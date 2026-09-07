@@ -7,12 +7,26 @@ import {
   isCanonicalUuid,
 } from "./tree-controller.ts";
 import { parseAgentSnapshot } from "./agent-snapshot-codec.ts";
+import {
+  AgentActivityViewerModel,
+  renderAgentActivityViewerSurface,
+} from "./agent-activity-viewer.ts";
+import type { SafeAgentActivityEvent } from "./rpc-bridge-event.ts";
+import {
+  displayWidth,
+  renderFramedPanelLine,
+  renderNarrowPanelLine,
+  renderPanelRule,
+  safeUiFact,
+  stylePanelText,
+  themeBg,
+  themeBold,
+  themeFg,
+  truncateToDisplayWidth,
+  type UiPanelLineStyle,
+} from "./ui-surface.ts";
 
-const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const COMBINING_MARK_PATTERN = /^\p{Mark}$/u;
-const EXTENDED_PICTOGRAPHIC_PATTERN = /\p{Extended_Pictographic}/u;
-const REGIONAL_INDICATOR_PATTERN = /\p{Regional_Indicator}/u;
-const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/gu;
+export { displayWidth, truncateToDisplayWidth } from "./ui-surface.ts";
 
 export interface AgentTreePanelOptions {
   /** 同时显示的树正文行数，不包含标题和键位提示。 */
@@ -64,6 +78,12 @@ export interface AgentTreePanelPublicState {
 export interface AgentTreeSnapshotSource {
   read(): ControlResult<ScopedAgentTreeSnapshot>;
   onChange(listener: () => void): () => void;
+}
+
+/** 活动流缓存来源 seam：查看器 overlay 只通过它读取回放与变更通知。 */
+export interface AgentActivityStreamSource {
+  readReplay(agentId: string): readonly SafeAgentActivityEvent[];
+  onChange(listener: (agentId: string) => void): () => void;
 }
 
 interface AgentTreeTui {
@@ -123,7 +143,7 @@ const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({
 });
 const RENDER_PANEL_LINES = Symbol("renderPanelLines");
 
-export type AgentTreePanelInputOutcome = "changed" | "ignored" | "close";
+export type AgentTreePanelInputOutcome = "changed" | "ignored" | "close" | "enter";
 export type AgentTreePanelUpdateOutcome = "changed" | "ignored" | "close" | "error";
 
 export type AgentTreeNotificationType = "warning" | "error";
@@ -178,6 +198,7 @@ export class AgentTreeFailureNotifier {
 export function bindAgentTreeUi(
   source: AgentTreeSnapshotSource,
   context: AgentTreeUiContext,
+  activity?: AgentActivityStreamSource,
 ): AgentTreeUiBinding {
   if (context.hasUI !== true || context.ui === undefined) return inertUiBinding();
   const ui = context.ui;
@@ -191,6 +212,11 @@ export function bindAgentTreeUi(
     readonly done: () => void;
   } | undefined;
   let panelPromise: Promise<void> | undefined;
+  let viewerPromise: Promise<void> | undefined;
+  let activeViewer: {
+    readonly model: AgentActivityViewerModel;
+    readonly done: () => void;
+  } | undefined;
   let workingSpinnerFrame = 0;
   let widgetHasWorkingAgent = false;
   const widgetTuis = new Set<AgentTreeTui>();
@@ -304,6 +330,13 @@ export function bindAgentTreeUi(
         activePanel.model.markError();
       }
     }
+    if (activeViewer !== undefined) {
+      const viewer = activeViewer;
+      const viewed = result.data.nodes.find((candidate) =>
+        candidate.agent_id === viewer.model.agent_id
+      );
+      if (viewed !== undefined) viewer.model.updateLifecycle(viewed.state);
+    }
     requestRender();
     if (context.mode === "rpc") setWidget();
   };
@@ -335,6 +368,90 @@ export function bindAgentTreeUi(
     if (context.mode === "rpc") setWidget();
   }, ELAPSED_REFRESH_INTERVAL_MS);
   elapsedTimer.unref?.();
+
+  /** 在面板 overlay 之上叠加打开查看器 overlay；Esc 关闭后面板重新接管输入。 */
+  const openActivityViewer = (agentId: string): void => {
+    if (activity === undefined || viewerPromise !== undefined) return;
+    const node = snapshot?.nodes.find((candidate) => candidate.agent_id === agentId);
+    if (node === undefined) return;
+    const custom = context.ui?.custom;
+    if (typeof custom !== "function") return;
+    let invocation: Promise<void>;
+    try {
+      invocation = custom.call(context.ui, (tui, theme, _keybindings, done) => {
+        let closed = false;
+        let replay: readonly SafeAgentActivityEvent[] = [];
+        try {
+          replay = activity.readReplay(node.agent_id);
+        } catch {
+          // 初始读取失败落到空态，不阻断 overlay 打开。
+        }
+        const model = new AgentActivityViewerModel(
+          {
+            agent_id: node.agent_id,
+            template_id: node.template_id,
+            name: node.name,
+            state: node.state,
+          },
+          replay,
+        );
+        let unsubscribe: (() => void) | undefined;
+        try {
+          unsubscribe = activity.onChange((changedAgentId) => {
+            if (closed || changedAgentId !== node.agent_id) return;
+            try {
+              model.syncFrom(activity.readReplay(node.agent_id));
+            } catch {
+              // 缓存读取失败保持当前内容，不中断查看器。
+            }
+            safeRequestRender(tui);
+          });
+        } catch {
+          unsubscribe = undefined;
+        }
+        const finish = (): void => {
+          if (closed) return;
+          closed = true;
+          try { unsubscribe?.(); } catch {}
+          unsubscribe = undefined;
+          done(undefined);
+        };
+        activeViewer = { model, done: finish };
+        return {
+          render: (width) => {
+            try {
+              return [...renderAgentActivityViewerSurface(model, width, theme)];
+            } catch {
+              return [...renderAgentActivityViewerSurface(model, width, undefined)];
+            }
+          },
+          handleInput: (data) => {
+            try {
+              if (model.handleInput(data) === "close") finish();
+            } catch {
+              // 键盘处理异常保持在查看器边界内。
+            }
+            safeRequestRender(tui);
+          },
+          invalidate: () => {},
+          dispose: () => {
+            try { unsubscribe?.(); } catch {}
+            unsubscribe = undefined;
+            if (activeViewer?.model === model) activeViewer = undefined;
+          },
+        };
+      }, {
+        overlay: true,
+        overlayOptions: AGENT_TREE_OVERLAY_OPTIONS,
+      }) as Promise<void>;
+    } catch {
+      return;
+    }
+    viewerPromise = invocation.finally(() => {
+      viewerPromise = undefined;
+      activeViewer = undefined;
+    });
+  };
 
   const binding: AgentTreeUiBinding = Object.freeze({
     openPanel: (overrideContext = context): Promise<void> => {
@@ -373,7 +490,14 @@ export function bindAgentTreeUi(
               try {
                 if (panel.model === undefined) {
                   if (data === "\x1b") finish();
-                } else if (panel.model.handleInput(data) === "close") finish();
+                } else {
+                  const outcome = panel.model.handleInput(data);
+                  if (outcome === "close") finish();
+                  else if (outcome === "enter") {
+                    const selected = panel.model.getPublicState().selected_key;
+                    if (selected !== undefined) openActivityViewer(selected);
+                  }
+                }
               } catch {
                 panel.model?.markError();
               }
@@ -406,6 +530,8 @@ export function bindAgentTreeUi(
       unsubscribe = undefined;
       activePanel?.done();
       activePanel = undefined;
+      activeViewer?.done();
+      activeViewer = undefined;
       widgetTuis.clear();
       try {
         ui.setWidget?.(AGENTS_WIDGET_KEY, undefined, { placement: "aboveEditor" });
@@ -415,30 +541,6 @@ export function bindAgentTreeUi(
     },
   });
   return binding;
-}
-
-/** 计算无 ANSI 文本的终端列宽，避免按 UTF-16 单元切断 Unicode 字符。 */
-export function displayWidth(value: string): number {
-  let width = 0;
-  for (const { segment } of SEGMENTER.segment(value)) width += graphemeWidth(segment);
-  return width;
-}
-
-/** 超宽时保留一个省略号，并始终在字素簇边界截断。 */
-export function truncateToDisplayWidth(value: string, width: number): string {
-  if (!Number.isSafeInteger(width) || width <= 0) return "";
-  if (displayWidth(value) <= width) return value;
-  if (width === 1) return "…";
-  const available = width - 1;
-  let used = 0;
-  let output = "";
-  for (const { segment } of SEGMENTER.segment(value)) {
-    const next = graphemeWidth(segment);
-    if (used + next > available) break;
-    output += segment;
-    used += next;
-  }
-  return `${output}…`;
 }
 
 /** 常驻区域只投影当前会话的直接、未终止子代理。 */
@@ -562,6 +664,7 @@ export class AgentTreePanelModel {
     }
     const selected = rows[this.selectedIndex];
     if (selected === undefined) return "ignored";
+    if (data === "\r") return "enter";
     if (data === "\x1b[C" || data === "l") return this.expandSelected(selected.key);
     if (data === "\x1b[D" || data === "h") return this.collapseSelected(selected.key);
     return "ignored";
@@ -713,7 +816,7 @@ export class AgentTreePanelModel {
   }
 }
 
-type AgentTreePanelLineStyle = "header" | "body" | "terminal" | "error" | "footer";
+type AgentTreePanelLineStyle = UiPanelLineStyle;
 
 /** 将纯树投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
 export function renderAgentTreePanelSurface(
@@ -784,104 +887,6 @@ function formatPanelHeader(revision: number | undefined, width: number): string 
   const required = displayWidth(title) + displayWidth(revisionLabel) + 1;
   if (required > width) return truncateToDisplayWidth(`${title} · ${revisionLabel}`, width);
   return `${title}${" ".repeat(width - displayWidth(title) - displayWidth(revisionLabel))}${revisionLabel}`;
-}
-
-function renderPanelRule(
-  width: number,
-  position: "top" | "divider" | "bottom",
-  theme: unknown,
-): string {
-  const [left, fill, right] = position === "top"
-    ? ["┏", "━", "┓"]
-    : position === "bottom"
-      ? ["┗", "━", "┛"]
-      : ["┣", "━", "┫"];
-  const color = position === "divider" ? "border" : "borderAccent";
-  const rule = `${left}${fill.repeat(Math.max(0, width - 2))}${right}`;
-  return themeBg(theme, "customMessageBg", themeFg(theme, color, rule));
-}
-
-function renderFramedPanelLine(
-  value: string,
-  contentWidth: number,
-  style: AgentTreePanelLineStyle,
-  selected: boolean,
-  theme: unknown,
-): string {
-  const padded = padToDisplayWidth(value, contentWidth);
-  const borderColor = style === "header" || selected ? "borderAccent" : "border";
-  const line = `${themeFg(theme, borderColor, "┃")} ${stylePanelText(padded, style, theme)} ${themeFg(theme, borderColor, "┃")}`;
-  return themeBg(theme, selected ? "selectedBg" : "customMessageBg", line);
-}
-
-function renderNarrowPanelLine(
-  value: string,
-  width: number,
-  style: AgentTreePanelLineStyle,
-  selected: boolean,
-  theme: unknown,
-): string {
-  const padded = padToDisplayWidth(value, width);
-  return themeBg(
-    theme,
-    selected ? "selectedBg" : "customMessageBg",
-    stylePanelText(padded, style, theme),
-  );
-}
-
-function stylePanelText(value: string, style: AgentTreePanelLineStyle, theme: unknown): string {
-  switch (style) {
-    case "header":
-      return themeFg(theme, "accent", themeBold(theme, value));
-    case "body":
-      return themeFg(theme, "customMessageText", value);
-    case "error":
-      return themeFg(theme, "error", value);
-    case "footer":
-    case "terminal":
-      return themeFg(theme, "dim", value);
-  }
-}
-
-function padToDisplayWidth(value: string, width: number): string {
-  const truncated = truncateToDisplayWidth(value, width);
-  return `${truncated}${" ".repeat(Math.max(0, width - displayWidth(truncated)))}`;
-}
-
-function themeFg(theme: unknown, color: string, text: string): string {
-  if (typeof theme !== "object" || theme === null) return text;
-  const candidate = theme as AgentTreePanelTheme;
-  if (typeof candidate.fg !== "function") return text;
-  try {
-    const styled = candidate.fg.call(candidate, color, text);
-    return typeof styled === "string" ? styled : text;
-  } catch {
-    return text;
-  }
-}
-
-function themeBg(theme: unknown, color: string, text: string): string {
-  if (typeof theme !== "object" || theme === null) return text;
-  const candidate = theme as AgentTreePanelTheme;
-  if (typeof candidate.bg !== "function") return text;
-  try {
-    const styled = candidate.bg.call(candidate, color, text);
-    return typeof styled === "string" ? styled : text;
-  } catch {
-    return text;
-  }
-}
-
-function themeBold(theme: unknown, text: string): string {
-  if (typeof theme !== "object" || theme === null) return text;
-  const candidate = theme as AgentTreePanelTheme;
-  if (typeof candidate.bold !== "function") return text;
-  try {
-    const styled = candidate.bold.call(candidate, text);
-    return typeof styled === "string" ? styled : text;
-  } catch {
-    return text;
-  }
 }
 
 function directWidgetNodes(snapshot: ScopedAgentTreeSnapshot): readonly AgentSnapshot[] {
@@ -976,10 +981,6 @@ function formatCounts(counts: ReadonlyMap<string, number>): string {
 }
 
 /** 将外部可命名事实约束为单行纯文本，阻断 ANSI、换行与方向控制注入。 */
-function safeUiFact(value: string): string {
-  return value.replace(TERMINAL_CONTROL_PATTERN, " ").replace(/ {2,}/g, " ").trim();
-}
-
 function sameScope(left: ScopedAgentTreeSnapshot, right: ScopedAgentTreeSnapshot): boolean {
   return left.scope.kind === right.scope.kind
     && left.scope.agent_id === right.scope.agent_id;
@@ -1066,7 +1067,6 @@ function isValidScopedSnapshot(value: unknown): value is ScopedAgentTreeSnapshot
   }
   return true;
 }
-
 function formatTokens(count: number): string {
   if (count < 1_000) return String(count);
   if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
@@ -1083,44 +1083,6 @@ function formatElapsed(value: number): string {
   if (minutes < 60) return `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
-}
-
-function graphemeWidth(grapheme: string): number {
-  if (EXTENDED_PICTOGRAPHIC_PATTERN.test(grapheme) || REGIONAL_INDICATOR_PATTERN.test(grapheme)) return 2;
-  let width = 0;
-  for (const character of grapheme) width += codePointWidth(character);
-  return width;
-}
-
-function codePointWidth(character: string): number {
-  const codePoint = character.codePointAt(0) ?? 0;
-  if (
-    codePoint === 0
-    || codePoint < 32
-    || (codePoint >= 0x7f && codePoint < 0xa0)
-    || codePoint === 0x200d
-    || (codePoint >= 0xfe00 && codePoint <= 0xfe0f)
-    || (codePoint >= 0xe0100 && codePoint <= 0xe01ef)
-    || COMBINING_MARK_PATTERN.test(character)
-  ) return 0;
-  return isWideCodePoint(codePoint) ? 2 : 1;
-}
-
-function isWideCodePoint(codePoint: number): boolean {
-  return codePoint >= 0x1100 && (
-    codePoint <= 0x115f
-    || codePoint === 0x2329
-    || codePoint === 0x232a
-    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f)
-    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
-    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
-    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
-    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
-    || (codePoint >= 0xff00 && codePoint <= 0xff60)
-    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
-    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
-    || (codePoint >= 0x20000 && codePoint <= 0x3fffd)
-  );
 }
 
 function safeRequestRender(tui: AgentTreeTui): void {

@@ -721,7 +721,10 @@ export function createWjPiSubagentsRuntimeActivator(
         binding: bindAgentTreeUi({
           read: () => current.controller.getAgentTree(),
           onChange: (listener) => current.tree.onChange(listener),
-        }, context),
+        }, context, {
+          readReplay: (agentId) => current.controller.getActivityReplay(agentId),
+          onChange: (listener) => current.controller.onActivityChange(listener),
+        }),
       });
     };
 

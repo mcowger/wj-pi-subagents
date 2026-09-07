@@ -76,6 +76,30 @@ function treeSnapshot(): ScopedAgentTreeSnapshot {
   });
 }
 
+test("回车对选中节点返回进入查看结果", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  assert.equal(panel.handleInput("\r"), "enter");
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+
+  assert.equal(panel.handleInput("\x1b[B"), "changed");
+  assert.equal(panel.handleInput("\r"), "enter");
+  assert.equal(panel.getPublicState().selected_key, WORKING_CHILD_ID);
+});
+
+test("错误态与无选中行的回车被忽略", () => {
+  const errored = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  errored.markError();
+  assert.equal(errored.handleInput("\r"), "ignored");
+
+  const empty = new AgentTreePanelModel(Object.freeze({
+    tree_revision: 1,
+    scope: Object.freeze({ kind: "root" as const }),
+    nodes: Object.freeze([]),
+  }), { viewport_height: 8 });
+  assert.equal(empty.handleInput("\r"), "ignored");
+  assert.equal(empty.handleInput("\x1b"), "close");
+});
+
 test("面板将终态节点保留在对应父代理的树分支中", () => {
   const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 12 });
   const lines = panel.render(240);
