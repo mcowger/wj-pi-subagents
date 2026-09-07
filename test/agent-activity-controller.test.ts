@@ -20,6 +20,7 @@ import {
   TreeController,
   ROOT_TREE_ACTOR,
   type ReserveStartingChildInput,
+  type TreeActor,
 } from "../src/tree-controller.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -27,19 +28,25 @@ const GRANDCHILD_ID = "660e8400-e29b-41d4-a716-446655440001";
 
 class FakeSupervisor implements AgentSupervisor {
   private readonly listeners = new Set<(event: RpcSupervisorEvent) => void>();
+  readonly agentId: string;
   tree: TreeController | undefined;
+  actor: TreeActor = ROOT_TREE_ACTOR;
   reservation: ReserveStartingChildInput | undefined;
+
+  constructor(agentId = AGENT_ID) {
+    this.agentId = agentId;
+  }
 
   start(): Promise<RpcSupervisorStartupResult> {
     if (this.tree !== undefined && this.reservation !== undefined) {
-      const reserved = this.tree.reserveStartingChild(ROOT_TREE_ACTOR, this.reservation);
+      const reserved = this.tree.reserveStartingChild(this.actor, this.reservation);
       assert.equal(reserved.ok, true);
-      this.tree.applyLifecycleEvent(AGENT_ID, {
+      this.tree.applyLifecycleEvent(this.agentId, {
         type: "startup_ready",
         expected_generation: 0,
       });
     }
-    return Promise.resolve({ ok: true, agent_id: AGENT_ID, state: "idle" });
+    return Promise.resolve({ ok: true, agent_id: this.agentId, state: "idle" });
   }
 
   sendMessage(_message: string): Promise<RpcSupervisorCommandResult> {
@@ -53,7 +60,7 @@ class FakeSupervisor implements AgentSupervisor {
   terminate(): Promise<RpcSupervisorTerminationResult> {
     return Promise.resolve({
       ok: true,
-      agent_id: AGENT_ID,
+      agent_id: this.agentId,
       state: "terminated",
       cleanup: "confirmed",
     });
@@ -76,6 +83,10 @@ class FakeSupervisor implements AgentSupervisor {
         event,
       }));
     }
+  }
+
+  emitActivityDelivery(delivery: SupervisorActivityDelivery): void {
+    this.emitActivityStream(delivery.event, delivery.agent_id);
   }
 
   emitActivityDisplay(event: SafeAgentActivityDisplayEvent): void {
@@ -109,6 +120,7 @@ function makeController(fake: FakeSupervisor): {
     tree,
     allowUnvalidatedTemplates: true,
     createSupervisor: (input) => {
+      fake.actor = input.actor;
       fake.reservation = input.reservation;
       return fake;
     },
@@ -179,6 +191,73 @@ test("后代活动事件按其真实身份分组并沿上游转发", async () =>
     { agent_id: AGENT_ID, event: message("直接子正文") },
     { agent_id: GRANDCHILD_ID, event: message("孙代理正文") },
   ]);
+});
+
+test("每层缓存自身与直接子树活动，并把孙代理事件逐级隔离转发到根", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  const rootSpawned = await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+  assert.equal(rootSpawned.ok, true, JSON.stringify(rootSpawned));
+
+  const childTree = new TreeController({
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 10_000,
+    },
+    idFactory: () => GRANDCHILD_ID,
+    initialActor: {
+      agentId: AGENT_ID,
+      parentAgentId: null,
+      depth: 1,
+      templateId: "demo",
+      name: "直接子代理",
+      managementEnabled: true,
+    },
+  });
+  const grandchildSupervisor = new FakeSupervisor(GRANDCHILD_ID);
+  grandchildSupervisor.tree = childTree;
+  const childToRoot: SupervisorActivityDelivery[] = [];
+  const child = new AgentController({
+    tree: childTree,
+    actor: { kind: "agent", agent_id: AGENT_ID },
+    allowUnvalidatedTemplates: true,
+    createSupervisor: (input) => {
+      grandchildSupervisor.actor = input.actor;
+      grandchildSupervisor.reservation = input.reservation;
+      return grandchildSupervisor;
+    },
+    replyNotificationsHandledByInbox: false,
+    publishUpstreamActivity: (delivery) => {
+      childToRoot.push(delivery);
+      rootSupervisor.emitActivityDelivery(delivery);
+    },
+  });
+  const childSpawned = await child.spawnAgent({ template_id: "demo", name: "孙代理" });
+  assert.equal(childSpawned.ok, true, JSON.stringify(childSpawned));
+
+  assert.equal(child.recordOwnActivity(message("直接子自身事件")), true);
+  grandchildSupervisor.emitActivityStream(message("孙代理自身事件"));
+
+  assert.deepEqual(child.getActivityReplay(AGENT_ID), [message("直接子自身事件")]);
+  assert.deepEqual(child.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
+  assert.deepEqual(root.getActivityReplay(AGENT_ID), [message("直接子自身事件")]);
+  assert.deepEqual(root.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
+  assert.deepEqual(childToRoot, [
+    { agent_id: AGENT_ID, event: message("直接子自身事件") },
+    { agent_id: GRANDCHILD_ID, event: message("孙代理自身事件") },
+  ]);
+  assert.equal(root.getActivityRevision(AGENT_ID), 1);
+  assert.equal(root.getActivityRevision(GRANDCHILD_ID), 1);
+});
+
+test("根控制器没有可上行的自身代理身份", () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+
+  assert.equal(controller.recordOwnActivity(message("根事件")), false);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
 });
 
 test("子代理终止后活动缓存仍可回放", async () => {

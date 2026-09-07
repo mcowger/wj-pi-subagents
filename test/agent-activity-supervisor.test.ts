@@ -192,7 +192,7 @@ function setup(onGracefulClose?: (rpc: FakeRpcClient) => void): {
   return { rpc, supervisor, channels: { parent, child }, cleanup };
 }
 
-test("桥接活动事件经监督器以 activity_stream 分发，正文与摘要完整保留", async () => {
+test("RPC 桥完整活动副本不再重复分发，权威活动由子扩展监督通道上行", async () => {
   const { rpc, supervisor, channels, cleanup } = setup();
   const events: RpcSupervisorEvent[] = [];
   const unsubscribe = supervisor.onEvent((event) => events.push(event));
@@ -226,28 +226,7 @@ test("桥接活动事件经监督器以 activity_stream 分发，正文与摘要
       isError: false,
     });
 
-    assert.deepEqual(activityEvents(events), [
-      {
-        type: "message",
-        content: [
-          { type: "thinking", thinking: "内部推理" },
-          { type: "text", text: "回复正文" },
-        ],
-      },
-      {
-        type: "tool_execution_start",
-        toolCallId: "call_1",
-        toolName: "read",
-        args: '{"path":"src/a.ts"}',
-      },
-      {
-        type: "tool_execution_end",
-        toolCallId: "call_1",
-        toolName: "read",
-        result: '{"lines":["const a = 1;"]}',
-        isError: false,
-      },
-    ]);
+    assert.deepEqual(activityEvents(events), []);
   } finally {
     unsubscribe();
     await cleanup();

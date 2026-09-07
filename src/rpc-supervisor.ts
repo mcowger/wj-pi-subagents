@@ -1067,15 +1067,14 @@ export class RpcSupervisor {
         return;
       }
       case "tool_execution_start":
+        // 完整活动由 child 扩展沿监督通道上行；RPC 副本只维持既有阶段跟踪，
+        // 避免同一消息或工具事件在父端缓存两次。
+        this.receiveToolStart(event);
+        return;
       case "tool_execution_end":
+        this.receiveToolEnd(event);
+        return;
       case "message":
-        // 加宽后的活动事件正文只沿 activity_stream 分发；任务阶段与回复通道不受影响。
-        this.emitEvent(Object.freeze({
-          kind: "activity_stream",
-          event: Object.freeze(event) as SafeAgentActivityEvent,
-        }));
-        if (event.type === "tool_execution_start") this.receiveToolStart(event);
-        else if (event.type === "tool_execution_end") this.receiveToolEnd(event);
         return;
       case "activity_display": {
         const display = parseAgentActivityDisplayEvent(event.event);

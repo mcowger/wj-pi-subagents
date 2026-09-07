@@ -778,6 +778,15 @@ export class AgentController {
     return this.tree.getTreeSnapshotFor(this.actor);
   }
 
+  /**
+   * 子模式运行时记录当前 Pi 节点自身的完整活动。根没有可上行的代理身份；
+   * 合法事件先进入本层缓存，再沿与后代活动相同的端口逐级转发。
+   */
+  recordOwnActivity(event: SafeAgentActivityEvent): boolean {
+    if (this.actor.kind !== "agent") return false;
+    return this.recordActivity(this.actor.agent_id, event);
+  }
+
   /** 该代理的全量活动流回放（按到达序）；未知代理为空。 */
   getActivityReplay(agentId: unknown): readonly SafeAgentActivityEvent[] {
     if (!isCanonicalUuid(agentId)) return Object.freeze([]);
@@ -1026,16 +1035,7 @@ export class AgentController {
       this.tree.updateActivity(agentId, event.activity);
     }
     if (event.kind === "activity_stream" && agentId !== undefined) {
-      const activityAgentId = event.agent_id ?? agentId;
-      this.activityCache.append(activityAgentId, event.event);
-      try {
-        this.publishUpstreamActivity?.(Object.freeze({
-          agent_id: activityAgentId,
-          event: event.event,
-        }));
-      } catch {
-        // 上行转发失败不回滚本地缓存，也不改变节点生命周期。
-      }
+      this.recordActivity(event.agent_id ?? agentId, event.event);
     }
     if (event.kind === "activity_display" && agentId !== undefined) {
       for (const listener of this.activityDisplayListeners) {
@@ -1091,6 +1091,18 @@ export class AgentController {
     // 在事件登记前把同一事实当成 idle/terminal 快照并留下重复通知。
     if (directLifecycleAgentId !== undefined) this.resolveWaiters(directLifecycleAgentId);
     this.resolveAllReadyWaiters();
+  }
+
+  private recordActivity(agentId: string, event: SafeAgentActivityEvent): boolean {
+    const revision = this.activityCache.revision(agentId);
+    this.activityCache.append(agentId, event);
+    if (this.activityCache.revision(agentId) === revision) return false;
+    try {
+      this.publishUpstreamActivity?.(Object.freeze({ agent_id: agentId, event }));
+    } catch {
+      // 上行转发失败不回滚本地缓存，也不改变节点生命周期。
+    }
+    return true;
   }
 
   private deliverTerminalNotification(agentId: string): boolean {

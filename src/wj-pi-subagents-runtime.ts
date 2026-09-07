@@ -27,6 +27,10 @@ import type {
   ExtensionApiSurface,
 } from "./host-gate.ts";
 import {
+  normalizeRpcBridgeEvent,
+  type SafeAgentActivityEvent,
+} from "./rpc-bridge-event.ts";
+import {
   RUNTIME_EPHEMERAL_ENV_KEYS,
   RUNTIME_INTERNAL_ENV_KEYS,
   captureRootRuntimeContext,
@@ -696,6 +700,25 @@ function readDirectChildDisplayName(
   }
 }
 
+function readOwnActivityEvent(event: unknown): SafeAgentActivityEvent | undefined {
+  const normalized = normalizeRpcBridgeEvent(event);
+  if (normalized.kind !== "event") return undefined;
+  switch (normalized.event.type) {
+    case "message":
+    case "tool_execution_start":
+    case "tool_execution_end":
+      return normalized.event;
+    default:
+      return undefined;
+  }
+}
+
+function observeOwnActivity(current: ActiveRuntime | undefined, event: unknown): void {
+  if (current === undefined || !current.isChild || current.handoffPending === true) return;
+  const activity = readOwnActivityEvent(event);
+  if (activity !== undefined) current.controller.recordOwnActivity(activity);
+}
+
 export function createWjPiSubagentsRuntimeActivator(
   options: WjPiSubagentsRuntimeOptions = {},
 ): WjPiSubagentsRuntimeActivator {
@@ -861,8 +884,17 @@ export function createWjPiSubagentsRuntimeActivator(
     api.on("message_end", (event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
+      observeOwnActivity(current, event);
       current.replyCoordinator?.observeAssistantMessageEnd(event);
       refreshContextUsage(current, rawContext);
+    });
+
+    api.on("tool_execution_start", (event) => {
+      observeOwnActivity(active, event);
+    });
+
+    api.on("tool_execution_end", (event) => {
+      observeOwnActivity(active, event);
     });
 
     api.on("agent_end", (_event, rawContext) => {

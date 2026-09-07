@@ -348,7 +348,7 @@ test("/agents overlay 使用既定布局并经宿主路径渲染生命周期主�
   binding.dispose();
 });
 
-test("活动 display 与树更新经打开的查看器共用一次 50ms 重绘", async () => {
+test("孙代理查看器可回放并实时追加，活动与树更新共用一次 50ms 重绘", async () => {
   type OverlayComponent = {
     render(width: number): string[];
     handleInput?(data: string): void;
@@ -389,11 +389,18 @@ test("活动 display 与树更新经打开的查看器共用一次 50ms 重绘",
       return () => { if (treeChange === listener) treeChange = undefined; };
     },
   };
-  const replay: SafeAgentActivityEvent[] = [];
+  const replay: SafeAgentActivityEvent[] = [Object.freeze({
+    type: "message",
+    content: [Object.freeze({ type: "text", text: "孙代理历史" })],
+  })];
+  const replayReads: string[] = [];
   let activityChange: ((agentId: string) => void) | undefined;
   let displayChange: ((agentId: string, event: SafeAgentActivityDisplayEvent) => void) | undefined;
   const activity: AgentActivityStreamSource = {
-    readReplay: () => replay,
+    readReplay: (agentId) => {
+      replayReads.push(agentId);
+      return agentId === WORKING_CHILD_ID ? replay : [];
+    },
     onChange: (listener) => {
       activityChange = listener;
       return () => { if (activityChange === listener) activityChange = undefined; };
@@ -408,13 +415,25 @@ test("活动 display 与树更新经打开的查看器共用一次 50ms 重绘",
   const panelPromise = binding.openPanel();
   await Promise.resolve();
   const panel = overlays[0];
+  panel?.handleInput?.("\x1b[B");
   panel?.handleInput?.("\r");
   const viewer = overlays[1];
   assert.ok(viewer !== undefined);
   assert.ok(activityChange !== undefined);
   assert.ok(displayChange !== undefined);
+  assert.deepEqual(replayReads, [WORKING_CHILD_ID]);
+  assert.match(viewer?.render(120).join("\n") ?? "", /working-child.*孙代理历史/us);
 
-  displayChange?.(PARENT_ID, Object.freeze({
+  replay.push(Object.freeze({
+    type: "message",
+    content: [Object.freeze({ type: "text", text: "孙代理实时完整事件" })],
+  }));
+  activityChange?.(PARENT_ID);
+  assert.equal(replayReads.length, 1);
+  activityChange?.(WORKING_CHILD_ID);
+  assert.match(viewer?.render(120).join("\n") ?? "", /孙代理实时完整事件/u);
+
+  displayChange?.(WORKING_CHILD_ID, Object.freeze({
     type: "message_delta",
     streamId: "message-1",
     sequence: 1,
@@ -426,7 +445,7 @@ test("活动 display 与树更新经打开的查看器共用一次 50ms 重绘",
 
   currentSnapshot = Object.freeze({ ...treeSnapshot(), tree_revision: 8 });
   treeChange?.();
-  displayChange?.(PARENT_ID, Object.freeze({
+  displayChange?.(WORKING_CHILD_ID, Object.freeze({
     type: "message_delta",
     streamId: "message-1",
     sequence: 2,
