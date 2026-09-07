@@ -231,3 +231,138 @@ test("查看器表面使用既定框线布局并应用主题", () => {
   );
   assert.ok(marked.some((line) => line.includes("worker · worker-a")), marked.join("\n"));
 });
+
+test("assistant Markdown 块可读并按宽度换行", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    textMessage([
+      "# Summary",
+      "",
+      "This is **important** and uses `inline code`.",
+      "",
+      "```ts",
+      "const answer = 42;",
+      "return answer;",
+      "```",
+    ].join("\n")),
+  ], { viewport_height: 20 });
+  const body = viewer.render(32).slice(1, -1);
+
+  assert.ok(body.some((line) => line.includes("Summary")), body.join("\n"));
+  assert.ok(body.some((line) => line.includes("important")), body.join("\n"));
+  assert.doesNotMatch(body.join("\n"), /\*\*important\*\*/u);
+  assert.ok(body.some((line) => line.includes("const answer = 42;")), body.join("\n"));
+  assert.ok(body.filter((line) => line.length > 0).length > 4, body.join("\n"));
+});
+
+test("工具调用只显示单行关键参数摘要", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart(
+      "t-summary",
+      "read_file",
+      JSON.stringify({
+        path: "src/agent-activity-viewer.ts",
+        content: "secret-content ".repeat(40),
+        recursive: true,
+      }),
+    ),
+  ]);
+  const callLines = viewer.render(160).filter((line) => line.includes("read_file"));
+
+  assert.equal(callLines.length, 1);
+  assert.match(callLines[0] ?? "", /src\/agent-activity-viewer\.ts/u);
+  assert.doesNotMatch(callLines[0] ?? "", /secret-content/u);
+  assert.ok((callLines[0] ?? "").length < 140, callLines[0]);
+});
+
+test("超长工具结果默认折叠，展开后追加仍保持展开状态", () => {
+  const result = Array.from({ length: 8 }, (_, index) => `result-line-${index + 1}`).join("\n");
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
+    toolEnd("t-long", "read_file", result),
+  ], { viewport_height: 20 });
+
+  const collapsed = viewer.render(120).slice(1, -1).join("\n");
+  assert.match(collapsed, /collapsed|expand/u);
+  assert.doesNotMatch(collapsed, /result-line-8/u);
+
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expanded = viewer.render(120).slice(1, -1).join("\n");
+  assert.match(expanded, /result-line-8/u);
+
+  viewer.appendEvent(textMessage("after result"));
+  const afterAppend = viewer.render(120).slice(1, -1).join("\n");
+  assert.match(afterAppend, /result-line-8/u);
+});
+
+test("连续流式消息在显示层合并但保留完整事件计数", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("H")]);
+  for (const snapshot of ["He", "Hel", "Hell", "Hello"]) {
+    viewer.appendEvent(textMessage(snapshot));
+  }
+
+  const body = viewer.render(120).slice(1, -1);
+  assert.deepEqual(body.filter((line) => ["H", "He", "Hel", "Hell", "Hello"].includes(line)), ["Hello"]);
+  assert.equal(viewer.getPublicState().event_count, 5);
+});
+
+test("显示层节流重绘许可但不丢弃快速追加事件", () => {
+  let now = 1_000;
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("first")], {
+    render_throttle_ms: 50,
+    now: () => now,
+  });
+
+  assert.equal(viewer.shouldRender(), true);
+  assert.equal(viewer.shouldRender(), false);
+  viewer.appendEvent(textMessage("second"));
+  now = 1_020;
+  assert.equal(viewer.shouldRender(), false);
+  now = 1_050;
+  assert.equal(viewer.shouldRender(), true);
+  assert.equal(viewer.getPublicState().event_count, 2);
+  assert.ok(viewer.render(120).some((line) => line.includes("second")));
+});
+
+test("查看器正文净化 ANSI 与方向控制序列", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    textMessage("safe\x1b[31m red\x1b[0m\u202e hidden\u0007 text"),
+    toolStart(
+      "t-clean",
+      "run_cmd",
+      JSON.stringify({
+        command: "echo\nsecret",
+        stdout: "large output ".repeat(20),
+      }),
+    ),
+  ]);
+  const body = viewer.render(120).slice(1, -1).join("\n");
+
+  assert.doesNotMatch(body, /\x1b|\\u202e|\\u0007/u);
+  assert.match(body, /safe red\s+hidden\s+text/u);
+  assert.match(body, /command=/u);
+  assert.doesNotMatch(body, /large output/u);
+});
+
+test("展开状态按工具调用 ID 在宽度变化和追加后保持", () => {
+  const result = Array.from({ length: 6 }, (_, index) => `line-${index}`).join("\n");
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("stable-id", "read_file", JSON.stringify({ path: "x.txt" })),
+    toolEnd("stable-id", "read_file", result),
+  ]);
+  assert.equal(viewer.setToolResultExpanded("stable-id", true), "changed");
+  assert.deepEqual(viewer.getExpandedToolCallIds(), ["stable-id"]);
+  assert.match(viewer.render(40).join("\n"), /line-5/u);
+  assert.match(viewer.render(140).join("\n"), /line-5/u);
+  viewer.appendEvent(toolStart("next", "run_cmd", JSON.stringify({ cmd: "pwd" })));
+  assert.match(viewer.render(140).join("\n"), /line-5/u);
+  assert.deepEqual(viewer.getExpandedToolCallIds(), ["stable-id"]);
+});
+
+test("代码块与长段落的显示结果不丢失正文", () => {
+  const paragraph = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(paragraph)]);
+  const body = viewer.render(24).slice(1, -1).join(" ");
+
+  for (const word of paragraph.split(" ")) assert.match(body, new RegExp(`\\b${word}\\b`, "u"));
+  assert.ok(viewer.render(24).slice(1, -1).filter((line) => line.trim().length > 0).length > 1);
+});

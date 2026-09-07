@@ -389,6 +389,25 @@ export function bindAgentTreeUi(
           },
           replay,
         );
+        let renderTimer: ReturnType<typeof setTimeout> | undefined;
+        const scheduleActivityRender = (): void => {
+          if (closed || renderTimer !== undefined) return;
+          const delay = model.getRenderThrottleMs();
+          if (delay <= 0) {
+            safeRequestRender(tui);
+            return;
+          }
+          renderTimer = setTimeout(() => {
+            renderTimer = undefined;
+            if (!closed) safeRequestRender(tui);
+          }, delay);
+          renderTimer.unref?.();
+        };
+        const clearActivityRenderTimer = (): void => {
+          if (renderTimer === undefined) return;
+          clearTimeout(renderTimer);
+          renderTimer = undefined;
+        };
         let unsubscribe: (() => void) | undefined;
         try {
           unsubscribe = activity.onChange((changedAgentId) => {
@@ -398,7 +417,7 @@ export function bindAgentTreeUi(
             } catch {
               // 缓存读取失败保持当前内容，不中断查看器。
             }
-            safeRequestRender(tui);
+            scheduleActivityRender();
           });
         } catch {
           unsubscribe = undefined;
@@ -408,6 +427,7 @@ export function bindAgentTreeUi(
           closed = true;
           try { unsubscribe?.(); } catch {}
           unsubscribe = undefined;
+          clearActivityRenderTimer();
           done(undefined);
         };
         activeViewer = { model, done: finish };
@@ -431,6 +451,7 @@ export function bindAgentTreeUi(
           dispose: () => {
             try { unsubscribe?.(); } catch {}
             unsubscribe = undefined;
+            clearActivityRenderTimer();
             if (activeViewer?.model === model) activeViewer = undefined;
           },
         };

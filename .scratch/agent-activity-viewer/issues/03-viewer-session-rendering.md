@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — 面板回车进入最小查看器（渲染语义加宽建立在其查看器投影模型之上）
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] assistant 文本以 Markdown 渲染，长段落、代码片段可读
 - [ ] 工具调用渲染为单行摘要（工具名称 + 关键参数），不逐行倾倒参数全文
