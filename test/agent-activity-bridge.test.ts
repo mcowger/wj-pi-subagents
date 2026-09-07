@@ -76,6 +76,16 @@ test("真实桥接进程把加宽的活动事件闭集传给父端，并拒绝�
     },
     {
       type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "" },
+          { type: "thinking", thinking: "跳过的空块" },
+        ],
+      },
+    },
+    {
+      type: "message_end",
       message: { role: "assistant", content: [{ type: "text", text: oversized.text }] },
     },
     { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "结果" }] } },
@@ -112,6 +122,12 @@ test("真实桥接进程把加宽的活动事件闭集传给父端，并拒绝�
         result: '{"lines":["const a = 1;"],"truncated":false}',
         isError: false,
       },
+      // 空 text 块被跳过，非空 thinking 块保留。
+      {
+        type: "message",
+        content: [{ type: "thinking", thinking: "跳过的空块" }],
+      },
+      // 空块消息被桥接忽略，不产生事件也不中断会话。
       { type: "agent_settled" },
     ]);
   } finally {

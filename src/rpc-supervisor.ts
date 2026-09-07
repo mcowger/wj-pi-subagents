@@ -1099,7 +1099,8 @@ export class RpcSupervisor {
 
   /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */
   private receiveSupervisorEvent(event: SupervisorEvent): void {
-    if (this.phase !== "ready" && this.phase !== "starting") return;    const expectedGeneration = event.expected_generation;
+    if (this.phase !== "ready" && this.phase !== "starting") return;
+    const expectedGeneration = event.expected_generation;
     if (typeof expectedGeneration !== "number" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
       this.receiveTransportFault("protocol_fault", "supervisor");
       return;

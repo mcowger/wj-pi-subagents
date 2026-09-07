@@ -289,10 +289,53 @@ test("消息活动事件仍拒绝结构违约与非字符串正文", () => {
     type: "message_end",
     message: { role: "assistant", content: "不是数组" },
   }), { kind: "invalid" });
+  // 空 content 数组结构合法但无正文：按 ignored 处理，不中断会话。
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "message_end",
     message: { role: "assistant", content: [] },
-  }), { kind: "invalid" });
+  }), { kind: "ignored" });
+});
+
+test("空正文块被跳过，全空消息按 ignored 处理而不中断桥接", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "text", text: "" },
+        { type: "thinking", thinking: "" },
+        { type: "text", text: "有效正文" },
+      ],
+    },
+  }), {
+    kind: "event",
+    event: {
+      type: "message",
+      content: [{ type: "text", text: "有效正文" }],
+    },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "" }, { type: "thinking", thinking: "" }],
+    },
+  }), { kind: "ignored" });
+});
+
+test("活动事件闭集校验器拒绝空正文，与桥接端‘空块跳过’不冲突", () => {
+  assert.equal(parseAgentActivityEvent({ type: "message", content: [] }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "message",
+    content: [{ type: "text", text: "" }],
+  }).kind, "invalid");
+  // 空字符串 args/result 不属于违约：空参数与空结果无害。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    result: "",
+  }).kind, "event");
 });
 
 test("桥接闭集加宽：工具执行事件携带参数与结果 JSON 摘要", () => {

@@ -33,7 +33,14 @@
 
 4. **父端分发与上行接线**
    - 桥接活动事件经 `RpcSupervisor.receiveRpcEvent` 以 `activity_stream` 分发 → `AgentController` 写入缓存；后代活动事件（监督通道转发）按其真实身份归档。
-   - `AgentController` 新增 `getActivityReplay` / `getActivityRevision` / `onActivityChange`；子模式运行时通过 `publishUpstreamActivity` seam 把活动流沿唯一祖先方向转发上行（fire-and-forget），供递归汇聚工单（04）复用；本片不涉及扩展实例自身事件收集端与多层汇聚测试。
+   - `AgentController` 新增 `getActivityReplay` / `getActivityRevision` / `onActivityChange`；子模式运行时通过 `publishUpstreamActivity` seam 把活动流沿唯一祖先方向转发上行（fire-and-forget）。该 seam 是验收项 2“父端分发”的接线组成部分——没有它，监督通道活动帧无真实生产者；它同时为递归汇聚工单（04）预置了逐级转发能力，但 04 的扩展实例自身事件收集端与多层汇聚测试不在本片。
+
+### Code review（双轴）与修复记录
+
+- Standards 轴：无文档化标准硬违规；发现 1 处格式事故（`receiveSupervisorEvent` 两语句意外并一行）与若干判断项。
+- Spec 轴：验收项逐条有落点、无实质缺失；指出空正文块两端校验不一致（桥接端接受、父端防线拒绝 → 可致会话中断）与 `publishUpstreamActivity` 记账问题。
+- 已修复：①语句并行格式事故；②空正文块统一为“桥接端跳过、全空消息 ignored 不中断会话、监督层闭集校验判违约、父端防线允许空字符串摘要”，并补端到端与矩阵测试；③防线魔法数改为导入 `ACTIVITY_MAX_TEXT_BYTES`、注释方向更正；④`summarizeActivityJson` 更名 `encodeBoundedActivityJson`；⑤`budgetedTextLength` 返回类型收紧。
+- 判断项保留并说明：父端事件防线（`isSafeBridgeEvent`）保持粗校验而非委托完整闭集校验器——两者语义不同（防线拒绳即协议故障，必须更宽而非更严）；观察者 try/catch 分发三处重复系跟随文件内既有惯例，留待后续提取。
 
 ### 验证
 
@@ -42,7 +49,7 @@
 - 监督通道协议测试（`test/agent-activity-channel.test.ts`，6 项）：帧校验、身份作用域、超限拒绝、屏障丢弃、字节流适配层分发。
 - 监督器与控制器接线测试（`test/agent-activity-supervisor.test.ts`、`test/agent-activity-controller.test.ts`）：`activity_stream` 分发、既有活动阶段与工具配对零回归、缓存累积与上行转发、终止后回放。
 - 活动缓存纯模型测试（`test/agent-activity-cache.test.ts`，6 项）。
-- 全量回归：236 项测试全部通过（231 pass / 0 fail / 5 skipped 为既有跳过），`tsc --noEmit` 通过。
+- 全量回归：238 项测试全部通过（233 pass / 0 fail / 5 skipped 为既有跳过），`tsc --noEmit` 通过。
 
 ### 真实模型端到端验收步骤（供父会话执行）
 

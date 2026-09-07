@@ -129,7 +129,7 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
         || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
       ) return INVALID_EVENT;
       if (event.type === "tool_execution_start") {
-        const args = summarizeActivityJson(event.args);
+        const args = encodeBoundedActivityJson(event.args);
         if (args === "invalid") return INVALID_EVENT;
         if (args === "rejected") return REPLY_TOO_LARGE_EVENT;
         return safeEvent(Object.freeze({
@@ -139,7 +139,7 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
           ...(args === undefined ? {} : { args }),
         }));
       }
-      const result = summarizeActivityJson(event.result);
+      const result = encodeBoundedActivityJson(event.result);
       if (result === "invalid") return INVALID_EVENT;
       if (result === "rejected") return REPLY_TOO_LARGE_EVENT;
       if (event.isError !== undefined && typeof event.isError !== "boolean") return INVALID_EVENT;
@@ -159,6 +159,13 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
       const activity = normalizeActivityMessageEnd(event.message);
       if (activity.kind === "invalid") return INVALID_EVENT;
       if (activity.kind === "rejected") return REPLY_TOO_LARGE_EVENT;
+      // 结构合法但无有效正文（空块或空 content）的消息无内容可显示，
+      // 忽略该事件而不是把它当成违约中断会话。
+      if (
+        activity.kind === "event"
+        && activity.event.type === "message"
+        && activity.event.content.length === 0
+      ) return IGNORED_EVENT;
       return safeEvent(activity.event);
     }
     case "extension_error":
@@ -217,7 +224,7 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
   switch (value.type) {
     case "message": {
       const content = normalizeActivityContent(value.content);
-      if (content === undefined) return INVALID_ACTIVITY_EVENT;
+      if (content === undefined || content.length === 0) return INVALID_ACTIVITY_EVENT;
       if (content === "rejected") return ACTIVITY_REJECTED;
       return Object.freeze({
         kind: "event",
@@ -291,7 +298,9 @@ function normalizeActivityMessageEnd(
 function normalizeActivityContent(
   value: unknown,
 ): readonly SafeAgentActivityContentBlock[] | "rejected" | undefined {
-  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ACTIVITY_CONTENT_BLOCKS) {
+  // 空数组属于“结构合法但无正文”，由调用方决定忽略（桥接端）或判违约
+  // （监督层防御，合法桥接永不发送）；只有非数组或超块数才在这里判违约。
+  if (!Array.isArray(value) || value.length > MAX_ACTIVITY_CONTENT_BLOCKS) {
     return undefined;
   }
   const content: SafeAgentActivityContentBlock[] = [];
@@ -301,8 +310,9 @@ function normalizeActivityContent(
     if (item.type === "toolCall" || item.type === "image") continue;
     if (item.type === "text") {
       if (typeof item.text !== "string") return undefined;
+      // 空正文块对查看器无意义；跳过而不是判违约，避免合法空回复中断会话。
+      if (item.text.length === 0) continue;
       const nextBytes = budgetedTextLength(item.text, encodedBytes, content.length);
-      if (nextBytes === undefined) return undefined;
       if (nextBytes === "rejected") return "rejected";
       encodedBytes = nextBytes;
       content.push(Object.freeze({ type: "text", text: item.text }));
@@ -310,8 +320,8 @@ function normalizeActivityContent(
     }
     if (item.type === "thinking") {
       if (typeof item.thinking !== "string") return undefined;
+      if (item.thinking.length === 0) continue;
       const nextBytes = budgetedTextLength(item.thinking, encodedBytes, content.length);
-      if (nextBytes === undefined) return undefined;
       if (nextBytes === "rejected") return "rejected";
       encodedBytes = nextBytes;
       content.push(Object.freeze({ type: "thinking", thinking: item.thinking }));
@@ -326,16 +336,15 @@ function budgetedTextLength(
   text: string,
   currentBytes: number,
   blockCount: number,
-): number | "rejected" | undefined {
-  if (text.length === 0) return currentBytes;
+): number | "rejected" {
   const encoded = encodedJsonLength(text);
   const nextBytes = currentBytes + (blockCount === 0 ? 0 : 1) + encoded;
   if (nextBytes > ACTIVITY_MAX_TEXT_BYTES) return "rejected";
   return nextBytes;
 }
 
-/** 把工具参数/结果 JSON 值收窄为有界字符串；不可序列化值属于结构违约。 */
-function summarizeActivityJson(value: unknown): string | "invalid" | "rejected" | undefined {
+/** 把工具参数/结果 JSON 值编码为有界字符串；不可序列化值属于结构违约。 */
+function encodeBoundedActivityJson(value: unknown): string | "invalid" | "rejected" | undefined {
   if (value === undefined) return undefined;
   let encoded: string;
   try {

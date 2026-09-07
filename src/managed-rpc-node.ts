@@ -5,6 +5,7 @@ import type { Readable, Writable } from "node:stream";
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import type { AgentSnapshot } from "./tree-controller.ts";
 import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
+import { ACTIVITY_MAX_TEXT_BYTES } from "./rpc-bridge-event.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
 import {
   isManagedProcessTreeAdapter,
@@ -1101,11 +1102,14 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
   return value.isError === undefined || typeof value.isError === "boolean";
 }
 
-/** 父端防线按转义前 UTF-8 上限粗校验；转义后必然不超过同一上限。 */
+/**
+ * 父端防线按转义前 UTF-8 上限粗校验：转义后只会更长，因此防线放行的字符串
+ * 未必满足转义后预算（由下游精确保留裁决），但被防线拒绝的字符串必然超限。
+ * 空字符串无害，允许通过。
+ */
 function isBoundedActivityText(value: unknown): value is string {
   return typeof value === "string"
-    && value.length > 0
-    && new TextEncoder().encode(value).byteLength <= 16 * 1024;
+    && new TextEncoder().encode(value).byteLength <= ACTIVITY_MAX_TEXT_BYTES;
 }
 
 function decodeBase64Bytes(value: string): Uint8Array | undefined {
