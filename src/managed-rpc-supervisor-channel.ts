@@ -10,6 +10,7 @@ import type {
 import {
   SupervisorChannel,
   SupervisorFrameDecoder,
+  type SupervisorActivityDelivery,
   type SupervisorChannelOptions,
   type SupervisorCapabilityManifest,
   type SupervisorControlRequest,
@@ -48,6 +49,7 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
   private readonly closed = createDeferred<void>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly events = new Set<(event: SupervisorEvent) => void>();
+  private readonly activities = new Set<(activity: SupervisorActivityDelivery) => void>();
   private readonly snapshots = new Set<(snapshot: SupervisorSnapshot) => void>();
   private readonly capabilities = new Set<(capability: SupervisorCapabilityManifest) => void>();
   private readonly controlRequests = new Set<(request: SupervisorControlRequest) => void>();
@@ -175,6 +177,11 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return () => this.events.delete(listener);
   }
 
+  onActivity(listener: (activity: SupervisorActivityDelivery) => void): () => void {
+    this.activities.add(listener);
+    return () => this.activities.delete(listener);
+  }
+
   onSnapshot(listener: (snapshot: SupervisorSnapshot) => void): () => void {
     this.snapshots.add(listener);
     return () => this.snapshots.delete(listener);
@@ -253,6 +260,15 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
           listener(result.event);
         } catch {
           // 生命周期观察者异常不能改变协议状态。
+        }
+      }
+    }
+    if (result.kind === "accepted" && result.activity !== undefined) {
+      for (const listener of this.activities) {
+        try {
+          listener(result.activity);
+        } catch {
+          // 活动观察者异常不能改变协议状态。
         }
       }
     }

@@ -1213,6 +1213,13 @@ export function createWjPiSubagentsRuntimeActivator(
         replyNotificationsHandledByInbox: true,
         authority,
         ...(upstream === undefined ? {} : { flushUpstreamLifecycle: () => upstream.publisher.flush() }),
+        ...(upstream === undefined ? {} : {
+          // 子模式运行时把后代活动流沿唯一祖先方向转发上行；fire-and-forget，
+          // 失败不回滚本地缓存也不阻塞监督事件处理。
+          publishUpstreamActivity: (delivery) => {
+            void state.upstream?.channel.publishActivity(delivery).catch(() => {});
+          },
+        }),
       });
       state.controller = controller;
       state.createSupervisor = createSupervisor;

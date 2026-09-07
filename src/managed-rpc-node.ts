@@ -1049,20 +1049,63 @@ function isSafeBridgeEvent(value: unknown): boolean {
       return Number.isSafeInteger(value.pendingMessageCount)
         && (value.pendingMessageCount as number) >= 0
         && Object.keys(value).every((key) => key === "type" || key === "pendingMessageCount");
+    case "message":
+      return isSafeActivityMessageEvent(value);
     case "tool_execution_start":
     case "tool_execution_end":
-      return typeof value.toolCallId === "string"
-        && value.toolCallId.length > 0
-        && value.toolCallId.length <= 256
-        && typeof value.toolName === "string"
-        && value.toolName.length > 0
-        && value.toolName.length <= 256
-        && Object.keys(value).every((key) => key === "type" || key === "toolCallId" || key === "toolName");
+      return isSafeActivityToolEvent(value);
     case "extension_error":
       return Object.keys(value).length === 1;
     default:
       return false;
   }
+}
+
+function isSafeActivityMessageEvent(value: Record<string, unknown>): boolean {
+  if (
+    !Array.isArray(value.content)
+    || value.content.length === 0
+    || value.content.length > 64
+    || !Object.keys(value).every((key) => key === "type" || key === "content")
+  ) return false;
+  for (const item of value.content) {
+    if (!isRecord(item) || typeof item.type !== "string") return false;
+    if (item.type === "text") {
+      if (!isBoundedActivityText(item.text)) return false;
+      continue;
+    }
+    if (item.type === "thinking") {
+      if (!isBoundedActivityText(item.thinking)) return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
+  if (
+    typeof value.toolCallId !== "string"
+    || value.toolCallId.length === 0
+    || value.toolCallId.length > 256
+    || typeof value.toolName !== "string"
+    || value.toolName.length === 0
+    || value.toolName.length > 256
+  ) return false;
+  const allowed = value.type === "tool_execution_start"
+    ? ["type", "toolCallId", "toolName", "args"]
+    : ["type", "toolCallId", "toolName", "result", "isError"];
+  if (!Object.keys(value).every((key) => allowed.includes(key))) return false;
+  if (value.args !== undefined && !isBoundedActivityText(value.args)) return false;
+  if (value.result !== undefined && !isBoundedActivityText(value.result)) return false;
+  return value.isError === undefined || typeof value.isError === "boolean";
+}
+
+/** 父端防线按转义前 UTF-8 上限粗校验；转义后必然不超过同一上限。 */
+function isBoundedActivityText(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && new TextEncoder().encode(value).byteLength <= 16 * 1024;
 }
 
 function decodeBase64Bytes(value: string): Uint8Array | undefined {

@@ -2,6 +2,7 @@ import type { Readable, Writable } from "node:stream";
 import {
   SupervisorChannel,
   SupervisorFrameDecoder,
+  type SupervisorActivityDelivery,
   type SupervisorChannelOptions,
   type SupervisorCapabilityManifest,
   type SupervisorControlRequest,
@@ -65,6 +66,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly replyDispatches = new Map<string, Deferred<boolean>>();
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
+  private readonly activityListeners = new Set<(activity: SupervisorActivityDelivery) => void>();
   private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
   private readonly capabilityListeners = new Set<(capability: SupervisorCapabilityManifest) => void>();
   private readonly controlRequestListeners = new Set<(request: SupervisorControlRequest) => void>();
@@ -179,6 +181,19 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     await this.send(this.protocol.publishEvent(event));
   }
 
+  /**
+   * child 端发布活动流事件；每次提交独立，无确认或屏障。事件被发布端
+   * 拒绝（超限）时静默返回，会话不受影响。
+   */
+  async publishActivity(input: {
+    readonly agent_id?: string;
+    readonly event: unknown;
+  }): Promise<void> {
+    const frame = this.protocol.publishActivity(input);
+    if (frame === undefined) return;
+    await this.send(frame);
+  }
+
   /** child 端发布新的完整子树；修订和正文边界仍由协议状态机校验。 */
   async publishSnapshot(nodes: readonly unknown[], subtreeRevision: number): Promise<void> {
     await this.send(this.protocol.publishSnapshot(nodes, subtreeRevision));
@@ -237,6 +252,11 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   onEvent(listener: (event: SupervisorEvent) => void): () => void {
     this.eventListeners.add(listener);
     return () => this.eventListeners.delete(listener);
+  }
+
+  onActivity(listener: (activity: SupervisorActivityDelivery) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
   }
 
   onSnapshot(listener: (snapshot: SupervisorSnapshot) => void): () => void {
@@ -300,6 +320,15 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
           listener(result.event);
         } catch {
           // 观察者异常不能改变协议状态或破坏后续帧读取。
+        }
+      }
+    }
+    if (result.kind === "accepted" && result.activity !== undefined) {
+      for (const listener of this.activityListeners) {
+        try {
+          listener(result.activity);
+        } catch {
+          // 活动观察者异常不能改变协议状态。
         }
       }
     }

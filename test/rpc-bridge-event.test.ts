@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { REPLY_MAX_TEXT_BYTES } from "../src/child-reply-limits.ts";
 import {
+  ACTIVITY_MAX_TEXT_BYTES,
   normalizeAssistantMessageEnd,
   normalizeRpcBridgeEvent,
+  parseAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
 
 test("真正 child 回复端点只公开文本，明确丢弃 thinking、toolCall 和图片内容", () => {
@@ -119,7 +121,7 @@ test("compaction_end 分离取消与真实错误，且不公开 provider 错误�
   }), { kind: "invalid" });
 });
 
-test("任务桥接忽略全部 message_end，真正 child 回复端点仍拒绝未知内容块", () => {
+test("任务桥接忽略非 assistant 的 message_end，assistant 正文进入活动闭集并拒绝未知内容块", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({ type: "message_update", delta: "忽略" }), {
     kind: "ignored",
   });
@@ -130,7 +132,7 @@ test("任务桥接忽略全部 message_end，真正 child 回复端点仍拒绝�
       content: [{ type: "future_secret_block", secret: "不得静默丢弃" }],
     },
   }), {
-    kind: "ignored",
+    kind: "invalid",
   });
   assert.deepEqual(normalizeAssistantMessageEnd({
     type: "message_end",
@@ -203,4 +205,214 @@ test("真正 child 端忽略非 assistant 的 message_end，不把它当成直�
   }), {
     kind: "ignored",
   });
+});
+
+test("桥接闭集加宽：assistant 正文规范化为携带 text 与 thinking 块的消息活动事件", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      provider: "不得透传",
+      content: [
+        { type: "thinking", thinking: "内部推理", signature: "不得透传" },
+        { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.ts" } },
+        { type: "text", text: "开始处理" },
+        { type: "image", data: "YWJj", mimeType: "image/png" },
+      ],
+    },
+  }), {
+    kind: "event",
+    event: {
+      type: "message",
+      content: [
+        { type: "thinking", thinking: "内部推理" },
+        { type: "text", text: "开始处理" },
+      ],
+    },
+  });
+});
+
+test("消息活动正文按 JSON 转义后 UTF-8 总长度区分超限，拒绝事件而不中断会话", () => {
+  // 预算按 JSON.stringify 后字节数计（含首尾引号）：非转义字符 1 字节/字。
+  const withinBudget = normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES - 2) }],
+    },
+  });
+  assert.equal(withinBudget.kind, "event");
+
+  const boundary = normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "\n".repeat((ACTIVITY_MAX_TEXT_BYTES - 2) / 2) }],
+    },
+  });
+  // "\n" 转义为 2 字节，恰好抵达上限。
+  assert.equal(boundary.kind, "event");
+
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES - 1) }],
+    },
+  }), {
+    kind: "rejected",
+    reason: "reply_too_large",
+  });
+
+  // thinking 与 text 共享同一条连接预算。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "y".repeat(ACTIVITY_MAX_TEXT_BYTES - 2) },
+        { type: "text", text: "xyz" },
+      ],
+    },
+  }), {
+    kind: "rejected",
+    reason: "reply_too_large",
+  });
+});
+
+test("消息活动事件仍拒绝结构违约与非字符串正文", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: 42 }] },
+  }), { kind: "invalid" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: { role: "assistant", content: "不是数组" },
+  }), { kind: "invalid" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: { role: "assistant", content: [] },
+  }), { kind: "invalid" });
+});
+
+test("桥接闭集加宽：工具执行事件携带参数与结果 JSON 摘要", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    args: { path: "a.ts", limit: 10 },
+  }), {
+    kind: "event",
+    event: {
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "read",
+      args: '{"path":"a.ts","limit":10}',
+    },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    result: { lines: ["a", "b"], truncated: false },
+    isError: false,
+  }), {
+    kind: "event",
+    event: {
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "read",
+      result: '{"lines":["a","b"],"truncated":false}',
+      isError: false,
+    },
+  });
+  // 缺省字段保持缺省，旧事件形状不变。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_2",
+    toolName: "edit",
+  }), {
+    kind: "event",
+    event: {
+      type: "tool_execution_end",
+      toolCallId: "call_2",
+      toolName: "edit",
+    },
+  });
+});
+
+test("工具参数或结果超过活动预算拒绝该事件，不可序列化参数按结构违约拒绝", () => {
+  const oversized = { text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES) };
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "write",
+    args: oversized,
+  }), { kind: "rejected", reason: "reply_too_large" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "bash",
+    result: { output: "y".repeat(ACTIVITY_MAX_TEXT_BYTES) },
+    isError: true,
+  }), { kind: "rejected", reason: "reply_too_large" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "write",
+    args: BigInt(1),
+  }), { kind: "invalid" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "bash",
+    isError: "false",
+  }), { kind: "invalid" });
+});
+
+test("活动事件闭集校验器接受合法事件并拒绝违约、未知与超限", () => {
+  assert.deepEqual(parseAgentActivityEvent({
+    type: "message",
+    content: [
+      { type: "thinking", thinking: "推理" },
+      { type: "text", text: "回复" },
+    ],
+  }), {
+    kind: "event",
+    event: {
+      type: "message",
+      content: [
+        { type: "thinking", thinking: "推理" },
+        { type: "text", text: "回复" },
+      ],
+    },
+  });
+  assert.deepEqual(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    args: '{"path":"a.ts"}',
+  }), {
+    kind: "event",
+    event: {
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "read",
+      args: '{"path":"a.ts"}',
+    },
+  });
+  assert.equal(parseAgentActivityEvent({ type: "agent_start" }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "message",
+    content: [{ type: "text", text: 1 }],
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "",
+    toolName: "read",
+  }).kind, "invalid");
+  assert.deepEqual(parseAgentActivityEvent({
+    type: "message",
+    content: [{ type: "text", text: "z".repeat(ACTIVITY_MAX_TEXT_BYTES + 1) }],
+  }), { kind: "rejected", reason: "reply_too_large" });
 });

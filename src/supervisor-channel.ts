@@ -1,6 +1,10 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
 import {
+  parseAgentActivityEvent,
+  type SafeAgentActivityEvent,
+} from "./rpc-bridge-event.ts";
+import {
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
@@ -36,6 +40,7 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "snapshot",
   "capability",
   "reply",
+  "activity",
   "control_request",
   "control_response",
   "close",
@@ -180,6 +185,12 @@ export type SupervisorControlResponse =
       readonly error: PublicControlError;
     };
 
+/** parent 端一次性分发的活动流交付：事件所属代理身份与合法闭集事件。 */
+export interface SupervisorActivityDelivery {
+  readonly agent_id: string;
+  readonly event: SafeAgentActivityEvent;
+}
+
 /** 监督器向直接父/子控制器传播的脱敏生命周期事实。 */
 export interface SupervisorEvent {
   readonly root_id: string;
@@ -251,6 +262,8 @@ export interface SupervisorReceiveAccepted {
   readonly capability?: SupervisorCapabilityManifest;
   /** 仅供本地监督器递交给 TreeController 的脱敏生命周期事实。 */
   readonly event?: SupervisorEvent;
+  /** 本次通过身份与闭集校验的上行活动流交付。 */
+  readonly activity?: SupervisorActivityDelivery;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
   readonly snapshot?: SupervisorSnapshot;
   /** 本次通过身份、分支和正文边界校验的上行内部控制请求。 */
@@ -1261,6 +1274,33 @@ export class SupervisorChannel {
     );
   }
 
+  /**
+   * child 沿监督通道上行一条活动流事件。每次提交独立，无确认、无屏障、
+   * 不承诺跨事件顺序；事件所属代理可以是自身或子树内后代（递归汇聚）。
+   * 正文超预算时事件被拒绝（返回 undefined），不中断会话；载荷违约是
+   * 协议错误，抛出 SupervisorProtocolError。
+   */
+  publishActivity(input: {
+    readonly agent_id?: string;
+    readonly event: unknown;
+  }): SupervisorFrame | undefined {
+    if (
+      this.role !== "child" ||
+      this.terminationBarrier ||
+      this.state !== "ready"
+    ) throw new SupervisorProtocolError("closed");
+    const agentId = input.agent_id ?? this.localAgentId;
+    if (!isCanonicalUuid(agentId)) throw new SupervisorProtocolError("identity_mismatch");
+    if (!this.eventAgentIsInScope(agentId)) throw new SupervisorProtocolError("identity_mismatch");
+    const parsed = parseAgentActivityEvent(input.event);
+    if (parsed.kind === "invalid") throw new SupervisorProtocolError("invalid_frame");
+    if (parsed.kind === "rejected") return undefined;
+    return this.createFrame("activity", Object.freeze({
+      agent_id: agentId,
+      event: parsed.event,
+    }));
+  }
+
   /** child 仅在普通 ready 后发布一次固定的内部能力快照。 */
   publishCapability(manifest: SupervisorCapabilityManifest): SupervisorFrame {
     if (
@@ -1516,6 +1556,7 @@ export class SupervisorChannel {
     let replies: readonly SupervisorReply[] = EMPTY_REPLIES;
     let capability: SupervisorCapabilityManifest | undefined;
     let event: SupervisorEvent | undefined;
+    let activity: SupervisorActivityDelivery | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
     let closeRequested = false;
@@ -1565,6 +1606,9 @@ export class SupervisorChannel {
       case "event":
         event = this.applyEvent(frame);
         break;
+      case "activity":
+        activity = this.applyActivity(frame);
+        break;
       case "close":
         this.applyClose(frame);
         closeRequested = true;
@@ -1580,6 +1624,7 @@ export class SupervisorChannel {
       replies,
       ...(capability === undefined ? {} : { capability }),
       ...(event === undefined ? {} : { event }),
+      ...(activity === undefined ? {} : { activity }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
       ...(controlResponse === undefined ? {} : { control_response: controlResponse }),
@@ -1706,6 +1751,25 @@ export class SupervisorChannel {
   private applyEvent(frame: InternalFrame): SupervisorEvent {
     // 生命周期事件仅允许稳定代码，不允许把 RPC 细节、正文或参数混入快照。
     return this.parseEventPayload(frame.payload);
+  }
+
+  /**
+   * 活动流帧只分发合法闭集事件；正文超预算时该帧被忽略（不中断会话），
+   * 结构违约与越权身份与既有帧语义一致，升级为协议故障。
+   */
+  private applyActivity(frame: InternalFrame): SupervisorActivityDelivery | undefined {
+    if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+    const payload = frame.payload;
+    if (!hasExactObjectKeys(payload, ["agent_id", "event"])) frameError("invalid_frame");
+    if (!isCanonicalUuid(payload.agent_id)) frameError("invalid_frame");
+    if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
+    const parsed = parseAgentActivityEvent(payload.event);
+    if (parsed.kind === "invalid") frameError("invalid_frame");
+    if (parsed.kind === "rejected") return undefined;
+    return Object.freeze({
+      agent_id: payload.agent_id as string,
+      event: parsed.event,
+    });
   }
 
   private parseEventPayload(payload: Record<string, unknown>): SupervisorEvent {

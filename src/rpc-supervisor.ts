@@ -1,4 +1,5 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
+import type { SafeAgentActivityEvent } from "./rpc-bridge-event.ts";
 import {
   ManagedRpcCommandRejectedError,
   ManagedRpcStartupError,
@@ -6,6 +7,7 @@ import {
   type ManagedRpcNodeStartContext,
 } from "./managed-rpc-node.ts";
 import type {
+  SupervisorActivityDelivery,
   SupervisorCapabilityManifest,
   SupervisorControlRequest,
   SupervisorControlResponse,
@@ -297,6 +299,12 @@ export type RpcSupervisorEvent =
       readonly activity: RpcSupervisorActivity;
     }
   | {
+      readonly kind: "activity_stream";
+      /** 后代活动事件经监督通道转发时携带其身份；直接子代理活动省略。 */
+      readonly agent_id?: string;
+      readonly event: SafeAgentActivityEvent;
+    }
+  | {
       readonly kind: "reply";
       readonly reply: ChildReplyEnvelope;
     }
@@ -318,6 +326,8 @@ export interface RpcSupervisorChannel {
   onFault(listener: (fault: RpcSupervisorChannelFault) => void): () => void;
   /** 父端收到子端安全生命周期事实时调用；旧替身可省略。 */
   onEvent?(listener: (event: SupervisorEvent) => void): () => void;
+  /** 父端收到子端活动流交付时调用；旧替身可省略。 */
+  onActivity?(listener: (activity: SupervisorActivityDelivery) => void): () => void;
   onSnapshot?(listener: (snapshot: SupervisorSnapshot) => void): () => void;
   /** parent 端缓存的 child 启动能力证明；仅用于启动裁决。 */
   getCapability?(): SupervisorCapabilityManifest | undefined;
@@ -534,6 +544,7 @@ export class RpcSupervisor {
   private unsubscribeRpcFault: (() => void) | undefined;
   private unsubscribeChannelFault: (() => void) | undefined;
   private unsubscribeChannelEvent: (() => void) | undefined;
+  private unsubscribeChannelActivity: (() => void) | undefined;
   private unsubscribeChannelSnapshot: (() => void) | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly activeTools = new Set<string>();
@@ -954,6 +965,12 @@ export class RpcSupervisor {
         this.receiveSupervisorEvent(event);
       });
     }
+    const onChannelActivity = channel.onActivity;
+    if (typeof onChannelActivity === "function") {
+      this.unsubscribeChannelActivity = onChannelActivity.call(channel, (activity) => {
+        this.receiveSupervisorActivity(activity);
+      });
+    }
     const onChannelSnapshot = channel.onSnapshot;
     if (typeof onChannelSnapshot === "function") {
       this.unsubscribeChannelSnapshot = onChannelSnapshot.call(channel, (snapshot) => {
@@ -1037,10 +1054,15 @@ export class RpcSupervisor {
         return;
       }
       case "tool_execution_start":
-        this.receiveToolStart(event);
-        return;
       case "tool_execution_end":
-        this.receiveToolEnd(event);
+      case "message":
+        // 加宽后的活动事件正文只沿 activity_stream 分发；任务阶段与回复通道不受影响。
+        this.emitEvent(Object.freeze({
+          kind: "activity_stream",
+          event: Object.freeze(event) as SafeAgentActivityEvent,
+        }));
+        if (event.type === "tool_execution_start") this.receiveToolStart(event);
+        else if (event.type === "tool_execution_end") this.receiveToolEnd(event);
         return;
       case "message_end":
         // 回复只能由真正 child 扩展经监督通道上行；任务 RPC 事件不再发布回复。
@@ -1077,8 +1099,7 @@ export class RpcSupervisor {
 
   /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */
   private receiveSupervisorEvent(event: SupervisorEvent): void {
-    if (this.phase !== "ready" && this.phase !== "starting") return;
-    const expectedGeneration = event.expected_generation;
+    if (this.phase !== "ready" && this.phase !== "starting") return;    const expectedGeneration = event.expected_generation;
     if (typeof expectedGeneration !== "number" || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) {
       this.receiveTransportFault("protocol_fault", "supervisor");
       return;
@@ -1131,6 +1152,16 @@ export class RpcSupervisor {
     } catch {
       this.receiveTransportFault("protocol_fault", "supervisor");
     }
+  }
+
+  /** 活动流交付只分发事实，不参与生命周期、阶段跟踪或会话通知。 */
+  private receiveSupervisorActivity(activity: SupervisorActivityDelivery): void {
+    if (this.phase !== "ready" && this.phase !== "starting") return;
+    this.emitEvent(Object.freeze({
+      kind: "activity_stream",
+      agent_id: activity.agent_id,
+      event: activity.event,
+    }));
   }
 
   /** 完整快照先由通道校验，再由树控制器在一个修订中合并。 */
@@ -1709,12 +1740,14 @@ export class RpcSupervisor {
     this.unsubscribeRpcFault?.();
     this.unsubscribeChannelFault?.();
     this.unsubscribeChannelEvent?.();
+    this.unsubscribeChannelActivity?.();
     this.unsubscribeChannelSnapshot?.();
     this.channelBindingCleanup?.();
     this.unsubscribeRpcEvent = undefined;
     this.unsubscribeRpcFault = undefined;
     this.unsubscribeChannelFault = undefined;
     this.unsubscribeChannelEvent = undefined;
+    this.unsubscribeChannelActivity = undefined;
     this.unsubscribeChannelSnapshot = undefined;
     this.runtimeCompactionActive = false;
     this.compactionEndFenceVersion = undefined;

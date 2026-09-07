@@ -1,0 +1,146 @@
+import assert from "node:assert/strict";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import {
+  MANAGED_RPC_BRIDGE_CREDENTIAL_ENV,
+  ManagedRpcBridgeClient,
+} from "../src/managed-rpc-node.ts";
+
+const BRIDGE_CREDENTIAL = "bridge-activity-credential-0123456789abcdef";
+const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
+
+interface BridgeSession {
+  readonly process: ChildProcessWithoutNullStreams;
+  readonly client: ManagedRpcBridgeClient;
+  close(): Promise<void>;
+}
+
+function startBridge(events: readonly unknown[]): BridgeSession {
+  const bridge = spawn(process.execPath, [
+    "--experimental-strip-types",
+    fileURLToPath(new URL("../src/rpc-bridge-process.ts", import.meta.url)),
+  ], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    env: {
+      ...process.env,
+      [MANAGED_RPC_BRIDGE_CREDENTIAL_ENV]: BRIDGE_CREDENTIAL,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const client = new ManagedRpcBridgeClient({
+    stdin: bridge.stdin,
+    stdout: bridge.stdout,
+    stderr: bridge.stderr,
+  }, {
+    credential: BRIDGE_CREDENTIAL,
+    rpcOptions: {
+      piModulePath: new URL("./helpers/scripted-pi-rpc-client.mjs", import.meta.url).href,
+      events,
+    },
+  });
+  const close = async (): Promise<void> => {
+    await client.requestClose(AbortSignal.timeout(2_000)).catch(() => {});
+    await client.release();
+    if (bridge.exitCode === null) bridge.kill();
+  };
+  return { process: bridge, client, close };
+}
+
+test("真实桥接进程把加宽的活动事件闭集传给父端，并拒绝超限事件而不中断会话", async () => {
+  const oversized = { text: "x".repeat(64 * 1024) };
+  const session = startBridge([
+    { type: "agent_start" },
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "先读文件", signature: "不得透传" },
+          { type: "text", text: "开始处理" },
+        ],
+      },
+    },
+    {
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "read",
+      args: { path: "src/a.ts" },
+    },
+    {
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "read",
+      result: { lines: ["const a = 1;"], truncated: false },
+      isError: false,
+    },
+    {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: oversized.text }] },
+    },
+    { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "结果" }] } },
+    { type: "agent_settled" },
+  ]);
+  try {
+    const received: unknown[] = [];
+    const unsubscribe = session.client.onEvent((event) => received.push(event));
+    const abort = AbortSignal.timeout(2_000);
+    const started = await session.client.start(abort);
+    assert.equal(started, undefined);
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    unsubscribe();
+
+    assert.deepEqual(received, [
+      { type: "agent_start" },
+      {
+        type: "message",
+        content: [
+          { type: "thinking", thinking: "先读文件" },
+          { type: "text", text: "开始处理" },
+        ],
+      },
+      {
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "read",
+        args: '{"path":"src/a.ts"}',
+      },
+      {
+        type: "tool_execution_end",
+        toolCallId: "call_1",
+        toolName: "read",
+        result: '{"lines":["const a = 1;"],"truncated":false}',
+        isError: false,
+      },
+      { type: "agent_settled" },
+    ]);
+  } finally {
+    await session.close();
+  }
+});
+
+test("真实桥接进程在活动事件结构违约时按既有语义关闭传输", async () => {
+  const session = startBridge([
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "future_secret_block", secret: "不得静默丢弃" }],
+      },
+    },
+  ]);
+  const faults: unknown[] = [];
+  const unsubscribeFault = session.client.onTransportFault((fault) => faults.push(fault));
+  try {
+    const abort = AbortSignal.timeout(2_000);
+    // 违约事件先于 start 响应到达；传输按既有语义立即关闭并拒绝启动。
+    await session.client.start(abort).catch(() => {});
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(faults, ["protocol_fault"]);
+  } finally {
+    unsubscribeFault();
+    await session.close();
+  }
+});
+
+void AGENT_ID;

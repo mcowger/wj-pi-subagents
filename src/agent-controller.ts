@@ -28,6 +28,9 @@ import {
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
 } from "./rpc-supervisor.ts";
+import { AgentActivityCache } from "./agent-activity-cache.ts";
+import type { SafeAgentActivityEvent } from "./rpc-bridge-event.ts";
+import type { SupervisorActivityDelivery } from "./supervisor-channel.ts";
 
 import {
   WAIT_AGENT_DEFAULT_TIMEOUT_MS,
@@ -108,6 +111,11 @@ export interface AgentControllerOptions {
   readonly replyNotificationsHandledByInbox?: boolean;
   /** 生产运行时必须提供根权威端口；省略仅保留旧单节点测试 seam。 */
   readonly authority?: TreeAuthorityPort;
+  /**
+   * 子模式运行时提供的上游活动流转发端口；fire-and-forget，无确认或屏障。
+   * 根会话不提供，活动流终止于本地缓存。
+   */
+  readonly publishUpstreamActivity?: (delivery: SupervisorActivityDelivery) => void;
 }
 
 interface ManagedAgentEntry {
@@ -203,6 +211,8 @@ export class AgentController {
   private readonly flushUpstreamLifecycle: AgentControllerOptions["flushUpstreamLifecycle"];
   private readonly replyNotificationsHandledByInbox: boolean;
   private readonly authority: TreeAuthorityPort | undefined;
+  private readonly publishUpstreamActivity: AgentControllerOptions["publishUpstreamActivity"];
+  private readonly activityCache = new AgentActivityCache();
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
@@ -239,6 +249,7 @@ export class AgentController {
     this.flushUpstreamLifecycle = options.flushUpstreamLifecycle;
     this.replyNotificationsHandledByInbox = options.replyNotificationsHandledByInbox === true;
     this.authority = options.authority;
+    this.publishUpstreamActivity = options.publishUpstreamActivity;
     if (!isValidWaitAgentTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
     this.unsubscribeTreeChange = this.tree.onChange(() => this.resolveAllReadyWaiters());
   }
@@ -759,6 +770,23 @@ export class AgentController {
     return this.tree.getTreeSnapshotFor(this.actor);
   }
 
+  /** 该代理的全量活动流回放（按到达序）；未知代理为空。 */
+  getActivityReplay(agentId: unknown): readonly SafeAgentActivityEvent[] {
+    if (!isCanonicalUuid(agentId)) return Object.freeze([]);
+    return this.activityCache.replay(agentId);
+  }
+
+  /** 该代理的活动流修订号；未知代理为 0。 */
+  getActivityRevision(agentId: unknown): number {
+    if (!isCanonicalUuid(agentId)) return 0;
+    return this.activityCache.revision(agentId);
+  }
+
+  /** 注册活动流变更观察者；回调携带发生变更的代理身份。 */
+  onActivityChange(listener: (agentId: string) => void): () => void {
+    return this.activityCache.onChange(listener);
+  }
+
   async getAgentTemplates(): Promise<ControlResult<readonly AgentTemplateListItem[]>> {
     if (this.authority !== undefined) return this.authority.listTemplates(this.actor);
     return Object.freeze({
@@ -977,6 +1005,18 @@ export class AgentController {
     }
     if (event.kind === "activity" && agentId !== undefined) {
       this.tree.updateActivity(agentId, event.activity);
+    }
+    if (event.kind === "activity_stream" && agentId !== undefined) {
+      const activityAgentId = event.agent_id ?? agentId;
+      this.activityCache.append(activityAgentId, event.event);
+      try {
+        this.publishUpstreamActivity?.(Object.freeze({
+          agent_id: activityAgentId,
+          event: event.event,
+        }));
+      } catch {
+        // 上行转发失败不回滚本地缓存，也不改变节点生命周期。
+      }
     }
     // activity 阶段属于安全树快照；工具正文、名称和参数仍只留在监督器本地。
     const lifecycleApplied = directLifecycleAgentId !== undefined
