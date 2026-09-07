@@ -25,6 +25,7 @@ import {
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const GRANDCHILD_ID = "660e8400-e29b-41d4-a716-446655440001";
+const GREAT_GRANDCHILD_ID = "770e8400-e29b-41d4-a716-446655440002";
 
 class FakeSupervisor implements AgentSupervisor {
   private readonly listeners = new Set<(event: RpcSupervisorEvent) => void>();
@@ -98,6 +99,46 @@ class FakeSupervisor implements AgentSupervisor {
 
 function message(text: string): SafeAgentActivityEvent {
   return Object.freeze({ type: "message", content: [Object.freeze({ type: "text", text })] });
+}
+
+function makeChildModeController(options: {
+  readonly agentId: string;
+  readonly parentAgentId: string | null;
+  readonly depth: number;
+  readonly directChildId: string;
+  readonly directChildSupervisor: FakeSupervisor;
+  readonly publishUpstreamActivity: (delivery: SupervisorActivityDelivery) => void;
+}): AgentController {
+  const tree = new TreeController({
+    config: {
+      maxDepth: 3,
+      maxChildrenPerAgent: 4,
+      maxAgentsPerTree: 8,
+      waitTimeoutMs: 10_000,
+    },
+    idFactory: () => options.directChildId,
+    initialActor: {
+      agentId: options.agentId,
+      parentAgentId: options.parentAgentId,
+      depth: options.depth,
+      templateId: "demo",
+      name: `第 ${options.depth} 层代理`,
+      managementEnabled: true,
+    },
+  });
+  options.directChildSupervisor.tree = tree;
+  return new AgentController({
+    tree,
+    actor: { kind: "agent", agent_id: options.agentId },
+    allowUnvalidatedTemplates: true,
+    createSupervisor: (input) => {
+      options.directChildSupervisor.actor = input.actor;
+      options.directChildSupervisor.reservation = input.reservation;
+      return options.directChildSupervisor;
+    },
+    replyNotificationsHandledByInbox: false,
+    publishUpstreamActivity: options.publishUpstreamActivity,
+  });
 }
 
 function makeController(fake: FakeSupervisor): {
@@ -193,42 +234,20 @@ test("后代活动事件按其真实身份分组并沿上游转发", async () =>
   ]);
 });
 
-test("每层缓存自身与直接子树活动，并把孙代理事件逐级隔离转发到根", async () => {
+test("四层树逐层缓存自身与子树活动，并把曾孙事件按真实身份转发到根且不重复", async () => {
   const rootSupervisor = new FakeSupervisor(AGENT_ID);
   const { controller: root } = makeController(rootSupervisor);
   const rootSpawned = await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
   assert.equal(rootSpawned.ok, true, JSON.stringify(rootSpawned));
 
-  const childTree = new TreeController({
-    config: {
-      maxDepth: 3,
-      maxChildrenPerAgent: 4,
-      maxAgentsPerTree: 8,
-      waitTimeoutMs: 10_000,
-    },
-    idFactory: () => GRANDCHILD_ID,
-    initialActor: {
-      agentId: AGENT_ID,
-      parentAgentId: null,
-      depth: 1,
-      templateId: "demo",
-      name: "直接子代理",
-      managementEnabled: true,
-    },
-  });
   const grandchildSupervisor = new FakeSupervisor(GRANDCHILD_ID);
-  grandchildSupervisor.tree = childTree;
   const childToRoot: SupervisorActivityDelivery[] = [];
-  const child = new AgentController({
-    tree: childTree,
-    actor: { kind: "agent", agent_id: AGENT_ID },
-    allowUnvalidatedTemplates: true,
-    createSupervisor: (input) => {
-      grandchildSupervisor.actor = input.actor;
-      grandchildSupervisor.reservation = input.reservation;
-      return grandchildSupervisor;
-    },
-    replyNotificationsHandledByInbox: false,
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: grandchildSupervisor,
     publishUpstreamActivity: (delivery) => {
       childToRoot.push(delivery);
       rootSupervisor.emitActivityDelivery(delivery);
@@ -237,19 +256,46 @@ test("每层缓存自身与直接子树活动，并把孙代理事件逐级隔�
   const childSpawned = await child.spawnAgent({ template_id: "demo", name: "孙代理" });
   assert.equal(childSpawned.ok, true, JSON.stringify(childSpawned));
 
-  assert.equal(child.recordOwnActivity(message("直接子自身事件")), true);
-  grandchildSupervisor.emitActivityStream(message("孙代理自身事件"));
+  const greatGrandchildSupervisor = new FakeSupervisor(GREAT_GRANDCHILD_ID);
+  const grandchildToChild: SupervisorActivityDelivery[] = [];
+  const grandchild = makeChildModeController({
+    agentId: GRANDCHILD_ID,
+    parentAgentId: AGENT_ID,
+    depth: 2,
+    directChildId: GREAT_GRANDCHILD_ID,
+    directChildSupervisor: greatGrandchildSupervisor,
+    publishUpstreamActivity: (delivery) => {
+      grandchildToChild.push(delivery);
+      grandchildSupervisor.emitActivityDelivery(delivery);
+    },
+  });
+  const grandchildSpawned = await grandchild.spawnAgent({ template_id: "demo", name: "曾孙代理" });
+  assert.equal(grandchildSpawned.ok, true, JSON.stringify(grandchildSpawned));
 
+  assert.equal(child.recordOwnActivity(message("直接子自身事件")), true);
+  assert.equal(grandchild.recordOwnActivity(message("孙代理自身事件")), true);
+  greatGrandchildSupervisor.emitActivityStream(message("曾孙代理自身事件"));
+
+  assert.deepEqual(grandchild.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
+  assert.deepEqual(grandchild.getActivityReplay(GREAT_GRANDCHILD_ID), [message("曾孙代理自身事件")]);
   assert.deepEqual(child.getActivityReplay(AGENT_ID), [message("直接子自身事件")]);
   assert.deepEqual(child.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
+  assert.deepEqual(child.getActivityReplay(GREAT_GRANDCHILD_ID), [message("曾孙代理自身事件")]);
   assert.deepEqual(root.getActivityReplay(AGENT_ID), [message("直接子自身事件")]);
   assert.deepEqual(root.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
+  assert.deepEqual(root.getActivityReplay(GREAT_GRANDCHILD_ID), [message("曾孙代理自身事件")]);
+  assert.deepEqual(grandchildToChild, [
+    { agent_id: GRANDCHILD_ID, event: message("孙代理自身事件") },
+    { agent_id: GREAT_GRANDCHILD_ID, event: message("曾孙代理自身事件") },
+  ]);
   assert.deepEqual(childToRoot, [
     { agent_id: AGENT_ID, event: message("直接子自身事件") },
     { agent_id: GRANDCHILD_ID, event: message("孙代理自身事件") },
+    { agent_id: GREAT_GRANDCHILD_ID, event: message("曾孙代理自身事件") },
   ]);
   assert.equal(root.getActivityRevision(AGENT_ID), 1);
   assert.equal(root.getActivityRevision(GRANDCHILD_ID), 1);
+  assert.equal(root.getActivityRevision(GREAT_GRANDCHILD_ID), 1);
 });
 
 test("根控制器没有可上行的自身代理身份", () => {
