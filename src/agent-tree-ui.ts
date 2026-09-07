@@ -42,12 +42,6 @@ interface AgentTreeCustomOptions {
   };
 }
 
-interface AgentTreePanelTheme {
-  fg?(color: string, text: string): string;
-  bg?(color: string, text: string): string;
-  bold?(text: string): string;
-}
-
 interface PanelRow {
   readonly key: string;
   readonly text: string;

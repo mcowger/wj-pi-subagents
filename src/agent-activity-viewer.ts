@@ -6,7 +6,6 @@ import {
   renderPanelRule,
   safeUiFact,
   truncateToDisplayWidth,
-  type UiPanelLineStyle,
 } from "./ui-surface.ts";
 
 export { displayWidth } from "./ui-surface.ts";
@@ -128,7 +127,7 @@ export class AgentActivityViewerModel {
 
   handleInput(data: string): AgentActivityViewerInputOutcome {
     if (data === "\x1b") return "close";
-    const maxOffset = Math.max(0, this.eventLines().length - this.viewportHeight);
+    const maxOffset = this.maxScrollOffset();
     if (this.followEnabled) this.scrollOffset = maxOffset;
     if (data === "\x1b[A" || data === "k") {
       if (this.scrollOffset <= 0) return "ignored";
@@ -151,7 +150,7 @@ export class AgentActivityViewerModel {
 
   getPublicState(): AgentActivityViewerPublicState {
     this.settleFollow();
-    const maxOffset = Math.max(0, this.eventLines().length - this.viewportHeight);
+    const maxOffset = this.maxScrollOffset();
     this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, maxOffset));
     return Object.freeze({
       event_count: this.events.length,
@@ -164,7 +163,11 @@ export class AgentActivityViewerModel {
   /** 跟随时视口始终对齐最新事件；暂停时保持用户当前回看位置。 */
   private settleFollow(): void {
     if (!this.followEnabled) return;
-    this.scrollOffset = Math.max(0, this.eventLines().length - this.viewportHeight);
+    this.scrollOffset = this.maxScrollOffset();
+  }
+
+  private maxScrollOffset(): number {
+    return Math.max(0, this.eventLines().length - this.viewportHeight);
   }
 
   /** 把活动事件闭集渲染为纯文本级行；事件数为零时给出明确空态。 */
@@ -200,8 +203,6 @@ export class AgentActivityViewerModel {
   }
 }
 
-type AgentActivityViewerLineStyle = UiPanelLineStyle;
-
 /** 将纯查看器投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
 export function renderAgentActivityViewerSurface(
   model: AgentActivityViewerModel | undefined,
@@ -219,7 +220,6 @@ export function renderAgentActivityViewerSurface(
   const footer = semanticLines.at(-1)?.text ?? "";
   const body = semanticLines.slice(1, -1);
   const bodyHeight = model?.getViewportHeight() ?? DEFAULT_VIEWER_VIEWPORT_HEIGHT;
-  const bodyStyle = (): AgentActivityViewerLineStyle => "body";
 
   if (!framed) {
     return Object.freeze([
@@ -227,7 +227,7 @@ export function renderAgentActivityViewerSurface(
       ...body.map((line) => renderNarrowPanelLine(
         line.text,
         panelWidth,
-        bodyStyle(),
+        "body",
         false,
         theme,
       )),
@@ -242,7 +242,7 @@ export function renderAgentActivityViewerSurface(
     ...body.map((line) => renderFramedPanelLine(
       line.text,
       contentWidth,
-      bodyStyle(),
+      "body",
       false,
       theme,
     )),
