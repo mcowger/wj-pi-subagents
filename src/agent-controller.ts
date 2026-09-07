@@ -29,7 +29,10 @@ import {
   type RpcSupervisorTerminationResult,
 } from "./rpc-supervisor.ts";
 import { AgentActivityCache } from "./agent-activity-cache.ts";
-import type { SafeAgentActivityEvent } from "./rpc-bridge-event.ts";
+import type {
+  SafeAgentActivityDisplayEvent,
+  SafeAgentActivityEvent,
+} from "./rpc-bridge-event.ts";
 import type { SupervisorActivityDelivery } from "./supervisor-channel.ts";
 
 import {
@@ -213,6 +216,11 @@ export class AgentController {
   private readonly authority: TreeAuthorityPort | undefined;
   private readonly publishUpstreamActivity: AgentControllerOptions["publishUpstreamActivity"];
   private readonly activityCache = new AgentActivityCache();
+  /** 短暂逐 token 显示事件只通知已打开查看器，不缓存、不上行。 */
+  private readonly activityDisplayListeners = new Set<(
+    agentId: string,
+    event: SafeAgentActivityDisplayEvent,
+  ) => void>();
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
@@ -787,6 +795,17 @@ export class AgentController {
     return this.activityCache.onChange(listener);
   }
 
+  /**
+   * 注册短暂显示事件观察者。该通道没有 replay、修订号或持久化，故不会把
+   * token delta 混入 AgentActivityCache。
+   */
+  onActivityDisplayChange(
+    listener: (agentId: string, event: SafeAgentActivityDisplayEvent) => void,
+  ): () => void {
+    this.activityDisplayListeners.add(listener);
+    return () => this.activityDisplayListeners.delete(listener);
+  }
+
   async getAgentTemplates(): Promise<ControlResult<readonly AgentTemplateListItem[]>> {
     if (this.authority !== undefined) return this.authority.listTemplates(this.actor);
     return Object.freeze({
@@ -1016,6 +1035,15 @@ export class AgentController {
         }));
       } catch {
         // 上行转发失败不回滚本地缓存，也不改变节点生命周期。
+      }
+    }
+    if (event.kind === "activity_display" && agentId !== undefined) {
+      for (const listener of this.activityDisplayListeners) {
+        try {
+          listener(agentId, event.event);
+        } catch {
+          // 显示观察者异常不得影响控制器、缓存或其他观察者。
+        }
       }
     }
     // activity 阶段属于安全树快照；工具正文、名称和参数仍只留在监督器本地。

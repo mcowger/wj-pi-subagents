@@ -1,8 +1,11 @@
 import { Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
 import {
+  ACTIVITY_MAX_TEXT_BYTES,
+  parseAgentActivityDisplayEvent,
   parseAgentActivityEvent,
   type SafeAgentActivityContentBlock,
+  type SafeAgentActivityDisplayEvent,
   type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
 import {
@@ -21,7 +24,6 @@ const DEFAULT_VIEWER_VIEWPORT_HEIGHT = 20;
 const DEFAULT_LAYOUT_WIDTH = 80;
 const DEFAULT_TOOL_RESULT_COLLAPSE_LINES = 4;
 const DEFAULT_TOOL_RESULT_COLLAPSE_CHARS = 240;
-const DEFAULT_RENDER_THROTTLE_MS = 50;
 const MAX_TOOL_SUMMARY_KEYS = 3;
 const MAX_TOOL_SUMMARY_VALUE_CHARS = 96;
 const MAX_TOOL_SUMMARY_WIDTH = 160;
@@ -67,10 +69,6 @@ export interface AgentActivityViewerOptions {
   readonly tool_result_collapse_lines?: number;
   /** 结果超过该显示字符数后默认折叠。 */
   readonly tool_result_collapse_chars?: number;
-  /** 显示层重绘请求的最小间隔；不影响模型接收完整事件。 */
-  readonly render_throttle_ms?: number;
-  /** 供测试或宿主注入单调时钟。 */
-  readonly now?: () => number;
 }
 
 export type AgentActivityViewerInputOutcome = "changed" | "ignored" | "close";
@@ -104,6 +102,16 @@ interface ToolDisplayEntry {
   hasResult: boolean;
 }
 
+interface LiveMessageBlock {
+  readonly contentType: "text" | "thinking";
+  value: string;
+}
+
+interface LiveMessageEntry {
+  lastSequence: number;
+  readonly blocks: Map<number, LiveMessageBlock>;
+}
+
 type DisplayEntry = MessageDisplayEntry | ToolDisplayEntry;
 
 /**
@@ -117,11 +125,11 @@ export class AgentActivityViewerModel {
   private readonly name: string;
   private lifecycleState: AgentLifecycleState;
   private readonly events: SafeAgentActivityEvent[] = [];
+  /** 从 bridge 短暂转发的 token 增量；不进入回放、事件数或父端缓存。 */
+  private readonly liveMessages = new Map<string, LiveMessageEntry>();
   private readonly viewportHeight: number;
   private readonly collapseLines: number;
   private readonly collapseChars: number;
-  private readonly renderThrottleMs: number;
-  private readonly now: () => number;
   private readonly expandedToolCallIds = new Set<string>();
   private replayCursor = 0;
   private layoutWidth = DEFAULT_LAYOUT_WIDTH;
@@ -133,8 +141,6 @@ export class AgentActivityViewerModel {
     readonly revision: number;
     readonly lines: readonly ViewerSemanticLine[];
   } | undefined;
-  private renderInvalidated = true;
-  private lastPaintAt: number | undefined;
   private batching = false;
 
   constructor(
@@ -155,11 +161,6 @@ export class AgentActivityViewerModel {
       options.tool_result_collapse_chars,
       DEFAULT_TOOL_RESULT_COLLAPSE_CHARS,
     );
-    this.renderThrottleMs = validNonNegativeOption(
-      options.render_throttle_ms,
-      DEFAULT_RENDER_THROTTLE_MS,
-    );
-    this.now = options.now ?? (() => Date.now());
     this.syncFrom(replay);
   }
 
@@ -171,7 +172,6 @@ export class AgentActivityViewerModel {
   updateLifecycle(state: AgentLifecycleState): AgentActivityViewerUpdateOutcome {
     if (state === this.lifecycleState) return "ignored";
     this.lifecycleState = state;
-    this.invalidateRender();
     return "changed";
   }
 
@@ -180,9 +180,9 @@ export class AgentActivityViewerModel {
     const parsed = parseAgentActivityEvent(event);
     if (parsed.kind !== "event") return "ignored";
     this.events.push(parsed.event);
+    if (parsed.event.type === "message") this.liveMessages.clear();
     this.projectionRevision += 1;
     this.cachedProjection = undefined;
-    this.invalidateRender();
     if (!this.batching) this.settleFollow();
     return "changed";
   }
@@ -215,25 +215,61 @@ export class AgentActivityViewerModel {
   }
 
   /**
-   * 返回当前显示投影的重绘许可。快速追加只令该许可保持 pending，宿主可用
-   * 定时器在许可变为 true 时请求一次 TUI 重绘；完整事件仍立即保存在模型中。
+   * 接收仅显示层的有序 token 增量。乱序、重复、超预算或结构违约帧不会进入
+   * 完整活动历史；检测到序号缺口时丢弃该草稿，等待权威 message_end 收束。
    */
-  shouldRender(now = this.now()): boolean {
-    if (!this.renderInvalidated) return false;
-    const current = finiteTime(now, this.now());
-    if (
-      this.lastPaintAt !== undefined
-      && current >= this.lastPaintAt
-      && current - this.lastPaintAt < this.renderThrottleMs
-    ) return false;
-    this.renderInvalidated = false;
-    this.lastPaintAt = current;
-    return true;
-  }
-
-  /** 当前节流窗口，供 overlay 装配层安排下一次重绘。 */
-  getRenderThrottleMs(): number {
-    return this.renderThrottleMs;
+  applyDisplayEvent(event: SafeAgentActivityDisplayEvent): AgentActivityViewerUpdateOutcome {
+    const parsed = parseAgentActivityDisplayEvent(event);
+    if (parsed.kind !== "event") return "ignored";
+    const update = parsed.event;
+    const existing = this.liveMessages.get(update.streamId);
+    if (update.type === "message_complete") {
+      if (existing === undefined || update.sequence !== existing.lastSequence + 1) return "ignored";
+      this.liveMessages.delete(update.streamId);
+      this.touchProjection();
+      return "changed";
+    }
+    if (existing === undefined) {
+      if (update.sequence !== 1) return "ignored";
+      const entry: LiveMessageEntry = { lastSequence: update.sequence, blocks: new Map() };
+      entry.blocks.set(update.contentIndex, { contentType: update.contentType, value: update.delta });
+      if (!isLiveMessageWithinBudget(entry)) return "ignored";
+      this.liveMessages.set(update.streamId, entry);
+      this.touchProjection();
+      this.settleFollow();
+      return "changed";
+    }
+    if (update.sequence !== existing.lastSequence + 1) {
+      if (update.sequence > existing.lastSequence) {
+        this.liveMessages.delete(update.streamId);
+        this.touchProjection();
+        return "changed";
+      }
+      return "ignored";
+    }
+    const block = existing.blocks.get(update.contentIndex);
+    if (block !== undefined && block.contentType !== update.contentType) {
+      this.liveMessages.delete(update.streamId);
+      this.touchProjection();
+      return "changed";
+    }
+    const previous = block?.value;
+    if (block === undefined) {
+      existing.blocks.set(update.contentIndex, { contentType: update.contentType, value: update.delta });
+    } else {
+      block.value += update.delta;
+    }
+    if (!isLiveMessageWithinBudget(existing)) {
+      if (block === undefined) existing.blocks.delete(update.contentIndex);
+      else block.value = previous ?? "";
+      this.liveMessages.delete(update.streamId);
+      this.touchProjection();
+      return "changed";
+    }
+    existing.lastSequence = update.sequence;
+    this.touchProjection();
+    this.settleFollow();
+    return "changed";
   }
 
   /** 当前已展开的工具调用 ID；状态不随追加事件丢失。 */
@@ -260,7 +296,6 @@ export class AgentActivityViewerModel {
     else this.expandedToolCallIds.delete(toolCallId);
     this.projectionRevision += 1;
     this.cachedProjection = undefined;
-    this.invalidateRender();
     this.settleFollow();
     return "changed";
   }
@@ -292,8 +327,6 @@ export class AgentActivityViewerModel {
       this.followEnabled ? FOLLOWING_FOOTER_TEXT : PAUSED_FOOTER_TEXT,
       contentWidth,
     );
-    this.renderInvalidated = false;
-    this.lastPaintAt = finiteTime(this.now(), Date.now());
     return Object.freeze([
       Object.freeze({ text: identity, style: "header" as const }),
       ...visible,
@@ -317,14 +350,12 @@ export class AgentActivityViewerModel {
       if (this.scrollOffset <= 0) return "ignored";
       this.followEnabled = false;
       this.scrollOffset -= 1;
-      this.invalidateRender();
       return "changed";
     }
     if (data === "\x1b[B" || data === "j") {
       if (this.scrollOffset >= maxOffset) return "ignored";
       this.scrollOffset += 1;
       if (this.scrollOffset >= maxOffset) this.followEnabled = true;
-      this.invalidateRender();
       return "changed";
     }
     return "ignored";
@@ -355,8 +386,9 @@ export class AgentActivityViewerModel {
     return Math.max(0, this.eventLines(this.layoutWidth).length - this.viewportHeight);
   }
 
-  private invalidateRender(): void {
-    this.renderInvalidated = true;
+  private touchProjection(): void {
+    this.projectionRevision += 1;
+    this.cachedProjection = undefined;
   }
 
   private replayPrefixMatches(replay: readonly SafeAgentActivityEvent[]): boolean {
@@ -396,7 +428,7 @@ export class AgentActivityViewerModel {
       entry.kind === "tool"
       && entry.toolCallId === toolCallId
       && entry.hasResult
-      && this.isLongResult(entry.result ?? "")
+      && this.isLongResult(decodeToolResult(entry.result))
     );
   }
 
@@ -405,25 +437,17 @@ export class AgentActivityViewerModel {
     return safe.split("\n").length > this.collapseLines || displayWidth(safe) > this.collapseChars;
   }
 
-  /** 将活动事件投影成消息与工具行；连续累计消息快照只保留最新显示版本。 */
+  /** 将完整活动事件投影成消息与工具行，保留每条 message 的权威边界。 */
   private projectEntries(): DisplayEntry[] {
     const entries: DisplayEntry[] = [];
     const activeTools = new Map<string, ToolDisplayEntry>();
-    let lastMessage: MessageDisplayEntry | undefined;
 
-    for (let index = 0; index < this.events.length; index += 1) {
-      const event = this.events[index]!;
+    for (const event of this.events) {
       if (event.type === "message") {
-        if (lastMessage !== undefined && canMergeMessage(lastMessage.content, event.content)) {
-          lastMessage.content = event.content;
-        } else {
-          lastMessage = { kind: "message", content: event.content };
-          entries.push(lastMessage);
-        }
+        entries.push({ kind: "message", content: event.content });
         continue;
       }
 
-      lastMessage = undefined;
       if (event.type === "tool_execution_start") {
         const entry: ToolDisplayEntry = {
           kind: "tool",
@@ -459,6 +483,14 @@ export class AgentActivityViewerModel {
         existing.hasResult = true;
       }
     }
+    for (const live of this.liveMessages.values()) {
+      const content = [...live.blocks.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, block]) => block.contentType === "text"
+          ? Object.freeze({ type: "text" as const, text: block.value })
+          : Object.freeze({ type: "thinking" as const, thinking: block.value }));
+      if (content.length > 0) entries.push({ kind: "message", content });
+    }
     return entries;
   }
 
@@ -471,7 +503,7 @@ export class AgentActivityViewerModel {
       && this.cachedProjection.revision === this.projectionRevision
     ) return this.cachedProjection.lines;
 
-    if (this.events.length === 0) {
+    if (this.events.length === 0 && this.liveMessages.size === 0) {
       const empty = Object.freeze([{ text: EMPTY_ACTIVITY_TEXT, style: "body" as const }]);
       this.cachedProjection = { width: contentWidth, revision: this.projectionRevision, lines: empty };
       return empty;
@@ -500,7 +532,7 @@ export class AgentActivityViewerModel {
       }));
       if (!entry.hasResult) continue;
 
-      const result = sanitizeViewerMarkup(entry.result ?? "");
+      const result = decodeToolResult(entry.result);
       const long = this.isLongResult(result);
       if (long && !this.expandedToolCallIds.has(entry.toolCallId)) {
         const count = result.split("\n").length;
@@ -685,18 +717,28 @@ function summaryKeyRank(key: string): number {
   return rank < 0 ? 100 : rank;
 }
 
-function canMergeMessage(
-  previous: readonly SafeAgentActivityContentBlock[],
-  next: readonly SafeAgentActivityContentBlock[],
-): boolean {
-  if (previous.length !== next.length || previous.length === 0) return false;
-  const previousText = contentSignature(previous);
-  const nextText = contentSignature(next);
-  return previousText === nextText || nextText.startsWith(previousText) || previousText.startsWith(nextText);
+function isLiveMessageWithinBudget(entry: LiveMessageEntry): boolean {
+  let bytes = 0;
+  let blocks = 0;
+  for (const block of entry.blocks.values()) {
+    bytes += (blocks === 0 ? 0 : 1) + new TextEncoder().encode(JSON.stringify(block.value)).byteLength;
+    blocks += 1;
+    if (bytes > ACTIVITY_MAX_TEXT_BYTES) return false;
+  }
+  return true;
 }
 
-function contentSignature(content: readonly SafeAgentActivityContentBlock[]): string {
-  return content.map((block) => `${block.type}\u0000${block.type === "text" ? block.text : block.thinking}`).join("\u0001");
+function decodeToolResult(raw: string | undefined): string {
+  if (raw === undefined) return "";
+  try {
+    const decoded: unknown = JSON.parse(raw);
+    if (typeof decoded === "string") return sanitizeViewerMarkup(decoded);
+    const formatted = JSON.stringify(decoded);
+    return sanitizeViewerMarkup(formatted ?? "");
+  } catch {
+    // 测试替身和旧缓存可能保存原始文本，保留其可读回退。
+    return sanitizeViewerMarkup(raw);
+  }
 }
 
 function wrapPlainText(value: string, width: number): readonly string[] {
@@ -771,14 +813,6 @@ function validRenderWidth(value: number): number {
 
 function validPositiveOption(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : fallback;
-}
-
-function validNonNegativeOption(value: number | undefined, fallback: number): number {
-  return Number.isSafeInteger(value) && (value ?? 0) >= 0 ? value! : fallback;
-}
-
-function finiteTime(value: number, fallback: number): number {
-  return Number.isFinite(value) ? value : fallback;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

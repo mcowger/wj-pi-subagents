@@ -7,6 +7,7 @@ import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 export const ACTIVITY_MAX_TEXT_BYTES = 16 * 1024;
 const MAX_ACTIVITY_CONTENT_BLOCKS = 64;
 const MAX_TOOL_ID_BYTES = 256;
+const MAX_ACTIVITY_STREAM_ID_BYTES = 128;
 
 /** 活动消息事件允许的正文块闭集：assistant 文本与 thinking。 */
 export type SafeAgentActivityContentBlock =
@@ -32,6 +33,31 @@ export type SafeAgentActivityEvent =
       readonly result?: string;
       readonly isError?: boolean;
     };
+
+/**
+ * 仅供已打开查看器使用的短暂 assistant 增量；它绝不进入活动缓存。
+ * sequence 在每个 streamId 内严格递增，接收端据此拒绝乱序或重复帧。
+ */
+export type SafeAgentActivityDisplayEvent =
+  | {
+      readonly type: "message_delta";
+      readonly streamId: string;
+      readonly sequence: number;
+      readonly contentIndex: number;
+      readonly contentType: "text" | "thinking";
+      readonly delta: string;
+    }
+  | {
+      readonly type: "message_complete";
+      readonly streamId: string;
+      readonly sequence: number;
+    };
+
+export type AgentActivityDisplayEventNormalization =
+  | { readonly kind: "event"; readonly event: SafeAgentActivityDisplayEvent }
+  | { readonly kind: "ignored" }
+  | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
+  | { readonly kind: "invalid" };
 
 export type AgentActivityEventNormalization =
   | { readonly kind: "event"; readonly event: SafeAgentActivityEvent }
@@ -78,7 +104,13 @@ export type AssistantMessageEndNormalization = RpcBridgeEventNormalization;
 const IGNORED_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "ignored" });
 const INVALID_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "invalid" });
 const INVALID_ACTIVITY_EVENT: AgentActivityEventNormalization = Object.freeze({ kind: "invalid" });
+const INVALID_ACTIVITY_DISPLAY_EVENT: AgentActivityDisplayEventNormalization = Object.freeze({ kind: "invalid" });
+const IGNORED_ACTIVITY_DISPLAY_EVENT: AgentActivityDisplayEventNormalization = Object.freeze({ kind: "ignored" });
 const ACTIVITY_REJECTED: AgentActivityEventNormalization = Object.freeze({
+  kind: "rejected",
+  reason: "reply_too_large",
+});
+const ACTIVITY_DISPLAY_REJECTED: AgentActivityDisplayEventNormalization = Object.freeze({
   kind: "rejected",
   reason: "reply_too_large",
 });
@@ -280,6 +312,90 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
     default:
       return INVALID_ACTIVITY_EVENT;
   }
+}
+
+/**
+ * 校验 bridge 生成的显示层短暂事件。它与完整活动事件使用相同的正文预算，
+ * 但不会被 AgentActivityCache 接收或回放。
+ */
+export function parseAgentActivityDisplayEvent(
+  value: unknown,
+): AgentActivityDisplayEventNormalization {
+  if (!isRecord(value) || typeof value.type !== "string") return INVALID_ACTIVITY_DISPLAY_EVENT;
+  const streamId = value.streamId;
+  const sequence = value.sequence;
+  if (!validBoundedText(streamId, MAX_ACTIVITY_STREAM_ID_BYTES)) {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
+  if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= 0) {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
+  if (value.type === "message_complete") {
+    return Object.freeze({
+      kind: "event",
+      event: Object.freeze({
+        type: "message_complete" as const,
+        streamId,
+        sequence,
+      }),
+    });
+  }
+  if (value.type !== "message_delta") return INVALID_ACTIVITY_DISPLAY_EVENT;
+  const contentIndex = value.contentIndex;
+  const contentType = value.contentType;
+  const delta = value.delta;
+  if (
+    typeof contentIndex !== "number"
+    || !Number.isSafeInteger(contentIndex)
+    || contentIndex < 0
+    || contentIndex >= MAX_ACTIVITY_CONTENT_BLOCKS
+    || (contentType !== "text" && contentType !== "thinking")
+    || typeof delta !== "string"
+    || delta.length === 0
+  ) return INVALID_ACTIVITY_DISPLAY_EVENT;
+  if (encodedJsonLength(delta) > ACTIVITY_MAX_TEXT_BYTES) {
+    return ACTIVITY_DISPLAY_REJECTED;
+  }
+  return Object.freeze({
+    kind: "event",
+    event: Object.freeze({
+      type: "message_delta" as const,
+      streamId,
+      sequence,
+      contentIndex,
+      contentType,
+      delta,
+    }),
+  });
+}
+
+/**
+ * 从 Pi JSON/RPC message_update 中只提取文本与 thinking 增量。工具调用增量
+ * 由完整 tool_execution_start/end 负责呈现，因此在此显示通道中明确忽略。
+ */
+export function normalizeAssistantMessageUpdate(
+  value: unknown,
+  streamId: string,
+  sequence: number,
+): AgentActivityDisplayEventNormalization {
+  if (!isRecord(value) || value.type !== "message_update" || !isRecord(value.assistantMessageEvent)) {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
+  const update = value.assistantMessageEvent;
+  if (update.type !== "text_delta" && update.type !== "thinking_delta") {
+    return IGNORED_ACTIVITY_DISPLAY_EVENT;
+  }
+  // Pi 声明 delta 为普通 string；空增量没有可显示内容，不应把合法上游
+  // 心跳/边界事件升级为 bridge 协议故障。
+  if (update.delta === "") return IGNORED_ACTIVITY_DISPLAY_EVENT;
+  return parseAgentActivityDisplayEvent({
+    type: "message_delta",
+    streamId,
+    sequence,
+    contentIndex: update.contentIndex,
+    contentType: update.type === "text_delta" ? "text" : "thinking",
+    delta: update.delta,
+  });
 }
 
 /** 把 Pi assistant message_end 收窄为活动消息事件；预算覆盖整条连接后正文。 */

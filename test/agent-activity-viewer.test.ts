@@ -5,7 +5,10 @@ import {
   displayWidth,
   renderAgentActivityViewerSurface,
 } from "../src/agent-activity-viewer.ts";
-import type { SafeAgentActivityEvent } from "../src/rpc-bridge-event.ts";
+import type {
+  SafeAgentActivityDisplayEvent,
+  SafeAgentActivityEvent,
+} from "../src/rpc-bridge-event.ts";
 import { ACTIVITY_MAX_TEXT_BYTES } from "../src/rpc-bridge-event.ts";
 import type { AgentLifecycleState } from "../src/agent-snapshot-codec.ts";
 
@@ -47,6 +50,27 @@ function toolEnd(
     ...(result === undefined ? {} : { result }),
     ...(isError === undefined ? {} : { isError }),
   });
+}
+
+function displayDelta(
+  streamId: string,
+  sequence: number,
+  contentIndex: number,
+  contentType: "text" | "thinking",
+  delta: string,
+): SafeAgentActivityDisplayEvent {
+  return Object.freeze({
+    type: "message_delta",
+    streamId,
+    sequence,
+    contentIndex,
+    contentType,
+    delta,
+  });
+}
+
+function displayComplete(streamId: string, sequence: number): SafeAgentActivityDisplayEvent {
+  return Object.freeze({ type: "message_complete", streamId, sequence });
 }
 
 /** 4 行正文消息 + 工具开始/结束各 1 行 = 6 行事件正文。 */
@@ -274,11 +298,12 @@ test("工具调用只显示单行关键参数摘要", () => {
   assert.ok((callLines[0] ?? "").length < 140, callLines[0]);
 });
 
-test("超长工具结果默认折叠，展开后追加仍保持展开状态", () => {
+test("超长工具结果按桥接 JSON 编码还原后默认折叠，展开后追加仍保持展开状态", () => {
   const result = Array.from({ length: 8 }, (_, index) => `result-line-${index + 1}`).join("\n");
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     toolStart("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
-    toolEnd("t-long", "read_file", result),
+    // 桥接对原始字符串执行 JSON.stringify；查看器必须在显示层还原换行。
+    toolEnd("t-long", "read_file", JSON.stringify(result)),
   ], { viewport_height: 20 });
 
   const collapsed = viewer.render(120).slice(1, -1).join("\n");
@@ -294,33 +319,44 @@ test("超长工具结果默认折叠，展开后追加仍保持展开状态", ()
   assert.match(afterAppend, /result-line-8/u);
 });
 
-test("连续流式消息在显示层合并但保留完整事件计数", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("H")]);
-  for (const snapshot of ["He", "Hel", "Hell", "Hello"]) {
-    viewer.appendEvent(textMessage(snapshot));
-  }
+test("连续完整 assistant 消息保持事件边界", () => {
+  const messages = ["H", "He", "Hel", "Hell", "Hello"];
+  const viewer = new AgentActivityViewerModel(viewerAgent(), messages.map(textMessage));
 
   const body = viewer.render(120).slice(1, -1);
-  assert.deepEqual(body.filter((line) => ["H", "He", "Hel", "Hell", "Hello"].includes(line)), ["Hello"]);
-  assert.equal(viewer.getPublicState().event_count, 5);
+  assert.deepEqual(body.filter((line) => messages.includes(line)), messages);
+  assert.equal(viewer.getPublicState().event_count, messages.length);
 });
 
-test("显示层节流重绘许可但不丢弃快速追加事件", () => {
-  let now = 1_000;
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("first")], {
-    render_throttle_ms: 50,
-    now: () => now,
-  });
+test("逐 token 显示事件只驻留查看器投影，并在完整消息抵达时收束", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 1, 0, "text", "Hel")), "changed");
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 2, 0, "text", "lo")), "changed");
+  assert.equal(viewer.getPublicState().event_count, 0);
+  assert.match(viewer.render(120).join("\n"), /Hello/u);
 
-  assert.equal(viewer.shouldRender(), true);
-  assert.equal(viewer.shouldRender(), false);
-  viewer.appendEvent(textMessage("second"));
-  now = 1_020;
-  assert.equal(viewer.shouldRender(), false);
-  now = 1_050;
-  assert.equal(viewer.shouldRender(), true);
-  assert.equal(viewer.getPublicState().event_count, 2);
-  assert.ok(viewer.render(120).some((line) => line.includes("second")));
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 4, 0, "text", "!")), "changed");
+  assert.doesNotMatch(viewer.render(120).join("\n"), /Hello!/u);
+  assert.equal(viewer.applyDisplayEvent(displayComplete("message-1", 3)), "ignored");
+
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-2", 1, 0, "text", "done")), "changed");
+  assert.equal(viewer.applyDisplayEvent(displayComplete("message-2", 2)), "changed");
+  assert.doesNotMatch(viewer.render(120).join("\n"), /done/u);
+  viewer.appendEvent(textMessage("done"));
+  assert.equal(viewer.getPublicState().event_count, 1);
+  assert.match(viewer.render(120).join("\n"), /done/u);
+});
+
+test("实时完整事件追加不会丢失快速到达的消息", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("first")]);
+  for (const text of ["second", "third", "fourth"]) viewer.appendEvent(textMessage(text));
+
+  const body = viewer.render(120).slice(1, -1).join("\n");
+  assert.match(body, /first/u);
+  assert.match(body, /second/u);
+  assert.match(body, /third/u);
+  assert.match(body, /fourth/u);
+  assert.equal(viewer.getPublicState().event_count, 4);
 });
 
 test("查看器正文净化 ANSI 与方向控制序列", () => {
@@ -347,7 +383,7 @@ test("展开状态按工具调用 ID 在宽度变化和追加后保持", () => {
   const result = Array.from({ length: 6 }, (_, index) => `line-${index}`).join("\n");
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     toolStart("stable-id", "read_file", JSON.stringify({ path: "x.txt" })),
-    toolEnd("stable-id", "read_file", result),
+    toolEnd("stable-id", "read_file", JSON.stringify(result)),
   ]);
   assert.equal(viewer.setToolResultExpanded("stable-id", true), "changed");
   assert.deepEqual(viewer.getExpandedToolCallIds(), ["stable-id"]);

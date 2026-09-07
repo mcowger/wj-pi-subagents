@@ -1,5 +1,9 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
-import type { SafeAgentActivityEvent } from "./rpc-bridge-event.ts";
+import {
+  parseAgentActivityDisplayEvent,
+  type SafeAgentActivityDisplayEvent,
+  type SafeAgentActivityEvent,
+} from "./rpc-bridge-event.ts";
 import {
   ManagedRpcCommandRejectedError,
   ManagedRpcStartupError,
@@ -303,6 +307,11 @@ export type RpcSupervisorEvent =
       /** 后代活动事件经监督通道转发时携带其身份；直接子代理活动省略。 */
       readonly agent_id?: string;
       readonly event: SafeAgentActivityEvent;
+    }
+  | {
+      readonly kind: "activity_display";
+      /** 仅本进程查看器消费的 transient 帧，禁止写入活动缓存或向上汇聚。 */
+      readonly event: SafeAgentActivityDisplayEvent;
     }
   | {
       readonly kind: "reply";
@@ -980,6 +989,10 @@ export class RpcSupervisor {
   }
 
   private receiveRpcEvent(event: unknown): void {
+    if (this.phase === "terminating") {
+      this.receiveTerminatingDisplayEvent(event);
+      return;
+    }
     if (this.phase !== "ready") return;
     if (!isRecord(event) || typeof event.type !== "string") {
       this.failRuntime("invalid_rpc_event");
@@ -1064,6 +1077,15 @@ export class RpcSupervisor {
         if (event.type === "tool_execution_start") this.receiveToolStart(event);
         else if (event.type === "tool_execution_end") this.receiveToolEnd(event);
         return;
+      case "activity_display": {
+        const display = parseAgentActivityDisplayEvent(event.event);
+        if (display.kind !== "event") {
+          this.failRuntime("invalid_rpc_event");
+          return;
+        }
+        this.emitEvent(Object.freeze({ kind: "activity_display", event: display.event }));
+        return;
+      }
       case "message_end":
         // 回复只能由真正 child 扩展经监督通道上行；任务 RPC 事件不再发布回复。
         return;
@@ -1095,6 +1117,17 @@ export class RpcSupervisor {
           ? "rpc_process_exit"
           : "rpc_protocol_fault";
     this.failRuntime(code);
+  }
+
+  /**
+   * 终止启动后，普通 Pi 事件不再可改变生命周期；唯独 bridge 在 close 前排队的
+   * display 收束帧必须送到已打开查看器，以清除未落账的 token 草稿。
+   */
+  private receiveTerminatingDisplayEvent(event: unknown): void {
+    if (!isRecord(event) || event.type !== "activity_display") return;
+    const display = parseAgentActivityDisplayEvent(event.event);
+    if (display.kind !== "event" || display.event.type !== "message_complete") return;
+    this.emitEvent(Object.freeze({ kind: "activity_display", event: display.event }));
   }
 
   /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */

@@ -5,7 +5,10 @@ import type { Readable, Writable } from "node:stream";
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import type { AgentSnapshot } from "./tree-controller.ts";
 import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
-import { ACTIVITY_MAX_TEXT_BYTES } from "./rpc-bridge-event.ts";
+import {
+  ACTIVITY_MAX_TEXT_BYTES,
+  parseAgentActivityDisplayEvent,
+} from "./rpc-bridge-event.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
 import {
   isManagedProcessTreeAdapter,
@@ -1050,6 +1053,9 @@ function isSafeBridgeEvent(value: unknown): boolean {
       return Number.isSafeInteger(value.pendingMessageCount)
         && (value.pendingMessageCount as number) >= 0
         && Object.keys(value).every((key) => key === "type" || key === "pendingMessageCount");
+    case "activity_display":
+      return Object.keys(value).length === 2
+        && parseAgentActivityDisplayEvent(value.event).kind === "event";
     case "message":
       return isSafeActivityMessageEvent(value);
     case "tool_execution_start":

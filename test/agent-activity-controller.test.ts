@@ -12,7 +12,10 @@ import type {
   RpcSupervisorStartupResult,
   RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
-import type { SafeAgentActivityEvent } from "../src/rpc-bridge-event.ts";
+import type {
+  SafeAgentActivityDisplayEvent,
+  SafeAgentActivityEvent,
+} from "../src/rpc-bridge-event.ts";
 import {
   TreeController,
   ROOT_TREE_ACTOR,
@@ -74,6 +77,12 @@ class FakeSupervisor implements AgentSupervisor {
       }));
     }
   }
+
+  emitActivityDisplay(event: SafeAgentActivityDisplayEvent): void {
+    for (const listener of this.listeners) {
+      listener(Object.freeze({ kind: "activity_display", event }));
+    }
+  }
 }
 
 function message(text: string): SafeAgentActivityEvent {
@@ -127,6 +136,31 @@ test("活动流事件写入父端缓存，按到达序可回放且修订号递�
   ]);
   assert.equal(controller.getActivityRevision(AGENT_ID), 2);
   assert.deepEqual(notified, [AGENT_ID, AGENT_ID]);
+  unsubscribe();
+});
+
+test("逐 token 显示事件只通知查看器，不写入缓存或上行活动流", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, upstream } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  const observed: Array<{ readonly agentId: string; readonly event: SafeAgentActivityDisplayEvent }> = [];
+  const unsubscribe = controller.onActivityDisplayChange((agentId, event) => observed.push({ agentId, event }));
+  const delta: SafeAgentActivityDisplayEvent = Object.freeze({
+    type: "message_delta",
+    streamId: "message-1",
+    sequence: 1,
+    contentIndex: 0,
+    contentType: "text",
+    delta: "partial",
+  });
+  fake.emitActivityDisplay(delta);
+
+  assert.deepEqual(observed, [{ agentId: AGENT_ID, event: delta }]);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
+  assert.equal(controller.getActivityRevision(AGENT_ID), 0);
+  assert.deepEqual(upstream, []);
   unsubscribe();
 });
 

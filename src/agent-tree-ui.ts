@@ -11,7 +11,10 @@ import {
   AgentActivityViewerModel,
   renderAgentActivityViewerSurface,
 } from "./agent-activity-viewer.ts";
-import type { SafeAgentActivityEvent } from "./rpc-bridge-event.ts";
+import type {
+  SafeAgentActivityDisplayEvent,
+  SafeAgentActivityEvent,
+} from "./rpc-bridge-event.ts";
 import {
   displayWidth,
   renderFramedPanelLine,
@@ -78,6 +81,10 @@ export interface AgentTreeSnapshotSource {
 export interface AgentActivityStreamSource {
   readReplay(agentId: string): readonly SafeAgentActivityEvent[];
   onChange(listener: (agentId: string) => void): () => void;
+  /** 可选的 display-only token delta；无回放、无缓存、不向父层汇聚。 */
+  onDisplayChange?(
+    listener: (agentId: string, event: SafeAgentActivityDisplayEvent) => void,
+  ): () => void;
 }
 
 interface AgentTreeTui {
@@ -123,6 +130,7 @@ export interface AgentTreeUiBinding {
 const AGENTS_WIDGET_KEY = "wj-pi-subagents-agents";
 const AGENTS_WIDGET_TITLE = "● Agents";
 const ELAPSED_REFRESH_INTERVAL_MS = 1_000;
+const ACTIVITY_VIEWER_RENDER_THROTTLE_MS = 50;
 /** 与 Pi Loader 默认 Working 指示器保持一致。 */
 const WORKING_SPINNER_FRAMES = Object.freeze([
   "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
@@ -210,6 +218,7 @@ export function bindAgentTreeUi(
   let activeViewer: {
     readonly model: AgentActivityViewerModel;
     readonly done: () => void;
+    readonly scheduleRender: () => void;
   } | undefined;
   let workingSpinnerFrame = 0;
   let widgetHasWorkingAgent = false;
@@ -234,6 +243,10 @@ export function bindAgentTreeUi(
   }
 
   const requestRender = (): void => {
+    if (activeViewer !== undefined) {
+      activeViewer.scheduleRender();
+      return;
+    }
     for (const tui of widgetTuis) safeRequestRender(tui);
     if (activePanel !== undefined) safeRequestRender(activePanel.tui);
   };
@@ -277,7 +290,7 @@ export function bindAgentTreeUi(
   const spinnerTimer = setInterval(() => {
     if (disposed || !widgetHasWorkingAgent) return;
     workingSpinnerFrame = (workingSpinnerFrame + 1) % WORKING_SPINNER_FRAMES.length;
-    for (const tui of widgetTuis) safeRequestRender(tui);
+    requestRender();
     if (context.mode === "rpc") setWidget();
   }, WORKING_SPINNER_INTERVAL_MS);
   spinnerTimer.unref?.();
@@ -392,15 +405,10 @@ export function bindAgentTreeUi(
         let renderTimer: ReturnType<typeof setTimeout> | undefined;
         const scheduleActivityRender = (): void => {
           if (closed || renderTimer !== undefined) return;
-          const delay = model.getRenderThrottleMs();
-          if (delay <= 0) {
-            safeRequestRender(tui);
-            return;
-          }
           renderTimer = setTimeout(() => {
             renderTimer = undefined;
             if (!closed) safeRequestRender(tui);
-          }, delay);
+          }, ACTIVITY_VIEWER_RENDER_THROTTLE_MS);
           renderTimer.unref?.();
         };
         const clearActivityRenderTimer = (): void => {
@@ -409,6 +417,7 @@ export function bindAgentTreeUi(
           renderTimer = undefined;
         };
         let unsubscribe: (() => void) | undefined;
+        let unsubscribeDisplay: (() => void) | undefined;
         try {
           unsubscribe = activity.onChange((changedAgentId) => {
             if (closed || changedAgentId !== node.agent_id) return;
@@ -422,15 +431,29 @@ export function bindAgentTreeUi(
         } catch {
           unsubscribe = undefined;
         }
+        if (typeof activity.onDisplayChange === "function") {
+          try {
+            unsubscribeDisplay = activity.onDisplayChange((changedAgentId, event) => {
+              if (closed || changedAgentId !== node.agent_id) return;
+              if (model.applyDisplayEvent(event) === "changed") scheduleActivityRender();
+            });
+          } catch {
+            unsubscribeDisplay = undefined;
+          }
+        }
         const finish = (): void => {
           if (closed) return;
           closed = true;
           try { unsubscribe?.(); } catch {}
           unsubscribe = undefined;
+          try { unsubscribeDisplay?.(); } catch {}
+          unsubscribeDisplay = undefined;
           clearActivityRenderTimer();
+          if (activeViewer?.model === model) activeViewer = undefined;
           done(undefined);
+          requestRender();
         };
-        activeViewer = { model, done: finish };
+        activeViewer = { model, done: finish, scheduleRender: scheduleActivityRender };
         return {
           render: (width) => {
             try {
@@ -451,6 +474,8 @@ export function bindAgentTreeUi(
           dispose: () => {
             try { unsubscribe?.(); } catch {}
             unsubscribe = undefined;
+            try { unsubscribeDisplay?.(); } catch {}
+            unsubscribeDisplay = undefined;
             clearActivityRenderTimer();
             if (activeViewer?.model === model) activeViewer = undefined;
           },

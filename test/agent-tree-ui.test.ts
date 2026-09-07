@@ -6,8 +6,13 @@ import {
   displayWidth,
   renderAgentTreePanelSurface,
   renderAgentsWidget,
+  type AgentActivityStreamSource,
   type AgentTreeUiContext,
 } from "../src/agent-tree-ui.ts";
+import type {
+  SafeAgentActivityDisplayEvent,
+  SafeAgentActivityEvent,
+} from "../src/rpc-bridge-event.ts";
 import type {
   AgentSnapshot,
   ScopedAgentTreeSnapshot,
@@ -341,4 +346,101 @@ test("/agents overlay 使用既定布局并经宿主路径渲染生命周期主�
     /<fg:dim>.*completed-child.*<\/fg:dim>/,
   );
   binding.dispose();
+});
+
+test("活动 display 与树更新经打开的查看器共用一次 50ms 重绘", async () => {
+  type OverlayComponent = {
+    render(width: number): string[];
+    handleInput?(data: string): void;
+    dispose?(): void;
+  };
+  const overlays: OverlayComponent[] = [];
+  const overlayCompletions: Promise<void>[] = [];
+  const renderRequests: number[] = [];
+  const ui = {
+    custom: (
+      factory: (
+        tui: { requestRender(): void },
+        theme: unknown,
+        keybindings: unknown,
+        done: (result: undefined) => void,
+      ) => OverlayComponent,
+    ) => {
+      const index = overlays.length;
+      let settle: () => void = () => {};
+      const completion = new Promise<void>((resolve) => { settle = resolve; });
+      const component = factory(
+        { requestRender: () => { renderRequests[index] = (renderRequests[index] ?? 0) + 1; } },
+        MARKER_THEME,
+        undefined,
+        () => settle(),
+      );
+      overlays.push(component);
+      overlayCompletions.push(completion);
+      return completion;
+    },
+  } as unknown as NonNullable<AgentTreeUiContext["ui"]>;
+  let currentSnapshot = treeSnapshot();
+  let treeChange: (() => void) | undefined;
+  const source = {
+    read: () => ({ ok: true as const, data: currentSnapshot }),
+    onChange: (listener: () => void) => {
+      treeChange = listener;
+      return () => { if (treeChange === listener) treeChange = undefined; };
+    },
+  };
+  const replay: SafeAgentActivityEvent[] = [];
+  let activityChange: ((agentId: string) => void) | undefined;
+  let displayChange: ((agentId: string, event: SafeAgentActivityDisplayEvent) => void) | undefined;
+  const activity: AgentActivityStreamSource = {
+    readReplay: () => replay,
+    onChange: (listener) => {
+      activityChange = listener;
+      return () => { if (activityChange === listener) activityChange = undefined; };
+    },
+    onDisplayChange: (listener) => {
+      displayChange = listener;
+      return () => { if (displayChange === listener) displayChange = undefined; };
+    },
+  };
+  const binding = bindAgentTreeUi(source, { hasUI: true, mode: "tui", ui }, activity);
+
+  const panelPromise = binding.openPanel();
+  await Promise.resolve();
+  const panel = overlays[0];
+  panel?.handleInput?.("\r");
+  const viewer = overlays[1];
+  assert.ok(viewer !== undefined);
+  assert.ok(activityChange !== undefined);
+  assert.ok(displayChange !== undefined);
+
+  displayChange?.(PARENT_ID, Object.freeze({
+    type: "message_delta",
+    streamId: "message-1",
+    sequence: 1,
+    contentIndex: 0,
+    contentType: "text",
+    delta: "partial",
+  }));
+  assert.match(viewer?.render(120).join("\n") ?? "", /partial/u);
+
+  currentSnapshot = Object.freeze({ ...treeSnapshot(), tree_revision: 8 });
+  treeChange?.();
+  displayChange?.(PARENT_ID, Object.freeze({
+    type: "message_delta",
+    streamId: "message-1",
+    sequence: 2,
+    contentIndex: 0,
+    contentType: "text",
+    delta: " text",
+  }));
+  assert.equal(renderRequests[1] ?? 0, 0);
+  await new Promise<void>((resolve) => setTimeout(resolve, 65));
+  assert.equal(renderRequests[1], 1);
+
+  binding.dispose();
+  await panelPromise;
+  await Promise.all(overlayCompletions);
+  assert.equal(activityChange, undefined);
+  assert.equal(displayChange, undefined);
 });

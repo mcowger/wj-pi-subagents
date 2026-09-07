@@ -33,9 +33,11 @@ class TestManagedRpcNode {
   readonly process_binding = "managed" as const;
 
   readonly rpc: FakeRpcClient;
+  private readonly onGracefulClose: ((rpc: FakeRpcClient) => void) | undefined;
 
-  constructor(rpc: FakeRpcClient) {
+  constructor(rpc: FakeRpcClient, onGracefulClose?: (rpc: FakeRpcClient) => void) {
     this.rpc = rpc;
+    this.onGracefulClose = onGracefulClose;
   }
 
   start(): Promise<void> {
@@ -74,7 +76,9 @@ class TestManagedRpcNode {
     return () => {};
   }
 
-  async requestGracefulClose(_signal: AbortSignal): Promise<void> {}
+  async requestGracefulClose(_signal: AbortSignal): Promise<void> {
+    this.onGracefulClose?.(this.rpc);
+  }
 
   async forceTerminate(): Promise<void> {}
 
@@ -115,7 +119,7 @@ function activityEvents(events: readonly RpcSupervisorEvent[]): readonly SafeAge
     .map((event) => event.event);
 }
 
-function setup(): {
+function setup(onGracefulClose?: (rpc: FakeRpcClient) => void): {
   readonly rpc: FakeRpcClient;
   readonly supervisor: RpcSupervisor;
   readonly channels: {
@@ -175,7 +179,7 @@ function setup(): {
     controller: tree,
     actor: ROOT_TREE_ACTOR,
     reservation: { templateId: "researcher", name: "活动子代理" },
-    managedNode: new TestManagedRpcNode(rpc),
+    managedNode: new TestManagedRpcNode(rpc, onGracefulClose),
     channel: parent,
     startupTimeoutMs: 1_000,
     gracefulShutdownMs: 1_000,
@@ -242,6 +246,95 @@ test("桥接活动事件经监督器以 activity_stream 分发，正文与摘要
         toolName: "read",
         result: '{"lines":["const a = 1;"]}',
         isError: false,
+      },
+    ]);
+  } finally {
+    unsubscribe();
+    await cleanup();
+  }
+});
+
+test("监督器将合法短暂显示帧仅作为 activity_display 分发", async () => {
+  const { rpc, supervisor, channels, cleanup } = setup();
+  const events: RpcSupervisorEvent[] = [];
+  const unsubscribe = supervisor.onEvent((event) => events.push(event));
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(new AbortController().signal);
+    assert.equal((await startup).ok, true);
+
+    rpc.emitEvent({
+      type: "activity_display",
+      event: {
+        type: "message_delta",
+        streamId: "message-1",
+        sequence: 1,
+        contentIndex: 0,
+        contentType: "text",
+        delta: "partial",
+      },
+    });
+
+    assert.deepEqual(events.filter((event) => event.kind === "activity_display"), [{
+      kind: "activity_display",
+      event: {
+        type: "message_delta",
+        streamId: "message-1",
+        sequence: 1,
+        contentIndex: 0,
+        contentType: "text",
+        delta: "partial",
+      },
+    }]);
+    assert.deepEqual(activityEvents(events), []);
+  } finally {
+    unsubscribe();
+    await cleanup();
+  }
+});
+
+test("终止阶段仍转发 bridge close 的 display 收束帧", async () => {
+  const { rpc, supervisor, channels, cleanup } = setup((client) => {
+    client.emitEvent({
+      type: "activity_display",
+      event: { type: "message_complete", streamId: "message-1", sequence: 2 },
+    });
+  });
+  const events: RpcSupervisorEvent[] = [];
+  const unsubscribe = supervisor.onEvent((event) => events.push(event));
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(new AbortController().signal);
+    assert.equal((await startup).ok, true);
+    rpc.emitEvent({
+      type: "activity_display",
+      event: {
+        type: "message_delta",
+        streamId: "message-1",
+        sequence: 1,
+        contentIndex: 0,
+        contentType: "text",
+        delta: "partial",
+      },
+    });
+
+    const terminated = await supervisor.terminate();
+    assert.ok(terminated.ok || terminated.code === "termination_incomplete", JSON.stringify(terminated));
+    assert.deepEqual(events.filter((event) => event.kind === "activity_display"), [
+      {
+        kind: "activity_display",
+        event: {
+          type: "message_delta",
+          streamId: "message-1",
+          sequence: 1,
+          contentIndex: 0,
+          contentType: "text",
+          delta: "partial",
+        },
+      },
+      {
+        kind: "activity_display",
+        event: { type: "message_complete", streamId: "message-1", sequence: 2 },
       },
     ]);
   } finally {

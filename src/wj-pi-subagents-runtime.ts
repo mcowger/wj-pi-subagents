@@ -724,6 +724,7 @@ export function createWjPiSubagentsRuntimeActivator(
         }, context, {
           readReplay: (agentId) => current.controller.getActivityReplay(agentId),
           onChange: (listener) => current.controller.onActivityChange(listener),
+          onDisplayChange: (listener) => current.controller.onActivityDisplayChange(listener),
         }),
       });
     };

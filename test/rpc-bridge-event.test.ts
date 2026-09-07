@@ -4,7 +4,9 @@ import { REPLY_MAX_TEXT_BYTES } from "../src/child-reply-limits.ts";
 import {
   ACTIVITY_MAX_TEXT_BYTES,
   normalizeAssistantMessageEnd,
+  normalizeAssistantMessageUpdate,
   normalizeRpcBridgeEvent,
+  parseAgentActivityDisplayEvent,
   parseAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
 
@@ -118,6 +120,65 @@ test("compaction_end 分离取消与真实错误，且不公开 provider 错误�
     reason: "threshold",
     aborted: "false",
     willRetry: false,
+  }), { kind: "invalid" });
+});
+
+test("显示层 message_update 只提取有序文本与 thinking delta，不进入完整活动事件闭集", () => {
+  assert.deepEqual(normalizeAssistantMessageUpdate({
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hel" },
+  }, "message-1", 1), {
+    kind: "event",
+    event: {
+      type: "message_delta",
+      streamId: "message-1",
+      sequence: 1,
+      contentIndex: 0,
+      contentType: "text",
+      delta: "Hel",
+    },
+  });
+  assert.deepEqual(normalizeAssistantMessageUpdate({
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "" },
+  }, "message-1", 2), { kind: "ignored" });
+  assert.deepEqual(normalizeAssistantMessageUpdate({
+    type: "message_update",
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: "plan" },
+  }, "message-1", 2), {
+    kind: "event",
+    event: {
+      type: "message_delta",
+      streamId: "message-1",
+      sequence: 2,
+      contentIndex: 1,
+      contentType: "thinking",
+      delta: "plan",
+    },
+  });
+  assert.deepEqual(normalizeAssistantMessageUpdate({
+    type: "message_update",
+    assistantMessageEvent: { type: "toolcall_delta", contentIndex: 2, delta: "{}" },
+  }, "message-1", 3), { kind: "ignored" });
+  assert.deepEqual(normalizeAssistantMessageUpdate({
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", contentIndex: -1, delta: "bad" },
+  }, "message-1", 4), { kind: "invalid" });
+  assert.deepEqual(parseAgentActivityDisplayEvent({
+    type: "message_complete",
+    streamId: "message-1",
+    sequence: 3,
+  }), {
+    kind: "event",
+    event: { type: "message_complete", streamId: "message-1", sequence: 3 },
+  });
+  assert.deepEqual(parseAgentActivityDisplayEvent({
+    type: "message_delta",
+    streamId: "",
+    sequence: 1,
+    contentIndex: 0,
+    contentType: "text",
+    delta: "bad",
   }), { kind: "invalid" });
 });
 

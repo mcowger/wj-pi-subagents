@@ -25,7 +25,12 @@ import {
   nativeLocalSupervisorTransportAdapter,
   type LocalSupervisorTransportListener,
 } from "./local-supervisor-transport.ts";
-import { normalizeRpcBridgeEvent } from "./rpc-bridge-event.ts";
+import {
+  normalizeAssistantMessageUpdate,
+  normalizeRpcBridgeEvent,
+  parseAgentActivityDisplayEvent,
+  type AgentActivityDisplayEventNormalization,
+} from "./rpc-bridge-event.ts";
 import { RUNTIME_EPHEMERAL_ENV_KEYS } from "./root-runtime-context.ts";
 import type { SupervisorByteTransport } from "./stream-supervisor-channel.ts";
 import {
@@ -104,6 +109,86 @@ let supervisorWriteQueue: Promise<void> = Promise.resolve();
 let supervisorTransportEnded = false;
 let childSupervisorEnvironment: Record<string, string> | undefined;
 const configuredCredential = process.env[CREDENTIAL_ENV];
+
+interface ActiveDisplayMessageStream {
+  readonly streamId: string;
+  nextSequence: number;
+  hasDelta: boolean;
+}
+
+/**
+ * Pi 的 JSON/RPC 流不提供 message id；每个 bridge 客户端同时只运行一个
+ * assistant turn，因此在本进程内分配单调 streamId，并在 message_end 时收束。
+ */
+class AssistantDisplayStreamTracker {
+  private nextStreamId = 0;
+  private active: ActiveDisplayMessageStream | undefined;
+  private discarding = false;
+
+  observe(event: unknown): readonly AgentActivityDisplayEventNormalization[] {
+    if (!isRecord(event) || typeof event.type !== "string") return [];
+    if (event.type === "message_start" && isAssistantMessageStart(event)) {
+      const previous = this.completeActive();
+      this.discarding = false;
+      this.active = this.newStream();
+      return previous === undefined ? [] : [previous];
+    }
+    if (event.type === "message_update") {
+      if (this.discarding) return [];
+      const active = this.active ?? this.newStream();
+      const normalized = normalizeAssistantMessageUpdate(event, active.streamId, active.nextSequence);
+      if (normalized.kind === "rejected") {
+        const completed = this.completeActive();
+        this.discarding = true;
+        return completed === undefined ? [] : [completed];
+      }
+      if (normalized.kind === "event" && normalized.event.type === "message_delta") {
+        active.nextSequence += 1;
+        active.hasDelta = true;
+        this.active ??= active;
+      }
+      return [normalized];
+    }
+    if (event.type === "message_end" && isAssistantMessageEnd(event)) {
+      const completed = this.completeActive();
+      this.discarding = false;
+      return completed === undefined ? [] : [completed];
+    }
+    return [];
+  }
+
+  finish(): readonly AgentActivityDisplayEventNormalization[] {
+    const completed = this.completeActive();
+    this.discarding = true;
+    return completed === undefined ? [] : [completed];
+  }
+
+  private newStream(): ActiveDisplayMessageStream {
+    this.nextStreamId += 1;
+    return { streamId: `message-${this.nextStreamId}`, nextSequence: 1, hasDelta: false };
+  }
+
+  private completeActive(): AgentActivityDisplayEventNormalization | undefined {
+    const active = this.active;
+    this.active = undefined;
+    if (active === undefined || !active.hasDelta) return undefined;
+    return parseAgentActivityDisplayEvent({
+      type: "message_complete",
+      streamId: active.streamId,
+      sequence: active.nextSequence,
+    });
+  }
+}
+
+function isAssistantMessageStart(event: Record<string, unknown>): boolean {
+  return isRecord(event.message) && event.message.role === "assistant";
+}
+
+function isAssistantMessageEnd(event: Record<string, unknown>): boolean {
+  return isRecord(event.message) && event.message.role === "assistant";
+}
+
+const displayStreamTracker = new AssistantDisplayStreamTracker();
 // 凭据只用于桥接首帧认证；Pi RpcClient 不应继承它。
 try {
   delete process.env[CREDENTIAL_ENV];
@@ -559,6 +644,15 @@ async function createClient(): Promise<BridgeClient> {
     throw error;
   }
   client.onEvent((event) => {
+    for (const display of displayStreamTracker.observe(event)) {
+      if (display.kind === "invalid") {
+        failAndExit("protocol_fault");
+        return;
+      }
+      if (display.kind === "event") {
+        emitEvent(Object.freeze({ type: "activity_display", event: display.event }));
+      }
+    }
     const normalized = normalizeRpcBridgeEvent(event);
     if (normalized.kind === "invalid") {
       failAndExit("protocol_fault");
@@ -600,6 +694,13 @@ async function handleCommand(command: BridgeCommand): Promise<void> {
       if (!authenticated && startCompletion === undefined) {
         response(command.id, false);
         return;
+      }
+      // 终止可截断 Pi 的 message_end；在停止 client 前将已有可见草稿收束，
+      // 使打开的查看器不会永久保留 transient token。
+      for (const display of displayStreamTracker.finish()) {
+        if (display.kind === "event") {
+          emitEvent(Object.freeze({ type: "activity_display", event: display.event }));
+        }
       }
       stopping = true;
       if (!startReady) settleStart(false);
