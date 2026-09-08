@@ -6,8 +6,8 @@ import {
   sanitizeSafeActivityText,
   type SafeAgentActivityContentBlock,
   type SafeAgentActivityDisplayEvent,
-  type SafePiToolSummary,
   type SafeToolOrigin,
+  type SafeToolSummary,
 } from "./rpc-bridge-event.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
@@ -107,10 +107,12 @@ interface ToolDisplayEntry {
   toolName: string;
   origin: SafeToolOrigin;
   state: ToolRunState;
-  /** 专用摘要：只有来源验证通过的 Pi 原生专用工具携带；结束事实覆盖开始。 */
-  summary: SafePiToolSummary | undefined;
+  /** 专用摘要：只有来源验证通过的专用工具携带；结束事实覆盖开始。 */
+  summary: SafeToolSummary | undefined;
   /** 失败事实自包含的完整错误正文（已净化）；默认折叠，展开后红色显示。 */
   errorText: string | undefined;
+  /** 插件工具失败事实的规范稳定错误码；追加在摘要行尾。 */
+  errorCode: string | undefined;
 }
 
 /**
@@ -146,7 +148,8 @@ interface LiveMessageEntry {
 
 /**
  * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；工具错误
- * 正文使用 tool-error 前缀；实时草稿使用 live 前缀。身份跨重绘稳定。
+ * 正文与消息正文使用独立前缀；父代理消息与实时草稿使用独立前缀。身份跨
+ * 重绘稳定。
  */
 function thinkingKey(entryId: string, blockIndex: number): string {
   return `thinking:${entryId}:${blockIndex}`;
@@ -154,6 +157,14 @@ function thinkingKey(entryId: string, blockIndex: number): string {
 
 function toolErrorKey(entryId: string): string {
   return `tool-error:${entryId}`;
+}
+
+function toolMessageKey(entryId: string): string {
+  return `tool-message:${entryId}`;
+}
+
+function parentMessageKey(entryId: string): string {
+  return `parent-message:${entryId}`;
 }
 
 function liveThinkingKey(streamId: string, contentIndex: number): string {
@@ -500,7 +511,10 @@ export class AgentActivityViewerModel {
 
   private isExpandableKey(key: string): boolean {
     if (typeof key !== "string" || key.length === 0) return false;
-    return key.startsWith("thinking:") || key.startsWith("tool-error:");
+    return key.startsWith("thinking:")
+      || key.startsWith("tool-error:")
+      || key.startsWith("tool-message:")
+      || key.startsWith("parent-message:");
   }
 
   private replayPrefixMatches(replay: readonly CanonicalAgentActivityEntry[]): boolean {
@@ -529,6 +543,12 @@ export class AgentActivityViewerModel {
         continue;
       }
 
+      if (body.type === "parent_message") {
+        // 接收侧实际接纳的父代理输入；未接纳输入不产生该条目。
+        entries.push({ kind: "parent_message", entryId: entry.entry_id, content: body.content });
+        continue;
+      }
+
       if (body.type === "tool_execution_start") {
         // 关联身份 = 运行实例 + 工具活动 ID + 执行代次：重复开始与完成后
         // 迟到开始都幂等忽略；完成态不退回运行中。
@@ -545,6 +565,7 @@ export class AgentActivityViewerModel {
           state: { phase: "running" },
           summary: body.summary,
           errorText: undefined,
+          errorCode: undefined,
         };
         entries.push(tool);
         toolIndex.set(identity, tool);
@@ -568,6 +589,7 @@ export class AgentActivityViewerModel {
           state,
           summary: body.summary,
           errorText: body.errorText,
+          errorCode: body.errorCode,
         };
         entries.push(tool);
         toolIndex.set(identity, tool);
@@ -580,6 +602,7 @@ export class AgentActivityViewerModel {
       existing.state = state;
       existing.summary = body.summary;
       existing.errorText = body.errorText;
+      existing.errorCode = body.errorCode;
     }
 
     if (toolIndex.size > 0) {
@@ -646,6 +669,16 @@ export class AgentActivityViewerModel {
         continue;
       }
 
+      if (entry.kind === "parent_message") {
+        lines.push(...renderParentMessageBlock(
+          entry.content,
+          contentWidth,
+          parentMessageKey(entry.entryId),
+          this.expandedKeys.has(parentMessageKey(entry.entryId)),
+        ));
+        continue;
+      }
+
       if (entry.kind === "live") {
         for (const item of entry.content) {
           if (item.block.type === "text") {
@@ -664,13 +697,21 @@ export class AgentActivityViewerModel {
 
       const visual = TOOL_STATE_VISUALS[entry.state.phase];
       // 行首顺序固定为状态图标、折叠标记、摘要。专用摘要展示白名单参数
-      // 与结果事实；错误正文默认折叠，展开后顶格红色预格式化纯文本。
+      // 与结果事实；错误正文与消息正文默认折叠，展开后顶格显示。
       if (entry.summary !== undefined) {
-        const expandable = entry.errorText !== undefined;
-        const expanded = expandable
-          && this.expandedKeys.has(toolErrorKey(entry.entryId));
+        const messageBody = toolMessageBody(entry.summary);
+        const expandable = entry.errorText !== undefined || messageBody !== undefined;
+        const expandKey = entry.errorText !== undefined
+          ? toolErrorKey(entry.entryId)
+          : toolMessageKey(entry.entryId);
+        const expanded = expandable && this.expandedKeys.has(expandKey);
         const marker = expandable ? (expanded ? "▾" : "▸") : "";
-        const suffix = visual.suffix === undefined ? "" : ` · ${visual.suffix}`;
+        // 失败事实的规范稳定错误码与收束事实并列在行尾。
+        const suffixParts = [
+          ...(visual.suffix === undefined ? [] : [visual.suffix]),
+          ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
+        ];
+        const suffix = suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`;
         // 摘要预算扣除行首图标/折叠标记与行尾收束事实，避免二次右侧截断。
         const summaryWidth = contentWidth
           - displayWidth(visual.icon) - 1
@@ -678,10 +719,10 @@ export class AgentActivityViewerModel {
           - displayWidth(suffix);
         lines.push(Object.freeze({
           text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${
-            formatPiToolSummary(entry.summary, summaryWidth)
+            formatToolSummary(entry.summary, summaryWidth)
           }${suffix}`,
           style: visual.style,
-          ...(expandable ? { selectable_key: toolErrorKey(entry.entryId) } : {}),
+          ...(expandable ? { selectable_key: expandKey } : {}),
         }));
         // Shell 工具的完整 command 始终在摘要行下方的独立代码区域显示：
         // 状态变化只更新摘要行，命令区域不重排。
@@ -691,14 +732,21 @@ export class AgentActivityViewerModel {
         if (expanded && entry.errorText !== undefined) {
           lines.push(...renderToolErrorBody(entry.errorText, contentWidth));
         }
+        if (expanded && messageBody !== undefined) {
+          lines.push(...renderMarkdownBlock(messageBody, contentWidth, "body"));
+        }
         continue;
       }
       // 安全兜底：只显示工具名与状态；不可展开，折叠标记恒为空但位置稳定。
       const summary = safeUiFact(entry.toolName);
       const marker = "";
+      const suffixParts = [
+        ...(visual.suffix === undefined ? [] : [visual.suffix]),
+        ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
+      ];
       lines.push(Object.freeze({
         text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${summary}${
-          visual.suffix === undefined ? "" : ` · ${visual.suffix}`
+          suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`
         }`,
         style: visual.style,
       }));
@@ -713,6 +761,11 @@ export class AgentActivityViewerModel {
 type DisplayEntry =
   | {
       readonly kind: "message";
+      readonly entryId: string;
+      readonly content: readonly SafeAgentActivityContentBlock[];
+    }
+  | {
+      readonly kind: "parent_message";
       readonly entryId: string;
       readonly content: readonly SafeAgentActivityContentBlock[];
     }
@@ -823,6 +876,43 @@ function renderThinkingBlock(
   return Object.freeze([title, ...body]);
 }
 
+const PARENT_MESSAGE_TITLE = "Parent message";
+
+/**
+ * 已接纳父代理输入统一折叠为 `Parent message`：不区分首条与后续消息，
+ * 不显示父代理身份。正文完整保留、默认折叠；展开后按统一背景、顶格无
+ * 缩进的正常 Markdown 显示。逐条独立身份，完全相同正文不去重。
+ */
+function renderParentMessageBlock(
+  content: readonly SafeAgentActivityContentBlock[],
+  width: number,
+  key: string,
+  expanded: boolean,
+): readonly ViewerSemanticLine[] {
+  const title: ViewerSemanticLine = Object.freeze({
+    text: PARENT_MESSAGE_TITLE,
+    style: "terminal" as const,
+    selectable_key: key,
+  });
+  if (!expanded) return Object.freeze([title]);
+  const lines: ViewerSemanticLine[] = [title];
+  let blockIndex = 0;
+  for (const block of content) {
+    if (block.type === "text") {
+      lines.push(...renderMarkdownBlock(block.text, width, "body"));
+    } else {
+      lines.push(...renderThinkingBlock(
+        block.thinking,
+        width,
+        `${key}:${blockIndex}`,
+        true,
+      ));
+    }
+    blockIndex += 1;
+  }
+  return Object.freeze(lines);
+}
+
 function isLiveMessageWithinBudget(entry: LiveMessageEntry): boolean {
   let bytes = 0;
   let blocks = 0;
@@ -916,7 +1006,7 @@ interface SummaryFragments {
 }
 
 /** 把专用摘要拆为“路径前字段 / 路径 / 路径后字段”，供省略策略使用。 */
-function summaryFragments(summary: SafePiToolSummary): SummaryFragments {
+function summaryFragments(summary: SafeToolSummary): SummaryFragments {
   switch (summary.tool) {
     case "read": {
       const tail = [
@@ -976,7 +1066,45 @@ function summaryFragments(summary: SafePiToolSummary): SummaryFragments {
       const tail = summary.timeout === undefined ? [] : [`timeout ${summary.timeout}`];
       return { head: [summary.tool], path: "", tail };
     }
+    case "get_agent_templates": {
+      // 成功只显示模板数量；失败摘要没有该字段，也不显示模板配置。
+      const tail = summary.count === undefined ? [] : [`${summary.count} templates`];
+      return { head: [summary.tool], path: "", tail };
+    }
+    case "spawn_agent": {
+      // 显示 name、template ID 与完整 UUID 的固定前八位；不显示 depth 或
+      // 初始 state。成功才有 agent_id。
+      const tail = summary.agent_id === undefined ? [] : [shortAgentId(summary.agent_id)];
+      return { head: [summary.tool, summary.name, summary.template_id], path: "", tail };
+    }
+    case "send_message": {
+      // 显示目标名称与固定八位短 ID；不显示 accepted。完整 message 在
+      // 独立可展开正文区域。
+      const head: string[] = [summary.tool];
+      if (summary.name !== undefined) head.push(summary.name);
+      head.push(shortAgentId(summary.agent_id));
+      return { head, path: "", tail: [] };
+    }
+    case "normal_reply":
+    case "final_report": {
+      // 摘要只显示工具名；完整 message 在独立可展开正文区域。
+      return { head: [summary.tool], path: "", tail: [] };
+    }
   }
+}
+
+/** 显示层固定八位短 ID：完整 UUID 的前八位；内部关联仍使用完整 UUID。 */
+function shortAgentId(agentId: string): string {
+  return agentId.slice(0, 8);
+}
+
+/** 消息类插件工具摘要自包含的完整尝试正文（成功与失败都保留）。 */
+function toolMessageBody(summary: SafeToolSummary): string | undefined {
+  return summary.tool === "send_message"
+    || summary.tool === "normal_reply"
+    || summary.tool === "final_report"
+    ? summary.message
+    : undefined;
 }
 
 function readTruncationFacts(
@@ -993,7 +1121,7 @@ function readTruncationFacts(
  * 专用摘要单行格式：状态图标与折叠标记之外的全部内容。长路径中间省略
  * 保留两端；其余超宽内容依赖整行右侧省略兜底。
  */
-function formatPiToolSummary(summary: SafePiToolSummary, contentWidth: number): string {
+function formatToolSummary(summary: SafeToolSummary, contentWidth: number): string {
   const fragments = summaryFragments(summary);
   const head = fragments.head.join(SUMMARY_SEPARATOR);
   const tail = fragments.tail.join(SUMMARY_SEPARATOR);

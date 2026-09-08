@@ -8,7 +8,7 @@ import {
 } from "../src/agent-activity-viewer.ts";
 import type {
   SafeAgentActivityDisplayEvent,
-  SafePiToolSummary,
+  SafeToolSummary,
   SafeToolOrigin,
 } from "../src/rpc-bridge-event.ts";
 import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
@@ -55,7 +55,7 @@ function toolStart(
   toolName: string,
   origin: SafeToolOrigin = "unknown",
   incarnationId: string = INCARNATION_ID,
-  summary?: SafePiToolSummary,
+  summary?: SafeToolSummary,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
@@ -78,8 +78,9 @@ function toolEnd(
   isError: boolean,
   origin: SafeToolOrigin = "unknown",
   incarnationId: string = INCARNATION_ID,
-  summary?: SafePiToolSummary,
+  summary?: SafeToolSummary,
   errorText?: string,
+  errorCode?: string,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
@@ -94,6 +95,7 @@ function toolEnd(
       isError,
       ...(summary === undefined ? {} : { summary }),
       ...(errorText === undefined ? {} : { errorText }),
+      ...(errorCode === undefined ? {} : { errorCode }),
     }),
   });
 }
@@ -1169,4 +1171,219 @@ test("命令正文的控制字符在查看器渲染中不可见", () => {
   const body = viewer.render(120).slice(1, -1).join("\n");
   assert.doesNotMatch(body, /\u001b|\u202e/u);
   assert.match(body, /echo safe-red/u);
+});
+
+const CHILD_SPAWN_ID = "1b3f2a7c-9d4e-4f5a-8b6c-7d8e9f0a1b2c";
+
+function parentMessageEntry(text: string): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "parent_message",
+      content: Object.freeze([Object.freeze({ type: "text", text })]),
+    }),
+  });
+}
+
+test("五种插件工具的运行中摘要只显示白名单参数", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "get_agent_templates", "plugin", INCARNATION_ID, { tool: "get_agent_templates" }),
+    toolStart("t2", "spawn_agent", "plugin", INCARNATION_ID, {
+      tool: "spawn_agent", name: "worker-a", template_id: "worker",
+    }),
+    toolStart("t3", "send_message", "plugin", INCARNATION_ID, {
+      tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "任务正文", name: "worker-b",
+    }),
+    toolStart("t4", "normal_reply", "plugin", INCARNATION_ID, {
+      tool: "normal_reply", message: "中间回复正文",
+    }),
+    toolStart("t5", "final_report", "plugin", INCARNATION_ID, {
+      tool: "final_report", message: "最终报告正文",
+    }),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 无载荷摘要行没有任何尾随字段。
+  assert.match(body, /▶ get_agent_templates\n/u);
+  // spawn_agent：name 与 template ID，无 depth、无初始 state、无 agent_id。
+  assert.match(body, /▶ spawn_agent · worker-a · worker\n/u);
+  assert.doesNotMatch(body, /depth|initial|state:/u);
+  // send_message：目标名称与固定八位短 ID，无 accepted；正文默认折叠。
+  assert.match(body, /▶ ▸ send_message · worker-b · 1b3f2a7c/u);
+  assert.doesNotMatch(body, /accepted/u);
+  assert.doesNotMatch(body, /任务正文/u);
+  assert.match(body, /▸/u);
+  // 消息类摘要只显示工具名；完整正文默认折叠。
+  assert.match(body, /▶ ▸ normal_reply\n/u);
+  assert.match(body, /▶ ▸ final_report\n/u);
+  assert.doesNotMatch(body, /中间回复正文|最终报告正文/u);
+});
+
+test("插件工具成功摘要显示模板数量与固定八位短 ID，不显示完整 UUID", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "get_agent_templates", false, "plugin", INCARNATION_ID, {
+      tool: "get_agent_templates", count: 7,
+    }),
+    toolEnd("t2", "spawn_agent", false, "plugin", INCARNATION_ID, {
+      tool: "spawn_agent", name: "worker-a", template_id: "worker", agent_id: CHILD_SPAWN_ID,
+    }),
+    toolEnd("t3", "send_message", false, "plugin", INCARNATION_ID, {
+      tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "你好", name: "worker-b",
+    }),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  assert.match(body, /✓ get_agent_templates · 7 templates/u);
+  // 模板 ID、描述等配置不出现。
+  assert.doesNotMatch(body, /template_|描述|description/u);
+  assert.match(body, /✓ spawn_agent · worker-a · worker · 1b3f2a7c/u);
+  assert.doesNotMatch(body, /1b3f2a7c-9d4e/u);
+  // send_message 成功也不显示 accepted；正文仍默认折叠可展开。
+  assert.match(body, /✓ ▸ send_message · worker-b · 1b3f2a7c/u);
+  assert.doesNotMatch(body, /accepted/u);
+  assert.doesNotMatch(body, /你好/u);
+});
+
+test("插件工具失败整行红色显示稳定错误码，消息工具失败正文保留", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "get_agent_templates", true, "plugin", INCARNATION_ID, {
+      tool: "get_agent_templates",
+    }, undefined, "internal_error"),
+    toolEnd("t2", "spawn_agent", true, "plugin", INCARNATION_ID, {
+      tool: "spawn_agent", name: "worker-a", template_id: "worker",
+    }, undefined, "spawn_failed"),
+    toolEnd("t3", "send_message", true, "plugin", INCARNATION_ID, {
+      tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "投递正文", name: "worker-b",
+    }, undefined, "agent_unavailable"),
+    toolEnd("t4", "normal_reply", true, "plugin", INCARNATION_ID, {
+      tool: "normal_reply", message: "过长回复正文",
+    }, undefined, "reply_too_large"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  assert.match(body, /× get_agent_templates · internal_error/u);
+  // 失败摘要不携带模板数量事实。
+  assert.doesNotMatch(body, /\d+ templates/u);
+  // 失败 spawn 摘要没有 agent_id：行尾只有稳定错误码。
+  assert.match(body, /× spawn_agent · worker-a · worker · spawn_failed\n/u);
+  // 失败正文保留：整行红色 + 稳定错误码，正文默认折叠。
+  assert.match(body, /× ▸ send_message · worker-b · 1b3f2a7c · agent_unavailable/u);
+  assert.doesNotMatch(body, /投递正文/u);
+  assert.match(body, /× ▸ normal_reply · reply_too_large/u);
+  assert.doesNotMatch(body, /过长回复正文/u);
+
+  const surface = renderAgentActivityViewerSurface(viewer, 160, theme).join("\n");
+  assert.match(surface, /<fg:error>[^]*× ▸ send_message/u);
+  assert.match(surface, /<fg:error>[^]*× ▸ normal_reply/u);
+});
+
+test("消息工具展开为顶格 Markdown，状态变化不折叠正文，失败正文可继续查看", () => {
+  const startEntry = toolStart("t1", "send_message", "plugin", INCARNATION_ID, {
+    tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "第一行\n**加粗正文**", name: "worker-b",
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    startEntry,
+  ], { viewport_height: 20 });
+
+  // 默认折叠：正文不可见，有折叠标记。
+  let body = viewer.render(160).slice(1, -1);
+  assert.doesNotMatch(body.join("\n"), /加粗正文/u);
+  assert.match(body.join("\n"), /▸/u);
+
+  // 选中并展开：正文顶格显示为 Markdown，标题行保留。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.match(viewer.getSelectedKey() ?? "", /tool-message:/u);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  body = viewer.render(160).slice(1, -1);
+  assert.match(body.join("\n"), /▾/u);
+  assert.ok(body.some((line) => line.includes("第一行")), body.join("\n"));
+  assert.ok(body.some((line) => line.includes("加粗正文")), body.join("\n"));
+
+  // 状态变化（成功结束）不折叠正文：展开状态保持。
+  viewer.syncFrom([startEntry, toolEnd("t1", "send_message", false, "plugin", INCARNATION_ID, {
+    tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "第一行\n**加粗正文**", name: "worker-b",
+  })]);
+  body = viewer.render(160).slice(1, -1);
+  assert.match(body.join("\n"), /✓ ▾ send_message/u);
+  assert.ok(body.some((line) => line.includes("第一行")), body.join("\n"));
+
+  // 失败结束：正文继续可查看，行尾出现稳定错误码。
+  const failStart = toolStart("t2", "send_message", "plugin", INCARNATION_ID, {
+    tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "第一行\n**加粗正文**", name: "worker-b",
+  });
+  const failViewer = new AgentActivityViewerModel(viewerAgent(), [failStart], { viewport_height: 20 });
+  failViewer.handleInput("\t");
+  failViewer.handleInput("\r");
+  failViewer.syncFrom([failStart, toolEnd("t2", "send_message", true, "plugin", INCARNATION_ID, {
+    tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "第一行\n**加粗正文**", name: "worker-b",
+  }, undefined, "message_delivery_failed")]);
+  const failBody = failViewer.render(160).slice(1, -1);
+  assert.match(failBody.join("\n"), /× ▾ send_message · worker-b · 1b3f2a7c · message_delivery_failed/u);
+  assert.ok(failBody.some((line) => line.includes("第一行")), failBody.join("\n"));
+});
+
+test("final_report 失败正文保留并可展开为 Markdown", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "final_report", true, "plugin", INCARNATION_ID, {
+      tool: "final_report", message: "报告标题\n结论正文",
+    }, undefined, "agent_unavailable"),
+  ], { viewport_height: 20 });
+  const collapsed = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(collapsed, /× ▸ final_report · agent_unavailable/u);
+  assert.doesNotMatch(collapsed, /结论正文/u);
+
+  viewer.handleInput("\t");
+  viewer.handleInput("\r");
+  const expanded = viewer.render(160).slice(1, -1);
+  assert.ok(expanded.some((line) => line.includes("报告标题")), expanded.join("\n"));
+  assert.ok(expanded.some((line) => line.includes("结论正文")), expanded.join("\n"));
+});
+
+test("Parent message 条目统一标题、默认折叠、可展开且重复正文不去重", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    parentMessageEntry("第一条任务指令"),
+    parentMessageEntry("第一条任务指令"),
+  ], { viewport_height: 20 });
+
+  // 完全相同正文不去重：两条独立条目；标题不携带父代理身份。
+  const collapsed = viewer.render(160).slice(1, -1);
+  const titles = collapsed.filter((line) => line.trim() === "Parent message");
+  assert.equal(titles.length, 2, collapsed.join("\n"));
+  assert.doesNotMatch(collapsed.join("\n"), /任务指令|父代理|parent-a/u);
+
+  // 逐条独立展开：Tab+Enter 两次展开两条。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.match(viewer.getSelectedKey() ?? "", /parent-message:/u);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expanded = viewer.render(160).slice(1, -1);
+  const bodies = expanded.filter((line) => line.includes("第一条任务指令"));
+  assert.equal(bodies.length, 2, expanded.join("\n"));
+  // 标题在展开后保留，正文顶格。
+  assert.equal(expanded.filter((line) => line.trim() === "Parent message").length, 2);
+});
+
+test("未知来源的插件工具名走安全兜底，不显示插件摘要与错误码", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "spawn_agent", false, "unknown"),
+    toolEnd("t2", "send_message", true, "unknown"),
+    toolEnd("t3", "final_report", true, "plugin"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+
+  // 兜底条目只显示工具名与状态。
+  assert.ok(lines.some((line) => line === "✓ spawn_agent"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "× send_message"), lines.join("\n"));
+  // plugin 来源缺必需摘要时同样兜底：无错误码可显示。
+  assert.ok(lines.some((line) => line === "× final_report"), lines.join("\n"));
+  assert.doesNotMatch(lines.join("\n"), /·|worker|1b3f2a7c|agent_unavailable/u);
 });

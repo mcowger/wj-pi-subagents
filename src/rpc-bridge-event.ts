@@ -1,4 +1,5 @@
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
+import { PUBLIC_ERROR_CODES, isCanonicalUuid } from "./tree-controller.ts";
 
 /**
  * 活动事件正文按 JSON 转义后 UTF-8 字节计算。它限制单个实时增量帧的尺寸；
@@ -35,6 +36,15 @@ export const PI_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 允许专用摘要规则的本插件工具名闭集（工单 05：子代理创建与父子消息；
+ * 工单 06：等待与控制）。只有来源验证为 plugin 的同名实现才能携带专用
+ * 摘要；同名覆盖与来源不明工具一律安全兜底。
+ */
+export const PLUGIN_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
+  "get_agent_templates", "spawn_agent", "send_message", "normal_reply", "final_report",
+]);
+
+/**
  * 允许失败事实携带完整原始错误正文的 Pi 原生工具闭集。Shell 工具（bash/
  * powershell）除外：其失败只表达成功或失败，stdout、stderr、退出码、超时
  * 正文与异常正文都不进入规范条目。
@@ -49,12 +59,12 @@ const FIND_DEFAULT_LIMIT = 1000;
 const LS_DEFAULT_LIMIT = 500;
 
 /**
- * Pi 原生工具的专用摘要闭集。字段是硬编码白名单：原始参数中的未来新增
- * 字段、文件正文、图片数据、匹配正文、路径列表、目录条目、写入/编辑统计
- * 与命令输出都不在这里出现。专用解析宽容原始输入变化；摘要自身的键集合
- * 是严格闭集。
+ * 专用工具摘要闭集（Pi 原生与本插件）。字段是硬编码白名单：原始参数中的
+ * 未来新增字段、文件正文、图片数据、匹配正文、路径列表、目录条目、写入/
+ * 编辑统计、命令输出、模板配置、depth、初始 state 与任务正文都不在这里
+ * 出现。专用解析宽容原始输入变化；摘要自身的键集合是严格闭集。
  */
-export type SafePiToolSummary =
+export type SafeToolSummary =
   | {
       readonly tool: "read";
       readonly path: string;
@@ -116,6 +126,34 @@ export type SafePiToolSummary =
       readonly tool: "powershell";
       readonly command: string;
       readonly timeout?: number;
+    }
+  | {
+      readonly tool: "get_agent_templates";
+      /** 成功结果的模板数量；失败摘要没有该字段。 */
+      readonly count?: number;
+    }
+  | {
+      readonly tool: "spawn_agent";
+      readonly name: string;
+      readonly template_id: string;
+      /** 成功返回的完整 UUID；显示层负责固定八位短 ID。 */
+      readonly agent_id?: string;
+    }
+  | {
+      readonly tool: "send_message";
+      readonly agent_id: string;
+      /** 完整尝试正文（产生端已净化）；成功与失败都保留。 */
+      readonly message: string;
+      /** 产生端解析到的目标名称；解析失败时不携带。 */
+      readonly name?: string;
+    }
+  | {
+      readonly tool: "normal_reply";
+      readonly message: string;
+    }
+  | {
+      readonly tool: "final_report";
+      readonly message: string;
     };
 
 const READ_SUMMARY_KEYS = Object.freeze([
@@ -133,6 +171,10 @@ const FIND_SUMMARY_KEYS = Object.freeze([
 const LS_SUMMARY_KEYS = Object.freeze([
   "tool", "path", "limit", "emptyDirectory", "entryLimitReached", "truncated", "truncatedBy",
 ] as const);
+const TEMPLATE_COUNT_SUMMARY_KEYS = Object.freeze(["tool", "count"] as const);
+const SPAWN_SUMMARY_KEYS = Object.freeze(["tool", "name", "template_id", "agent_id"] as const);
+const SEND_MESSAGE_SUMMARY_KEYS = Object.freeze(["tool", "agent_id", "message", "name"] as const);
+const MESSAGE_ONLY_SUMMARY_KEYS = Object.freeze(["tool", "message"] as const);
 
 /**
  * 活动正文事实净化：过滤 ANSI 与危险终端控制字符，保留换行与可读空白。
@@ -156,12 +198,17 @@ export type SafeAgentActivityEvent =
       readonly content: readonly SafeAgentActivityContentBlock[];
     }
   | {
+      /** 接收侧实际接纳的父代理输入；未接纳输入不产生该事件。 */
+      readonly type: "parent_message";
+      readonly content: readonly SafeAgentActivityContentBlock[];
+    }
+  | {
       readonly type: "tool_execution_start";
       readonly toolCallId: string;
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
-      /** 仅来源验证通过的 Pi 原生专用工具可携带的白名单摘要。 */
-      readonly summary?: SafePiToolSummary;
+      /** 仅来源验证通过的专用工具可携带的白名单摘要。 */
+      readonly summary?: SafeToolSummary;
     }
   | {
       readonly type: "tool_execution_end";
@@ -170,9 +217,11 @@ export type SafeAgentActivityEvent =
       readonly origin: SafeToolOrigin;
       readonly isError: boolean;
       /** 自包含摘要：成功时含结果事实，失败时只含输入参数。 */
-      readonly summary?: SafePiToolSummary;
+      readonly summary?: SafeToolSummary;
       /** 失败时的完整原始错误正文（产生端已净化）；不在成功事实出现。 */
       readonly errorText?: string;
+      /** 插件工具失败时的规范稳定错误码；不在成功事实出现。 */
+      readonly errorCode?: string;
     };
 
 /**
@@ -324,14 +373,9 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
       if (event.message.role !== "assistant") return IGNORED_EVENT;
       const activity = normalizeActivityMessageEnd(event.message);
       if (activity.kind === "invalid") return INVALID_EVENT;
-      if (activity.kind === "rejected") return REPLY_TOO_LARGE_EVENT;
       // 结构合法但无有效正文（空块或空 content）的消息无内容可显示，
       // 忽略该事件而不是把它当成违约中断会话。
-      if (
-        activity.kind === "event"
-        && activity.event.type === "message"
-        && activity.event.content.length === 0
-      ) return IGNORED_EVENT;
+      if (activity.event.content.length === 0) return IGNORED_EVENT;
       return safeEvent(activity.event);
     }
     case "extension_error":
@@ -388,12 +432,13 @@ export function normalizeAssistantMessageEnd(event: unknown): AssistantMessageEn
 export function parseAgentActivityEvent(value: unknown): AgentActivityEventNormalization {
   if (!isRecord(value) || typeof value.type !== "string") return INVALID_ACTIVITY_EVENT;
   switch (value.type) {
-    case "message": {
+    case "message":
+    case "parent_message": {
       const content = normalizeActivityContent(value.content);
       if (content === undefined || content.length === 0) return INVALID_ACTIVITY_EVENT;
       return Object.freeze({
         kind: "event",
-        event: Object.freeze({ type: "message", content }),
+        event: Object.freeze({ type: value.type, content }),
       });
     }
     case "tool_execution_start": {
@@ -404,7 +449,7 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
-        if (parsePiToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+        if (parseToolSummary(value.toolName, value.origin, value.summary) === undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
       }
@@ -415,7 +460,7 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolCallId: value.toolCallId,
           toolName: value.toolName,
           origin: value.origin,
-          ...(value.summary === undefined ? {} : { summary: value.summary as SafePiToolSummary }),
+          ...(value.summary === undefined ? {} : { summary: value.summary as SafeToolSummary }),
         }),
       });
     }
@@ -426,12 +471,12 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
         typeof value.isError !== "boolean"
         || !hasOnlyToolEventKeys(
           value,
-          ["type", "toolCallId", "toolName", "origin", "isError", "summary", "errorText"],
+          ["type", "toolCallId", "toolName", "origin", "isError", "summary", "errorText", "errorCode"],
         )
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
-        if (parsePiToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+        if (parseToolSummary(value.toolName, value.origin, value.summary) === undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
       }
@@ -446,6 +491,17 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           || value.errorText.length === 0
         ) return INVALID_ACTIVITY_EVENT;
       }
+      if (value.errorCode !== undefined) {
+        // 规范稳定错误码只属于来源验证通过的本插件工具的失败事实；成功
+        // 事实、白名单外错误码与降级来源都不允许携带。
+        if (
+          value.isError !== true
+          || value.origin !== "plugin"
+          || !PLUGIN_TOOL_SUMMARY_NAMES.has(value.toolName)
+          || typeof value.errorCode !== "string"
+          || !isPublicErrorCode(value.errorCode)
+        ) return INVALID_ACTIVITY_EVENT;
+      }
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
@@ -454,8 +510,9 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolName: value.toolName,
           origin: value.origin,
           isError: value.isError,
-          ...(value.summary === undefined ? {} : { summary: value.summary as SafePiToolSummary }),
+          ...(value.summary === undefined ? {} : { summary: value.summary as SafeToolSummary }),
           ...(value.errorText === undefined ? {} : { errorText: value.errorText }),
+          ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
         }),
       });
     }
@@ -552,33 +609,42 @@ export function normalizeAssistantMessageUpdate(
  * 产生端规范化：把子代理自身观察到的原始 Pi 工具执行事实缩减为安全闭集。
  * 原始结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方验证后随
  * 规范化输入传递。来源验证通过的 Pi 原生专用工具（read/grep/find/ls/write/
- * edit/bash/powershell）改用专用摘要规则：只保留白名单参数与结果事实，
- * Shell 外工具失败时自包含净化后的完整错误正文（Shell 工具失败只表达
- * 成功或失败）。专用解析宽容未来新增字段并忽略它们；必需字段缺失或类型
- * 错误、开始参数缺失或来源验证失败时完整降级为无载荷安全兜底。允许未来
- * 新增字段并忽略它们；关联身份缺失或来源闭集之外属于结构违约，由调用方
- * 决定是否升级，不在本函数内降级。
+ * edit/bash/powershell）与本插件专用工具（get_agent_templates/spawn_agent/
+ * send_message/normal_reply/final_report）各自使用专用摘要规则：只保留
+ * 白名单参数与结果事实，Shell 外 Pi 工具失败时自包含净化后的完整错误正文，
+ * 插件工具失败时自包含规范稳定错误码。专用解析宽容未来新增字段并忽略它
+ * 们；必需字段缺失或类型错误、开始参数缺失或来源验证失败时完整降级为无
+ * 载荷安全兜底。允许未来新增字段并忽略它们；关联身份缺失或来源闭集之外
+ * 属于结构违约，由调用方决定是否升级，不在本函数内降级。
  */
 export function normalizeOwnToolActivityEvent(
   event: unknown,
   origin: SafeToolOrigin,
   startArgs?: unknown,
+  resolveAgentName?: (agentId: string) => string | undefined,
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
   if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
-  // 专用摘要只作用于来源验证通过的原生专用工具；其余来源与工具都是无载荷
-  // 安全兜底。
+  // 专用摘要只作用于来源验证通过的原生专用工具与插件专用工具；其余来源
+  // 与工具都是无载荷安全兜底。
   const dedicatedPiTool = origin === "pi_native"
     && typeof event.toolName === "string"
     && PI_TOOL_SUMMARY_NAMES.has(event.toolName);
+  const dedicatedPluginTool = origin === "plugin"
+    && typeof event.toolName === "string"
+    && PLUGIN_TOOL_SUMMARY_NAMES.has(event.toolName);
   if (event.type === "tool_execution_start") {
     if (
       !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
       || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
     ) return INVALID_ACTIVITY_EVENT;
-    // 专用摘要只在 Pi 原生来源下提取；同名覆盖/未知来源与降级场景都是
+    // 专用摘要只在来源验证通过时提取；同名覆盖/未知来源与降级场景都是
     // 无载荷安全兜底。
-    const summary = dedicatedPiTool ? extractPiToolSummary(event.toolName, event.args) : undefined;
+    const summary = dedicatedPiTool
+      ? extractPiToolSummary(event.toolName, event.args)
+      : dedicatedPluginTool
+        ? extractPluginToolSummary(event.toolName, event.args, undefined, undefined, resolveAgentName)
+        : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_start",
       toolCallId: event.toolCallId,
@@ -597,11 +663,23 @@ export function normalizeOwnToolActivityEvent(
     // 才能自包含输入参数，否则整体降级为无摘要兜底。
     const summary = dedicatedPiTool && isRecord(startArgs)
       ? extractPiToolSummary(event.toolName, startArgs, event.result, event.isError)
-      : undefined;
-    // 错误正文只属于允许展开错误的工具；Shell 工具失败只表达成功或失败。
+      : dedicatedPluginTool && isRecord(startArgs)
+        ? extractPluginToolSummary(
+          event.toolName,
+          startArgs,
+          event.result,
+          event.isError,
+          resolveAgentName,
+        )
+        : undefined;
+    // 错误正文只属于允许展开错误的 Pi 工具；Shell 工具失败只表达成功或失败。
     const errorText = summary !== undefined && event.isError
       && PI_TOOL_ERROR_TEXT_NAMES.has(event.toolName)
       ? extractErrorText(event.result)
+      : undefined;
+    // 规范稳定错误码只属于插件工具的失败事实；非白名单错误码静默省略。
+    const errorCode = dedicatedPluginTool && event.isError
+      ? extractPluginErrorCode(event.result)
       : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_end",
@@ -611,6 +689,7 @@ export function normalizeOwnToolActivityEvent(
       isError: event.isError,
       ...(summary === undefined ? {} : { summary }),
       ...(errorText === undefined ? {} : { errorText }),
+      ...(errorCode === undefined ? {} : { errorCode }),
     });
   }
   return INVALID_ACTIVITY_EVENT;
@@ -620,9 +699,11 @@ export function normalizeOwnToolActivityEvent(
  * 运行时使用的有状态专用规范化器：Pi 的工具结束事件不携带参数，本工厂按
  * 工具活动 ID 缓存开始事件的参数，供结束事实自包含输入参数。缓存有界，
  * 溢出时淘汰最旧的待决条目；宿主查询失败时全部工具保守兜底为 unknown。
+ * 可选的目标名称解析器供 send_message 摘要携带接收者名称。
  */
 export function createOwnToolActivityNormalizer(
   resolveToolOrigin: (toolName: string) => SafeToolOrigin,
+  resolveAgentName?: (agentId: string) => string | undefined,
 ): (event: unknown) => AgentActivityEventNormalization {
   const MAX_PENDING_TOOL_ARGS = 256;
   const pendingArgs = new Map<string, unknown>();
@@ -644,7 +725,7 @@ export function createOwnToolActivityNormalizer(
       ? pendingArgs.get(toolCallId)
       : undefined;
     if (event.type === "tool_execution_end") pendingArgs.delete(toolCallId);
-    return normalizeOwnToolActivityEvent(event, origin, startArgs);
+    return normalizeOwnToolActivityEvent(event, origin, startArgs, resolveAgentName);
   };
 }
 
@@ -718,7 +799,7 @@ function extractPiToolSummary(
   args: unknown,
   result?: unknown,
   isError?: boolean,
-): SafePiToolSummary | undefined {
+): SafeToolSummary | undefined {
   if (!isRecord(args)) return undefined;
   const success = isError === false && isRecord(result)
     ? readRecord(result.details)
@@ -867,6 +948,113 @@ function extractErrorText(result: unknown): string | undefined {
   return sanitized.length === 0 ? undefined : sanitized;
 }
 
+/**
+ * 插件工具失败事实的规范稳定错误码：SubagentToolError 把稳定 JSON 外壳放
+ * 在 content 的 text 块中，这里只取白名单内的 error.code；其余结构、底层
+ * 异常正文与白名单外错误码一律省略。
+ */
+function extractPluginErrorCode(result: unknown): string | undefined {
+  if (!isRecord(result) || !Array.isArray(result.content)) return undefined;
+  for (const item of result.content) {
+    if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(item.text);
+    } catch {
+      continue;
+    }
+    const error = readRecord(parsed)?.error;
+    const code = isRecord(error) ? error.code : undefined;
+    if (typeof code === "string" && isPublicErrorCode(code)) return code;
+  }
+  return undefined;
+}
+
+/**
+ * 从原始插件工具事实提取专用摘要：消息类工具在开始与结束（无论成败）都
+ * 自包含完整尝试正文；spawn 成功追加完整 UUID；get_agent_templates 只在
+ * 成功摘要携带模板数量。必需字段缺失或类型错误时返回 undefined（完整
+ * 降级）；未来新增字段与任务正文、depth、初始 state 等一律忽略。
+ */
+function extractPluginToolSummary(
+  toolName: string,
+  args: unknown,
+  result?: unknown,
+  isError?: boolean,
+  resolveAgentName?: (agentId: string) => string | undefined,
+): SafeToolSummary | undefined {
+  if (!isRecord(args)) return undefined;
+  const successDetails = isError === false && isRecord(result)
+    ? readRecord(result.details)
+    : undefined;
+  switch (toolName) {
+    case "get_agent_templates": {
+      // 工具无输入参数；details 是模板数组，成功只提取模板数量，失败或
+      // details 缺失/非数组时只保留无载荷工具名摘要。
+      if (isError !== false) return { tool: "get_agent_templates" };
+      const details = isRecord(result) ? result.details : undefined;
+      return Array.isArray(details)
+        ? { tool: "get_agent_templates", count: details.length }
+        : { tool: "get_agent_templates" };
+    }
+    case "spawn_agent": {
+      const name = args.name;
+      const templateId = args.template_id;
+      if (typeof name !== "string" || typeof templateId !== "string") return undefined;
+      const agentId = successDetails === undefined ? undefined : successDetails.agent_id;
+      return {
+        tool: "spawn_agent",
+        name: sanitizeInlineActivityText(name),
+        template_id: sanitizeInlineActivityText(templateId),
+        ...(isCanonicalUuid(agentId) ? { agent_id: agentId } : {}),
+      };
+    }
+    case "send_message": {
+      const agentId = args.agent_id;
+      const message = args.message;
+      if (!isCanonicalUuid(agentId) || typeof message !== "string") return undefined;
+      const resolvedName = readResolvedAgentName(agentId, resolveAgentName);
+      return {
+        tool: "send_message",
+        agent_id: agentId,
+        message: sanitizeSafeActivityText(message),
+        ...(resolvedName === undefined ? {} : { name: resolvedName }),
+      };
+    }
+    case "normal_reply":
+    case "final_report": {
+      const message = args.message;
+      if (typeof message !== "string") return undefined;
+      return {
+        tool: toolName,
+        message: sanitizeSafeActivityText(message),
+      };
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** 单行事实净化：在正文净化基础上折叠换行，供名称、模板 ID 等内联字段使用。 */
+function sanitizeInlineActivityText(value: string): string {
+  return sanitizeSafeActivityText(value).replace(/\n+/gu, " ").trim();
+}
+
+function readResolvedAgentName(
+  agentId: string,
+  resolveAgentName: ((agentId: string) => string | undefined) | undefined,
+): string | undefined {
+  if (resolveAgentName === undefined) return undefined;
+  try {
+    const name = resolveAgentName(agentId);
+    return typeof name === "string" && name.trim().length > 0
+      ? sanitizeInlineActivityText(name)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Pi 已知空结果文案：content 全部为单个匹配文本时认定对应空结果事实。 */
 function matchesKnownEmptyResult(result: unknown, text: string): boolean {
   if (!isRecord(result) || !Array.isArray(result.content) || result.content.length === 0) return false;
@@ -933,7 +1121,7 @@ function parsePiToolSummary(
   toolName: string,
   origin: SafeToolOrigin,
   value: unknown,
-): SafePiToolSummary | undefined {
+): SafeToolSummary | undefined {
   if (origin !== "pi_native" || !PI_TOOL_SUMMARY_NAMES.has(toolName)) return undefined;
   if (!isRecord(value) || value.tool !== toolName) return undefined;
   switch (toolName) {
@@ -948,7 +1136,7 @@ function parsePiToolSummary(
         && typeof value.firstLineExceedsLimit !== "boolean"
       ) return undefined;
       if (value.hasMoreLines !== undefined && typeof value.hasMoreLines !== "boolean") return undefined;
-      return value as unknown as SafePiToolSummary;
+      return value as unknown as SafeToolSummary;
     }
     case "grep": {
       if (!hasOnlySummaryKeys(value, GREP_SUMMARY_KEYS)) return undefined;
@@ -962,7 +1150,7 @@ function parsePiToolSummary(
       if (value.matchLimitReached !== undefined && matchLimitReached === undefined) return undefined;
       if (!validTruncationFacts(value)) return undefined;
       if (value.linesTruncated !== undefined && typeof value.linesTruncated !== "boolean") return undefined;
-      return value as unknown as SafePiToolSummary;
+      return value as unknown as SafeToolSummary;
     }
     case "find": {
       if (!hasOnlySummaryKeys(value, FIND_SUMMARY_KEYS)) return undefined;
@@ -972,7 +1160,7 @@ function parsePiToolSummary(
       const resultLimitReached = positiveCountField(value, "resultLimitReached");
       if (value.resultLimitReached !== undefined && resultLimitReached === undefined) return undefined;
       if (!validTruncationFacts(value)) return undefined;
-      return value as unknown as SafePiToolSummary;
+      return value as unknown as SafeToolSummary;
     }
     case "ls": {
       if (!hasOnlySummaryKeys(value, LS_SUMMARY_KEYS)) return undefined;
@@ -982,14 +1170,14 @@ function parsePiToolSummary(
       const entryLimitReached = positiveCountField(value, "entryLimitReached");
       if (value.entryLimitReached !== undefined && entryLimitReached === undefined) return undefined;
       if (!validTruncationFacts(value)) return undefined;
-      return value as unknown as SafePiToolSummary;
+      return value as unknown as SafeToolSummary;
     }
     case "write":
     case "edit": {
       // 摘要只有 path：行数、字节大小、编辑块数等写入/编辑统计不属于闭集。
       if (!hasOnlySummaryKeys(value, PATH_ONLY_SUMMARY_KEYS)) return undefined;
       if (typeof value.path !== "string") return undefined;
-      return value as unknown as SafePiToolSummary;
+      return value as unknown as SafeToolSummary;
     }
     case "bash":
     case "powershell": {
@@ -1000,15 +1188,82 @@ function parsePiToolSummary(
         value.timeout !== undefined
         && !(typeof value.timeout === "number" && Number.isFinite(value.timeout) && value.timeout > 0)
       ) return undefined;
-      return value as unknown as SafePiToolSummary;
+      return value as unknown as SafeToolSummary;
     }
     default:
       return undefined;
   }
 }
 
+/**
+ * wire 闭集校验：摘要只允许来源验证通过的本插件专用工具携带，键集合与
+ * 类型严格闭合。消息类工具的完整尝试正文（成功与失败都保留）经产生端
+ * 净化后进入摘要；spawn 成功的 agent_id 必须是完整规范 UUID。
+ */
+function parsePluginToolSummary(
+  toolName: string,
+  origin: SafeToolOrigin,
+  value: unknown,
+): SafeToolSummary | undefined {
+  if (origin !== "plugin" || !PLUGIN_TOOL_SUMMARY_NAMES.has(toolName)) return undefined;
+  if (!isRecord(value) || value.tool !== toolName) return undefined;
+  switch (toolName) {
+    case "get_agent_templates": {
+      if (!hasOnlySummaryKeys(value, TEMPLATE_COUNT_SUMMARY_KEYS)) return undefined;
+      if (
+        value.count !== undefined
+        && !(typeof value.count === "number" && Number.isSafeInteger(value.count) && value.count >= 0)
+      ) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    case "spawn_agent": {
+      if (!hasOnlySummaryKeys(value, SPAWN_SUMMARY_KEYS)) return undefined;
+      if (typeof value.name !== "string" || value.name.length === 0) return undefined;
+      if (typeof value.template_id !== "string" || value.template_id.length === 0) return undefined;
+      if (value.agent_id !== undefined && !isCanonicalUuid(value.agent_id)) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    case "send_message": {
+      if (!hasOnlySummaryKeys(value, SEND_MESSAGE_SUMMARY_KEYS)) return undefined;
+      if (!isCanonicalUuid(value.agent_id)) return undefined;
+      if (typeof value.message !== "string" || value.message.length === 0) return undefined;
+      if (value.name !== undefined && !(typeof value.name === "string" && value.name.length > 0)) {
+        return undefined;
+      }
+      return value as unknown as SafeToolSummary;
+    }
+    case "normal_reply":
+    case "final_report": {
+      if (!hasOnlySummaryKeys(value, MESSAGE_ONLY_SUMMARY_KEYS)) return undefined;
+      if (typeof value.message !== "string" || value.message.length === 0) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * wire 摘要校验总入口：按来源身份分派到 Pi 原生与本插件专用规则；来源
+ * 降级或闭集外工具一律拒绝。
+ */
+function parseToolSummary(
+  toolName: string,
+  origin: SafeToolOrigin,
+  value: unknown,
+): SafeToolSummary | undefined {
+  if (origin === "pi_native") return parsePiToolSummary(toolName, origin, value);
+  if (origin === "plugin") return parsePluginToolSummary(toolName, origin, value);
+  return undefined;
+}
+
 function hasOnlySummaryKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key));
+}
+
+/** 公开控制面稳定错误码闭集谓词；插件失败事实与显示层共用同一白名单。 */
+function isPublicErrorCode(value: string): boolean {
+  return (PUBLIC_ERROR_CODES as readonly string[]).includes(value);
 }
 
 /** truncated/truncatedBy 的共享 wire 校验；值域外的 truncatedBy 判违约。 */
@@ -1030,13 +1285,20 @@ function validSummaryCount(value: Record<string, unknown>, key: string): boolean
 /** 把 Pi assistant message_end 收窄为活动消息事件。 */
 function normalizeActivityMessageEnd(
   message: Record<string, unknown>,
-): AgentActivityEventNormalization {
+):
+  | {
+      readonly kind: "event";
+      readonly event: Extract<SafeAgentActivityEvent, { readonly type: "message" }>;
+    }
+  | { readonly kind: "invalid" }
+{
   const content = normalizeActivityContent(message.content);
-  if (content === undefined) return INVALID_ACTIVITY_EVENT;
-  return Object.freeze({
-    kind: "event",
-    event: Object.freeze({ type: "message", content }),
+  if (content === undefined) return Object.freeze({ kind: "invalid" } as const);
+  const event: Extract<SafeAgentActivityEvent, { readonly type: "message" }> = Object.freeze({
+    type: "message",
+    content,
   });
+  return Object.freeze({ kind: "event", event });
 }
 
 function normalizeActivityContent(

@@ -42,10 +42,10 @@ function validEntry(overrides: Partial<CanonicalAgentActivityEntry> = {}): Canon
 }
 
 test("规范条目契约版本是固定字符串，解析器只接受当前版本", () => {
-  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/4");
+  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/5");
   assert.equal(parseCanonicalAgentActivityEntry(validEntry()).kind, "entry");
 
-  const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/2" });
+  const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/4" });
   assert.equal(parseCanonicalAgentActivityEntry(legacy).kind, "invalid");
 });
 

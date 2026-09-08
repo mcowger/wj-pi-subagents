@@ -809,7 +809,11 @@ export function createWjPiSubagentsRuntimeActivator(
       api,
       options.selfExtensionPath ?? defaultSelfExtensionPath(),
     );
-    const normalizeOwnActivity = createOwnToolActivityNormalizer(resolveToolOrigin);
+    // send_message 摘要的目标名称解析器：摘要提取时实时查询直接子快照，
+    // 查询失败或缺名时不携带名称，不影响正文事实。
+    const normalizeOwnActivity = createOwnToolActivityNormalizer(resolveToolOrigin, (agentId) =>
+      readDirectChildDisplayName(active, agentId, false),
+    );
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;

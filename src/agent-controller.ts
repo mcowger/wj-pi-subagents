@@ -37,9 +37,10 @@ import {
 } from "./canonical-activity.ts";
 import { randomUUID } from "node:crypto";
 import { AgentActivityCache } from "./agent-activity-cache.ts";
-import type {
-  SafeAgentActivityDisplayEvent,
-  SafeAgentActivityEvent,
+import {
+  sanitizeSafeActivityText,
+  type SafeAgentActivityDisplayEvent,
+  type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
 import type { SupervisorActivityDelivery } from "./supervisor-channel.ts";
 
@@ -417,6 +418,8 @@ export class AgentController {
         ? "compaction_active"
         : "message_delivery_failed");
     }
+    // 只有接收侧同步接纳后才写入接收者活动历史；未接纳输入不产生条目。
+    this.recordParentMessage(input.agent_id, input.message);
     return Object.freeze({
       ok: true,
       data: Object.freeze({
@@ -1137,6 +1140,31 @@ export class AgentController {
     const revision = this.activityCache.revision(agentId);
     this.activityCache.append(agentId, entry);
     return this.activityCache.revision(agentId) !== revision;
+  }
+
+  /**
+   * 接收侧同步接纳后写入接收者活动历史的父代理输入条目。统一摘要为
+   * Parent message，不区分首条与后续消息；逐条独立身份，完全相同正文
+   * 不去重。记录只追加活动缓存，不改变子代理生命周期状态，也不把接纳
+   * 解释为已读、已处理、完成或会话终止。
+   */
+  private recordParentMessage(agentId: string, message: string): void {
+    const body: SafeAgentActivityEvent = Object.freeze({
+      type: "parent_message",
+      content: Object.freeze([
+        Object.freeze({ type: "text", text: sanitizeSafeActivityText(message) }),
+      ]),
+    });
+    const candidate: CanonicalAgentActivityEntry = Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: agentId,
+      incarnation_id: this.activityIncarnationId,
+      entry_id: randomUUID(),
+      body,
+    });
+    const parsed = parseCanonicalAgentActivityEntry(candidate);
+    if (parsed.kind !== "entry") return;
+    this.recordActivity(agentId, parsed.entry);
   }
 
   private deliverTerminalNotification(agentId: string): boolean {

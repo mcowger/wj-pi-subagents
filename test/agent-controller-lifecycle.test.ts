@@ -432,3 +432,39 @@ test("父端接纳事件可以在 settled 后登记，terminate 建立不可逆�
   assert.equal(after.ok, false);
   if (!after.ok) assert.equal(after.error.code, "agent_unavailable");
 });
+
+test("send_message 接纳后写入接收者父消息活动，未接纳不产生条目", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "子代理" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+
+  // 未接纳：投递失败不写入父消息条目，也不伪造接收者活动。
+  fake.sendResult = { ok: false, code: "message_delivery_failed" };
+  const rejected = await controller.sendMessage({ agent_id: AGENT_ID, message: "未接纳正文" });
+  assert.equal(rejected.ok, false);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
+
+  // 接纳：写入统一 Parent message 条目，不改变生命周期状态。
+  fake.sendResult = { ok: true, accepted: true };
+  const accepted = await controller.sendMessage({ agent_id: AGENT_ID, message: "接纳正文" });
+  assert.equal(accepted.ok, true);
+  if (accepted.ok) assert.equal(accepted.data.accepted, true);
+  const replay = controller.getActivityReplay(AGENT_ID);
+  assert.equal(replay.length, 1);
+  const body = replay[0]?.body;
+  assert.equal(body?.type, "parent_message");
+  if (body?.type === "parent_message") {
+    assert.deepEqual(body.content, [{ type: "text", text: "接纳正文" }]);
+  }
+  const working = tree.getStatus(AGENT_ID);
+  assert.equal(working.ok, true);
+  if (working.ok) assert.equal(working.data.state, "working");
+
+  // 完全相同正文不去重：逐条独立条目。
+  await controller.sendMessage({ agent_id: AGENT_ID, message: "接纳正文" });
+  const repeated = controller.getActivityReplay(AGENT_ID);
+  assert.equal(repeated.length, 2);
+  assert.notEqual(repeated[0]?.entry_id, repeated[1]?.entry_id);
+});

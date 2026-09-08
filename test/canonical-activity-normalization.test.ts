@@ -109,33 +109,34 @@ test("活动事件闭集对 message 正文不再按字节拒绝，旧工具字�
 });
 
 test("产生端规范化把非专用工具事实缩减为无载荷状态事实，来源身份随输入传递", () => {
-  // 专用摘要只属于 Pi 原生 read/grep/find/ls；本插件工具仍是无载荷状态事实。
+  // 专用摘要只属于 Pi 原生专用工具与本插件的五个创建/消息工具；闭集外的
+  // 本插件工具（wait_agent 等）仍是无载荷状态事实，参数不跨进程。
   assert.deepEqual(normalizeOwnToolActivityEvent({
     type: "tool_execution_start",
     toolCallId: "call_1",
-    toolName: "spawn_agent",
-    args: { template_id: "worker", name: "w" },
+    toolName: "wait_agent",
+    args: { agent_ids: ["550e8400-e29b-41d4-a716-446655440002"], timeout_ms: 1000 },
   }, "plugin"), {
     kind: "event",
     event: {
       type: "tool_execution_start",
       toolCallId: "call_1",
-      toolName: "spawn_agent",
+      toolName: "wait_agent",
       origin: "plugin",
     },
   });
   assert.deepEqual(normalizeOwnToolActivityEvent({
     type: "tool_execution_end",
     toolCallId: "call_1",
-    toolName: "spawn_agent",
-    result: { content: [{ type: "text", text: "agent_id 不得跨进程" }] },
+    toolName: "wait_agent",
+    result: { content: [{ type: "text", text: "等待结果不得跨进程" }] },
     isError: false,
   }, "plugin"), {
     kind: "event",
     event: {
       type: "tool_execution_end",
       toolCallId: "call_1",
-      toolName: "spawn_agent",
+      toolName: "wait_agent",
       origin: "plugin",
       isError: false,
     },
@@ -1143,4 +1144,331 @@ test("活动事件闭集对 Shell 工具拒绝错误正文，write/edit 可携�
     origin: "plugin",
     summary: { tool: "write", path: "a.txt" },
   }).kind, "invalid");
+});
+
+const PLUGIN_CHILD_ID = "550e8400-e29b-41d4-a716-446655440009";
+
+/** 本插件专用工具事件的原始形状（参数在 start，结果在 end）。 */
+function pluginStart(toolName: string, args: unknown): unknown {
+  return {
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName,
+    args,
+  };
+}
+
+function pluginEnd(toolName: string, result: unknown, isError = false): unknown {
+  return {
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName,
+    result,
+    isError,
+  };
+}
+
+/** SubagentToolError 的稳定 JSON 外壳：content text 块中的完整 JSON 字符串。 */
+function pluginErrorShell(code: string, message = "boom"): unknown {
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify({ ok: false, error: { code, message, retryable: false, details: {} } }),
+    }],
+  };
+}
+
+test("五种插件专用工具的开始事实自包含白名单参数并忽略未来新增字段", () => {
+  // get_agent_templates 无输入参数；空 args 也产生无载荷工具名摘要。
+  const templates = normalizeOwnToolActivityEvent(pluginStart("get_agent_templates", {}), "plugin");
+  assert.equal(templates.kind, "event");
+  if (templates.kind !== "event" || templates.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(templates.event), { tool: "get_agent_templates" });
+
+  // spawn_agent 只保留 name 与 template_id；depth、初始 state、任务正文等
+  // 未来字段与敏感载荷一律忽略。
+  const spawn = normalizeOwnToolActivityEvent(pluginStart("spawn_agent", {
+    name: "worker-a",
+    template_id: "worker",
+    depth: 2,
+    initial_state: { secret: "state" },
+    task: "机密任务正文",
+  }), "plugin");
+  assert.equal(spawn.kind, "event");
+  if (spawn.kind !== "event" || spawn.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(spawn.event), {
+    tool: "spawn_agent",
+    name: "worker-a",
+    template_id: "worker",
+  });
+
+  // send_message 自包含完整尝试正文；resolveAgentName 命中时携带目标名称，
+  // 未命中时不携带。accepted 等其它字段忽略。
+  const resolved = normalizeOwnToolActivityEvent(
+    pluginStart("send_message", {
+      agent_id: PLUGIN_CHILD_ID,
+      message: "你好\n多行正文",
+      accepted: true,
+      priority: 1,
+    }),
+    "plugin",
+    undefined,
+    (agentId) => (agentId === PLUGIN_CHILD_ID ? "worker-a" : undefined),
+  );
+  assert.equal(resolved.kind, "event");
+  if (resolved.kind !== "event" || resolved.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(resolved.event), {
+    tool: "send_message",
+    agent_id: PLUGIN_CHILD_ID,
+    message: "你好\n多行正文",
+    name: "worker-a",
+  });
+
+  const unresolved = normalizeOwnToolActivityEvent(
+    pluginStart("send_message", { agent_id: PLUGIN_CHILD_ID, message: "你好" }),
+    "plugin",
+  );
+  assert.equal(unresolved.kind, "event");
+  if (unresolved.kind !== "event" || unresolved.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(unresolved.event), {
+    tool: "send_message",
+    agent_id: PLUGIN_CHILD_ID,
+    message: "你好",
+  });
+
+  // normal_reply 与 final_report 自包含完整 message。
+  for (const toolName of ["normal_reply", "final_report"] as const) {
+    const normalized = normalizeOwnToolActivityEvent(
+      pluginStart(toolName, { message: "回复正文", accepted: false }),
+      "plugin",
+    );
+    assert.equal(normalized.kind, "event", toolName);
+    if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+    assert.deepEqual(summaryOf(normalized.event), { tool: toolName, message: "回复正文" }, toolName);
+  }
+});
+
+test("插件工具结束事实区分成功与失败摘要并只携带白名单稳定错误码", () => {
+  // get_agent_templates 成功只提取模板数量；details 缺失或非数组时不携带。
+  const counted = normalizeOwnToolActivityEvent(
+    pluginEnd("get_agent_templates", { details: [{ id: "a" }, { id: "b" }, { id: "c" }] }, false),
+    "plugin",
+    {},
+  );
+  assert.equal(counted.kind, "event");
+  if (counted.kind !== "event" || counted.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(counted.event), { tool: "get_agent_templates", count: 3 });
+
+  const uncounted = normalizeOwnToolActivityEvent(
+    pluginEnd("get_agent_templates", {}, false),
+    "plugin",
+    {},
+  );
+  assert.equal(uncounted.kind, "event");
+  if (uncounted.kind !== "event" || uncounted.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(uncounted.event), { tool: "get_agent_templates" });
+
+  // spawn_agent 成功追加完整 UUID；失败摘要没有 agent_id。
+  const spawned = normalizeOwnToolActivityEvent(
+    pluginEnd(
+      "spawn_agent",
+      { details: { agent_id: PLUGIN_CHILD_ID, state: "idle", depth: 1 } },
+      false,
+    ),
+    "plugin",
+    { name: "worker-a", template_id: "worker" },
+  );
+  assert.equal(spawned.kind, "event");
+  if (spawned.kind !== "event" || spawned.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(spawned.event), {
+    tool: "spawn_agent",
+    name: "worker-a",
+    template_id: "worker",
+    agent_id: PLUGIN_CHILD_ID,
+  });
+
+  // 消息类工具失败保留完整尝试正文；错误码来自白名单 JSON 外壳。
+  const failedSend = normalizeOwnToolActivityEvent(
+    pluginEnd("send_message", pluginErrorShell("agent_unavailable", "child busy"), true),
+    "plugin",
+    { agent_id: PLUGIN_CHILD_ID, message: "投递正文" },
+  );
+  assert.equal(failedSend.kind, "event");
+  if (failedSend.kind !== "event" || failedSend.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(failedSend.event), {
+    tool: "send_message",
+    agent_id: PLUGIN_CHILD_ID,
+    message: "投递正文",
+  });
+  assert.equal(failedSend.event.errorCode, "agent_unavailable");
+  // 插件失败不携带错误正文。
+  assert.equal(failedSend.event.errorText, undefined);
+
+  const failedReply = normalizeOwnToolActivityEvent(
+    pluginEnd("normal_reply", pluginErrorShell("reply_too_large"), true),
+    "plugin",
+    { message: "过长回复" },
+  );
+  assert.equal(failedReply.kind, "event");
+  if (failedReply.kind !== "event" || failedReply.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(failedReply.event), { tool: "normal_reply", message: "过长回复" });
+  assert.equal(failedReply.event.errorCode, "reply_too_large");
+
+  // final_report 成功保留完整正文，不携带错误码。
+  const report = normalizeOwnToolActivityEvent(
+    pluginEnd("final_report", { details: { accepted: true } }, false),
+    "plugin",
+    { message: "最终报告" },
+  );
+  assert.equal(report.kind, "event");
+  if (report.kind !== "event" || report.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(report.event), { tool: "final_report", message: "最终报告" });
+  assert.equal(report.event.errorCode, undefined);
+
+  // get_agent_templates 失败摘要无模板数量，只携带稳定错误码。
+  const templatesFailed = normalizeOwnToolActivityEvent(
+    pluginEnd("get_agent_templates", pluginErrorShell("internal_error"), true),
+    "plugin",
+    {},
+  );
+  assert.equal(templatesFailed.kind, "event");
+  if (templatesFailed.kind !== "event" || templatesFailed.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(templatesFailed.event), { tool: "get_agent_templates" });
+  assert.equal(templatesFailed.event.errorCode, "internal_error");
+
+  // 白名单外错误码、非 JSON 外壳与缺失外壳都静默省略错误码。
+  for (const result of [
+    pluginErrorShell("secret_internal_code"),
+    { content: [{ type: "text", text: "plain failure text" }] },
+    { content: [] },
+  ]) {
+    const degraded = normalizeOwnToolActivityEvent(
+      pluginEnd("spawn_agent", result, true),
+      "plugin",
+      { name: "worker-a", template_id: "worker" },
+    );
+    assert.equal(degraded.kind, "event");
+    if (degraded.kind !== "event" || degraded.event.type !== "tool_execution_end") return;
+    assert.equal(degraded.event.errorCode, undefined);
+  }
+});
+
+test("插件专用工具必需字段缺失或类型错误时完整降级为安全兜底", () => {
+  const cases: readonly {
+    readonly toolName: string;
+    readonly startArgs: unknown;
+  }[] = [
+    { toolName: "spawn_agent", startArgs: { template_id: "worker" } },
+    { toolName: "spawn_agent", startArgs: { name: 42, template_id: "worker" } },
+    { toolName: "send_message", startArgs: { agent_id: "not-a-uuid", message: "正文" } },
+    { toolName: "send_message", startArgs: { agent_id: PLUGIN_CHILD_ID, message: 42 } },
+    { toolName: "normal_reply", startArgs: { message: null } },
+    { toolName: "final_report", startArgs: {} },
+    { toolName: "get_agent_templates", startArgs: null },
+  ];
+  for (const item of cases) {
+    const start = normalizeOwnToolActivityEvent(
+      pluginStart(item.toolName, item.startArgs),
+      "plugin",
+    );
+    assert.equal(start.kind, "event", item.toolName);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.equal(start.event.summary, undefined, item.toolName);
+
+    const end = normalizeOwnToolActivityEvent(
+      pluginEnd(item.toolName, pluginErrorShell("spawn_failed"), true),
+      "plugin",
+      isRecordArgs(item.startArgs) ? item.startArgs : undefined,
+    );
+    assert.equal(end.kind, "event", item.toolName);
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    // 摘要完整降级为无载荷兜底，但失败事实的稳定错误码仍然提取。
+    assert.equal(end.event.summary, undefined, item.toolName);
+    assert.equal(end.event.errorCode, "spawn_failed", item.toolName);
+  }
+});
+
+function isRecordArgs(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+test("同名覆盖的本插件专用工具名不产生插件摘要与错误码", () => {
+  // 用户同名覆盖使来源验证不再是 plugin：专用摘要与稳定错误码都不可用。
+  for (const origin of ["unknown", "pi_native"] as const) {
+    const start = normalizeOwnToolActivityEvent(
+      pluginStart("spawn_agent", { name: "worker-a", template_id: "worker" }),
+      origin,
+    );
+    assert.equal(start.kind, "event", origin);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.equal(start.event.summary, undefined, origin);
+
+    const end = normalizeOwnToolActivityEvent(
+      pluginEnd("send_message", pluginErrorShell("agent_unavailable"), true),
+      origin,
+      { agent_id: PLUGIN_CHILD_ID, message: "正文" },
+    );
+    assert.equal(end.kind, "event", origin);
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    assert.equal(end.event.summary, undefined, origin);
+    assert.equal(end.event.errorCode, undefined, origin);
+    // 插件工具失败正文不属于任何来源的白名单。
+    assert.equal(end.event.errorText, undefined, origin);
+  }
+});
+
+test("插件摘要的 wire 闭集：未知键、非法 UUID 与负数量判违约", () => {
+  // 摘要未知键判 invalid。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "spawn_agent",
+    origin: "plugin",
+    summary: { tool: "spawn_agent", name: "a", template_id: "w", depth: 2 },
+  }).kind, "invalid");
+  // spawn 成功摘要的 agent_id 必须是完整规范 UUID。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "spawn_agent",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "spawn_agent", name: "a", template_id: "w", agent_id: "short-id" },
+  }).kind, "invalid");
+  // get_agent_templates 数量必须是非负安全整数。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "get_agent_templates",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "get_agent_templates", count: -1 },
+  }).kind, "invalid");
+  // send_message 摘要要求完整正文与规范 UUID。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "send_message",
+    origin: "plugin",
+    summary: { tool: "send_message", agent_id: PLUGIN_CHILD_ID, message: "" },
+  }).kind, "invalid");
+  // 白名单外错误码判 invalid；白名单内合法。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "normal_reply",
+    origin: "plugin",
+    isError: true,
+    summary: { tool: "normal_reply", message: "正文" },
+    errorCode: "not_public",
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "normal_reply",
+    origin: "plugin",
+    isError: true,
+    summary: { tool: "normal_reply", message: "正文" },
+    errorCode: "message_delivery_failed",
+  }).kind, "event");
 });
