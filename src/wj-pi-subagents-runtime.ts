@@ -27,8 +27,9 @@ import type {
   ExtensionApiSurface,
 } from "./host-gate.ts";
 import {
-  normalizeOwnToolActivityEvent,
+  createOwnToolActivityNormalizer,
   normalizeRpcBridgeEvent,
+  type AgentActivityEventNormalization,
   type SafeAgentActivityEvent,
   type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
@@ -769,16 +770,16 @@ function readDirectChildDisplayName(
 
 function readOwnActivityEvent(
   event: unknown,
-  resolveToolOrigin: (toolName: string) => SafeToolOrigin,
+  normalizeOwnActivity: (event: unknown) => AgentActivityEventNormalization,
 ): SafeAgentActivityEvent | undefined {
-  // 工具事实走产生端专用规范化：来源身份随输入传递，原始参数与结果在此
-  // 处丢弃，永不跨进程；message 事实仍复用桥接事件闭集。
+  // 工具事实走产生端专用规范化：来源身份、开始参数缓存与专用摘要提取都在
+  // 规范化器内完成，原始参数与结果在此处丢弃，永不跨进程；message 事实
+  // 仍复用桥接事件闭集。
   if (
     isRecord(event)
     && (event.type === "tool_execution_start" || event.type === "tool_execution_end")
   ) {
-    const origin = resolveToolOrigin(typeof event.toolName === "string" ? event.toolName : "");
-    const normalized = normalizeOwnToolActivityEvent(event, origin);
+    const normalized = normalizeOwnActivity(event);
     return normalized.kind === "event" ? normalized.event : undefined;
   }
   const normalized = normalizeRpcBridgeEvent(event);
@@ -789,10 +790,10 @@ function readOwnActivityEvent(
 function observeOwnActivity(
   current: ActiveRuntime | undefined,
   event: unknown,
-  resolveToolOrigin: (toolName: string) => SafeToolOrigin,
+  normalizeOwnActivity: (event: unknown) => AgentActivityEventNormalization,
 ): void {
   if (current === undefined || !current.isChild || current.handoffPending === true) return;
-  const activity = readOwnActivityEvent(event, resolveToolOrigin);
+  const activity = readOwnActivityEvent(event, normalizeOwnActivity);
   if (activity !== undefined) current.controller.recordOwnActivity(activity);
 }
 
@@ -802,11 +803,13 @@ export function createWjPiSubagentsRuntimeActivator(
   const reloadLeaseTimeoutMs = validateRuntimeReloadLeaseTimeout(options.reloadLeaseTimeoutMs);
   return async (extensionApi, capabilities) => {
     const api = asRuntimeApi(extensionApi);
-    // 工具事件发生时实时查询注册表：晚加载扩展的同名覆盖也能被正确识别。
+    // 工具事件发生时实时查询注册表：晚加载扩展的同名覆盖也能被正确识别；
+    // 专用摘要所需的开始参数由规范化器按工具活动 ID 缓存。
     const resolveToolOrigin = createToolOriginResolver(
       api,
       options.selfExtensionPath ?? defaultSelfExtensionPath(),
     );
+    const normalizeOwnActivity = createOwnToolActivityNormalizer(resolveToolOrigin);
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
@@ -966,17 +969,17 @@ export function createWjPiSubagentsRuntimeActivator(
     api.on("message_end", (event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      observeOwnActivity(current, event, resolveToolOrigin);
+      observeOwnActivity(current, event, normalizeOwnActivity);
       current.replyCoordinator?.observeAssistantMessageEnd(event);
       refreshContextUsage(current, rawContext);
     });
 
     api.on("tool_execution_start", (event) => {
-      observeOwnActivity(active, event, resolveToolOrigin);
+      observeOwnActivity(active, event, normalizeOwnActivity);
     });
 
     api.on("tool_execution_end", (event) => {
-      observeOwnActivity(active, event, resolveToolOrigin);
+      observeOwnActivity(active, event, normalizeOwnActivity);
     });
 
     api.on("agent_end", (_event, rawContext) => {

@@ -3,8 +3,10 @@ import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
 import {
   ACTIVITY_MAX_TEXT_BYTES,
   parseAgentActivityDisplayEvent,
+  sanitizeSafeActivityText,
   type SafeAgentActivityContentBlock,
   type SafeAgentActivityDisplayEvent,
+  type SafePiToolSummary,
   type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
@@ -28,8 +30,6 @@ const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
 const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back";
 const RENDER_VIEWER_LINES = Symbol("renderViewerLines");
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const ANSI_ESCAPE_PATTERN = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~]|[()][0-2])/gu;
-const UNSAFE_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
 
 const PLAIN_MARKDOWN_THEME: MarkdownTheme = Object.freeze({
   heading: identity,
@@ -94,6 +94,8 @@ type ToolRunState =
 
 interface ToolDisplayEntry {
   readonly kind: "tool";
+  /** 条目身份：错误正文展开的稳定可展开键。 */
+  readonly entryId: string;
   /** 运行实例身份；与工具活动 ID、执行代次共同承担回填匹配职责。 */
   readonly incarnationId: string;
   readonly toolCallId: string;
@@ -105,6 +107,10 @@ interface ToolDisplayEntry {
   toolName: string;
   origin: SafeToolOrigin;
   state: ToolRunState;
+  /** 专用摘要：只有来源验证通过的 Pi 原生专用工具携带；结束事实覆盖开始。 */
+  summary: SafePiToolSummary | undefined;
+  /** 失败事实自包含的完整错误正文（已净化）；默认折叠，展开后红色显示。 */
+  errorText: string | undefined;
 }
 
 /**
@@ -139,11 +145,15 @@ interface LiveMessageEntry {
 }
 
 /**
- * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；实时草稿
- * 使用 live 前缀。身份跨重绘稳定。
+ * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；工具错误
+ * 正文使用 tool-error 前缀；实时草稿使用 live 前缀。身份跨重绘稳定。
  */
 function thinkingKey(entryId: string, blockIndex: number): string {
   return `thinking:${entryId}:${blockIndex}`;
+}
+
+function toolErrorKey(entryId: string): string {
+  return `tool-error:${entryId}`;
 }
 
 function liveThinkingKey(streamId: string, contentIndex: number): string {
@@ -490,7 +500,7 @@ export class AgentActivityViewerModel {
 
   private isExpandableKey(key: string): boolean {
     if (typeof key !== "string" || key.length === 0) return false;
-    return key.startsWith("thinking:");
+    return key.startsWith("thinking:") || key.startsWith("tool-error:");
   }
 
   private replayPrefixMatches(replay: readonly CanonicalAgentActivityEntry[]): boolean {
@@ -526,19 +536,22 @@ export class AgentActivityViewerModel {
         if (toolIndex.has(identity)) continue;
         const tool: ToolDisplayEntry = {
           kind: "tool",
+          entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
           generation: 1,
           toolName: body.toolName,
           origin: body.origin,
           state: { phase: "running" },
+          summary: body.summary,
+          errorText: undefined,
         };
         entries.push(tool);
         toolIndex.set(identity, tool);
         continue;
       }
 
-      // 结束事实自包含状态：开始缺失时仍建立完成条目。只有运行实例、
+      // 结束事实自包含状态与摘要：开始缺失时仍建立完成条目。只有运行实例、
       // 活动 ID 与代次都匹配的结束事实才能更新或回填既有条目。
       const identity = `${entry.incarnation_id}:${body.toolCallId}`;
       const existing = toolIndex.get(identity);
@@ -546,21 +559,27 @@ export class AgentActivityViewerModel {
       if (existing === undefined) {
         const tool: ToolDisplayEntry = {
           kind: "tool",
+          entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
           generation: 1,
           toolName: body.toolName,
           origin: body.origin,
           state,
+          summary: body.summary,
+          errorText: body.errorText,
         };
         entries.push(tool);
         toolIndex.set(identity, tool);
         continue;
       }
-      // 匹配结束原地更新（幂等或回填），绝不退回运行中。
+      // 匹配结束原地更新（幂等或回填），绝不退回运行中；结束事实携带更
+      // 完整的摘要与错误正文，覆盖开始事实的输入参数摘要。
       existing.toolName = body.toolName;
       existing.origin = body.origin;
       existing.state = state;
+      existing.summary = body.summary;
+      existing.errorText = body.errorText;
     }
 
     if (toolIndex.size > 0) {
@@ -644,9 +663,33 @@ export class AgentActivityViewerModel {
       }
 
       const visual = TOOL_STATE_VISUALS[entry.state.phase];
+      // 行首顺序固定为状态图标、折叠标记、摘要。专用摘要展示白名单参数
+      // 与结果事实；错误正文默认折叠，展开后顶格红色预格式化纯文本。
+      if (entry.summary !== undefined) {
+        const expandable = entry.errorText !== undefined;
+        const expanded = expandable
+          && this.expandedKeys.has(toolErrorKey(entry.entryId));
+        const marker = expandable ? (expanded ? "▾" : "▸") : "";
+        const suffix = visual.suffix === undefined ? "" : ` · ${visual.suffix}`;
+        // 摘要预算扣除行首图标/折叠标记与行尾收束事实，避免二次右侧截断。
+        const summaryWidth = contentWidth
+          - displayWidth(visual.icon) - 1
+          - (marker === "" ? 0 : displayWidth(marker) + 1)
+          - displayWidth(suffix);
+        lines.push(Object.freeze({
+          text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${
+            formatFileToolSummary(entry.summary, summaryWidth)
+          }${suffix}`,
+          style: visual.style,
+          ...(expandable ? { selectable_key: toolErrorKey(entry.entryId) } : {}),
+        }));
+        if (expanded && entry.errorText !== undefined) {
+          lines.push(...renderToolErrorBody(entry.errorText, contentWidth));
+        }
+        continue;
+      }
+      // 安全兜底：只显示工具名与状态；不可展开，折叠标记恒为空但位置稳定。
       const summary = safeUiFact(entry.toolName);
-      // 行首顺序固定为状态图标、折叠标记、摘要；兜底条目不可展开，折叠
-      // 标记恒为空，位置保持稳定。
       const marker = "";
       lines.push(Object.freeze({
         text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${summary}${
@@ -790,6 +833,148 @@ function wrapPlainText(value: string, width: number): readonly string[] {
   return Object.freeze(value.split("\n").flatMap((line) => wrapPlainLine(line, width)));
 }
 
+/**
+ * 工具错误正文：红色预格式化纯文本。不解析 Markdown、不做语义摘要或字符
+ * 截断，只按面板宽度软换行，保留换行与可读空白；顶格无前缀。
+ */
+function renderToolErrorBody(
+  errorText: string,
+  width: number,
+): readonly ViewerSemanticLine[] {
+  const safe = sanitizeViewerMarkup(errorText);
+  if (safe.length === 0) return Object.freeze([]);
+  return Object.freeze(wrapPlainText(safe, width).map((line) => Object.freeze({
+    text: line,
+    style: "error" as const,
+  })));
+}
+
+/**
+ * 超宽路径中间省略：保留首尾两端，中间以单个省略号连接；在字素簇边界
+ * 切分，不切断组合字符或宽字符。
+ */
+function truncateMiddleToDisplayWidth(value: string, width: number): string {
+  if (!Number.isSafeInteger(width) || width <= 0) return "";
+  if (displayWidth(value) <= width) return value;
+  if (width <= 1) return "…";
+  const segments = [...SEGMENTER.segment(value)];
+  const headBudget = Math.floor((width - 1) / 2);
+  const tailBudget = width - 1 - headBudget;
+  let head = "";
+  let headUsed = 0;
+  let headIndex = 0;
+  for (; headIndex < segments.length; headIndex += 1) {
+    const segment = segments[headIndex]!.segment;
+    const segmentWidth = displayWidth(segment);
+    if (headUsed + segmentWidth > headBudget) break;
+    head += segment;
+    headUsed += segmentWidth;
+  }
+  let tail = "";
+  let tailUsed = 0;
+  let tailIndex = segments.length - 1;
+  while (tailIndex >= headIndex) {
+    const segment = segments[tailIndex]!.segment;
+    const segmentWidth = displayWidth(segment);
+    if (tailUsed + segmentWidth > tailBudget) break;
+    tail = segment + tail;
+    tailUsed += segmentWidth;
+    tailIndex -= 1;
+  }
+  return `${head}…${tail}`;
+}
+
+/** 路径超宽时中间省略；其余字段从右侧省略。 */
+const SUMMARY_SEPARATOR = " · ";
+
+interface SummaryFragments {
+  readonly head: readonly string[];
+  readonly path: string;
+  readonly tail: readonly string[];
+}
+
+/** 把专用摘要拆为“路径前字段 / 路径 / 路径后字段”，供省略策略使用。 */
+function summaryFragments(summary: SafePiToolSummary): SummaryFragments {
+  switch (summary.tool) {
+    case "read": {
+      const tail = [
+        ...(summary.offset === undefined ? [] : [`offset ${summary.offset}`]),
+        ...(summary.limit === undefined ? [] : [`limit ${summary.limit}`]),
+        ...readTruncationFacts(summary.truncated, summary.truncatedBy, summary.firstLineExceedsLimit),
+      ];
+      return { head: ["read"], path: summary.path, tail };
+    }
+    case "grep": {
+      const tail = [
+        ...(summary.glob === undefined ? [] : [`glob ${summary.glob}`]),
+        ...(summary.ignoreCase === true ? ["ignoreCase"] : []),
+        ...(summary.literal === true ? ["literal"] : []),
+        ...(summary.context === undefined ? [] : [`context ${summary.context}`]),
+        ...(summary.limit === undefined ? [] : [`limit ${summary.limit}`]),
+        ...(summary.noMatches === true ? ["no matches"] : []),
+        ...(summary.matchLimitReached === undefined
+          ? []
+          : [`${summary.matchLimitReached} matches limit`]),
+        ...readTruncationFacts(summary.truncated, summary.truncatedBy),
+        ...(summary.linesTruncated === true ? ["lines truncated"] : []),
+      ];
+      return { head: ["grep", `/${summary.pattern}/`], path: summary.path, tail };
+    }
+    case "find": {
+      const tail = [
+        ...(summary.limit === undefined ? [] : [`limit ${summary.limit}`]),
+        ...(summary.noFiles === true ? ["no files"] : []),
+        ...(summary.resultLimitReached === undefined
+          ? []
+          : [`${summary.resultLimitReached} results limit`]),
+        ...readTruncationFacts(summary.truncated, summary.truncatedBy),
+      ];
+      return { head: ["find", summary.pattern], path: summary.path, tail };
+    }
+    case "ls": {
+      const tail = [
+        ...(summary.limit === undefined ? [] : [`limit ${summary.limit}`]),
+        ...(summary.emptyDirectory === true ? ["empty directory"] : []),
+        ...(summary.entryLimitReached === undefined
+          ? []
+          : [`${summary.entryLimitReached} entries limit`]),
+        ...readTruncationFacts(summary.truncated, summary.truncatedBy),
+      ];
+      return { head: ["ls"], path: summary.path, tail };
+    }
+  }
+}
+
+function readTruncationFacts(
+  truncated: boolean | undefined,
+  truncatedBy: "lines" | "bytes" | undefined,
+  firstLineExceedsLimit?: boolean,
+): readonly string[] {
+  if (truncated !== true) return [];
+  if (firstLineExceedsLimit === true) return ["truncated (first line)"];
+  return [`truncated (${truncatedBy ?? "bytes"})`];
+}
+
+/**
+ * 专用摘要单行格式：状态图标与折叠标记之外的全部内容。长路径中间省略
+ * 保留两端；其余超宽内容依赖整行右侧省略兑底。
+ */
+function formatFileToolSummary(summary: SafePiToolSummary, contentWidth: number): string {
+  const fragments = summaryFragments(summary);
+  const head = fragments.head.join(SUMMARY_SEPARATOR);
+  const tail = fragments.tail.join(SUMMARY_SEPARATOR);
+  const join = (path: string): string =>
+    [head, path, tail].filter((part) => part.length > 0).join(SUMMARY_SEPARATOR);
+  const full = join(fragments.path);
+  if (displayWidth(full) <= contentWidth) return full;
+  // 路径预算：整行减去固定部分、路径前的分隔符与省略号一位。
+  const fixed = [head, tail].filter((part) => part.length > 0).join(SUMMARY_SEPARATOR);
+  const budget = contentWidth - displayWidth(fixed)
+    - (fixed.length > 0 ? SUMMARY_SEPARATOR.length : 0) - 1;
+  const middlePath = truncateMiddleToDisplayWidth(fragments.path, Math.max(1, budget));
+  return join(middlePath);
+}
+
 function wrapPlainLine(value: string, width: number): string[] {
   const normalized = value.replace(/\t/gu, "   ");
   if (displayWidth(normalized) <= width) return [normalized];
@@ -830,10 +1015,7 @@ function wrapPlainLine(value: string, width: number): string[] {
 }
 
 function sanitizeViewerMarkup(value: string): string {
-  return value
-    .replace(/\r\n?/gu, "\n")
-    .replace(ANSI_ESCAPE_PATTERN, "")
-    .replace(UNSAFE_CONTROL_PATTERN, " ");
+  return sanitizeSafeActivityText(value);
 }
 
 function sameEntry(left: CanonicalAgentActivityEntry, right: CanonicalAgentActivityEntry): boolean {

@@ -26,6 +26,96 @@ export function isSafeToolOrigin(value: unknown): value is SafeToolOrigin {
   return value === "pi_native" || value === "plugin" || value === "unknown";
 }
 
+/**
+ * 允许专用摘要规则的 Pi 原生工具名闭集（工单 03：文件读取与检索）。
+ * 只有来源验证为 pi_native 的同名实现才能携带专用摘要。
+ */
+export const FILE_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set(["read", "grep", "find", "ls"]);
+
+/** Pi 各检索工具的默认 limit；非默认值才进入摘要。 */
+const GREP_DEFAULT_LIMIT = 100;
+const FIND_DEFAULT_LIMIT = 1000;
+const LS_DEFAULT_LIMIT = 500;
+
+/**
+ * Pi 原生文件读取与检索工具的专用摘要闭集。字段是硬编码白名单：原始参数
+ * 中的未来新增字段、文件正文、图片数据、匹配正文、路径列表与目录条目都
+ * 不在这里出现。专用解析宽容原始输入变化；摘要自身的键集合是严格闭集。
+ */
+export type SafePiToolSummary =
+  | {
+      readonly tool: "read";
+      readonly path: string;
+      readonly offset?: number;
+      readonly limit?: number;
+      readonly truncated?: boolean;
+      readonly truncatedBy?: "lines" | "bytes";
+      readonly firstLineExceedsLimit?: boolean;
+    }
+  | {
+      readonly tool: "grep";
+      readonly pattern: string;
+      readonly path: string;
+      readonly glob?: string;
+      readonly ignoreCase?: boolean;
+      readonly literal?: boolean;
+      readonly context?: number;
+      readonly limit?: number;
+      readonly noMatches?: boolean;
+      readonly matchLimitReached?: number;
+      readonly truncated?: boolean;
+      readonly truncatedBy?: "lines" | "bytes";
+      readonly linesTruncated?: boolean;
+    }
+  | {
+      readonly tool: "find";
+      readonly pattern: string;
+      readonly path: string;
+      readonly limit?: number;
+      readonly noFiles?: boolean;
+      readonly resultLimitReached?: number;
+      readonly truncated?: boolean;
+      readonly truncatedBy?: "lines" | "bytes";
+    }
+  | {
+      readonly tool: "ls";
+      readonly path: string;
+      readonly limit?: number;
+      readonly emptyDirectory?: boolean;
+      readonly entryLimitReached?: number;
+      readonly truncated?: boolean;
+      readonly truncatedBy?: "lines" | "bytes";
+    };
+
+const READ_SUMMARY_KEYS = Object.freeze([
+  "tool", "path", "offset", "limit", "truncated", "truncatedBy", "firstLineExceedsLimit",
+] as const);
+const GREP_SUMMARY_KEYS = Object.freeze([
+  "tool", "pattern", "path", "glob", "ignoreCase", "literal", "context", "limit",
+  "noMatches", "matchLimitReached", "truncated", "truncatedBy", "linesTruncated",
+] as const);
+const FIND_SUMMARY_KEYS = Object.freeze([
+  "tool", "pattern", "path", "limit", "noFiles", "resultLimitReached", "truncated", "truncatedBy",
+] as const);
+const LS_SUMMARY_KEYS = Object.freeze([
+  "tool", "path", "limit", "emptyDirectory", "entryLimitReached", "truncated", "truncatedBy",
+] as const);
+
+/**
+ * 活动正文事实净化：过滤 ANSI 与危险终端控制字符，保留换行与可读空白。
+ * 这是终端安全要求，不视为正文截断；产生端与查看器共用同一规则。
+ */
+const ACTIVITY_ANSI_PATTERN = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~]|[()][0-2])/gu;
+const ACTIVITY_UNSAFE_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
+
+export function sanitizeSafeActivityText(value: string): string {
+  return value
+    .replace(/\r\n?/gu, "\n")
+    .replace(/\t/gu, "  ")
+    .replace(ACTIVITY_ANSI_PATTERN, "")
+    .replace(ACTIVITY_UNSAFE_PATTERN, " ");
+}
+
 /** 加宽后的子代理会话活动事件闭集；监督通道活动流帧承载同一闭集。 */
 export type SafeAgentActivityEvent =
   | {
@@ -37,6 +127,8 @@ export type SafeAgentActivityEvent =
       readonly toolCallId: string;
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
+      /** 仅来源验证通过的 Pi 原生专用工具可携带的白名单摘要。 */
+      readonly summary?: SafePiToolSummary;
     }
   | {
       readonly type: "tool_execution_end";
@@ -44,6 +136,10 @@ export type SafeAgentActivityEvent =
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
       readonly isError: boolean;
+      /** 自包含摘要：成功时含结果事实，失败时只含输入参数。 */
+      readonly summary?: SafePiToolSummary;
+      /** 失败时的完整原始错误正文（产生端已净化）；不在成功事实出现。 */
+      readonly errorText?: string;
     };
 
 /**
@@ -270,10 +366,15 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
     case "tool_execution_start": {
       if (!validBoundedText(value.toolCallId, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
       if (!validBoundedText(value.toolName, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
-      if (!hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin"])) {
-        return INVALID_ACTIVITY_EVENT;
-      }
+      if (
+        !hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin", "summary"])
+      ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
+      if (value.summary !== undefined) {
+        if (parseFileToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+          return INVALID_ACTIVITY_EVENT;
+        }
+      }
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
@@ -281,6 +382,7 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolCallId: value.toolCallId,
           toolName: value.toolName,
           origin: value.origin,
+          ...(value.summary === undefined ? {} : { summary: value.summary as SafePiToolSummary }),
         }),
       });
     }
@@ -289,9 +391,27 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       if (!validBoundedText(value.toolName, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
       if (
         typeof value.isError !== "boolean"
-        || !hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin", "isError"])
+        || !hasOnlyToolEventKeys(
+          value,
+          ["type", "toolCallId", "toolName", "origin", "isError", "summary", "errorText"],
+        )
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
+      if (value.summary !== undefined) {
+        if (parseFileToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+          return INVALID_ACTIVITY_EVENT;
+        }
+      }
+      if (value.errorText !== undefined) {
+        // 错误正文只允许 Pi 原生专用工具在失败事实中携带；空正文无意义。
+        if (
+          value.isError !== true
+          || value.origin !== "pi_native"
+          || !FILE_TOOL_SUMMARY_NAMES.has(value.toolName)
+          || typeof value.errorText !== "string"
+          || value.errorText.length === 0
+        ) return INVALID_ACTIVITY_EVENT;
+      }
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
@@ -300,6 +420,8 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolName: value.toolName,
           origin: value.origin,
           isError: value.isError,
+          ...(value.summary === undefined ? {} : { summary: value.summary as SafePiToolSummary }),
+          ...(value.errorText === undefined ? {} : { errorText: value.errorText }),
         }),
       });
     }
@@ -393,14 +515,19 @@ export function normalizeAssistantMessageUpdate(
 }
 
 /**
- * 产生端规范化：把子代理自身观察到的原始 Pi 工具执行事实缩减为无载荷状态
- * 事实。原始参数、结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方
- * 验证后随规范化输入传递。允许未来新增字段并忽略它们；关联身份缺失或来源
- * 闭集之外属于结构违约，由调用方决定是否升级，不在本函数内降级。
+ * 产生端规范化：把子代理自身观察到的原始 Pi 工具执行事实缩减为安全闭集。
+ * 原始结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方验证后随
+ * 规范化输入传递。来源验证通过的 Pi 原生文件读取与检索工具（read/grep/
+ * find/ls）改用专用摘要规则：只保留白名单参数与结果事实，失败时自包含
+ * 输入参数与净化后的完整错误正文。专用解析宽容未来新增字段并忽略它们；
+ * 必需字段缺失或类型错误、开始参数缺失或来源验证失败时完整降级为无载荷
+ * 安全兜底。允许未来新增字段并忽略它们；关联身份缺失或来源闭集之外属于
+ * 结构违约，由调用方决定是否升级，不在本函数内降级。
  */
 export function normalizeOwnToolActivityEvent(
   event: unknown,
   origin: SafeToolOrigin,
+  startArgs?: unknown,
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
   if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
@@ -409,11 +536,17 @@ export function normalizeOwnToolActivityEvent(
       !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
       || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
     ) return INVALID_ACTIVITY_EVENT;
+    // 专用摘要只在 Pi 原生来源下提取；同名覆盖/未知来源与降级场景都是
+    // 无载荷安全兜底。
+    const summary = origin === "pi_native" && FILE_TOOL_SUMMARY_NAMES.has(event.toolName)
+      ? extractFileToolSummary(event.toolName, event.args)
+      : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_start",
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       origin,
+      ...(summary === undefined ? {} : { summary }),
     });
   }
   if (event.type === "tool_execution_end") {
@@ -422,15 +555,366 @@ export function normalizeOwnToolActivityEvent(
       || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
       || typeof event.isError !== "boolean"
     ) return INVALID_ACTIVITY_EVENT;
+    // Pi 的结束事件不携带参数；只有产生端缓存的开始参数齐全时，结束事实
+    // 才能自包含输入参数，否则整体降级为无摘要兜底。
+    const dedicated = origin === "pi_native"
+      && FILE_TOOL_SUMMARY_NAMES.has(event.toolName)
+      && isRecord(startArgs);
+    const summary = dedicated
+      ? extractFileToolSummary(event.toolName, startArgs, event.result, event.isError)
+      : undefined;
+    const errorText = summary !== undefined && event.isError
+      ? extractErrorText(event.result)
+      : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_end",
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       origin,
       isError: event.isError,
+      ...(summary === undefined ? {} : { summary }),
+      ...(errorText === undefined ? {} : { errorText }),
     });
   }
   return INVALID_ACTIVITY_EVENT;
+}
+
+/**
+ * 运行时使用的有状态专用规范化器：Pi 的工具结束事件不携带参数，本工厂按
+ * 工具活动 ID 缓存开始事件的参数，供结束事实自包含输入参数。缓存有界，
+ * 溢出时淘汰最旧的待决条目；宿主查询失败时全部工具保守兜底为 unknown。
+ */
+export function createOwnToolActivityNormalizer(
+  resolveToolOrigin: (toolName: string) => SafeToolOrigin,
+): (event: unknown) => AgentActivityEventNormalization {
+  const MAX_PENDING_TOOL_ARGS = 256;
+  const pendingArgs = new Map<string, unknown>();
+  return (event: unknown): AgentActivityEventNormalization => {
+    if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
+    const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+    if (event.type === "tool_execution_start" && toolCallId.length > 0) {
+      // 同活动 ID 的重复开始覆盖旧参数；容量溢出时淘汰最早待决条目。
+      pendingArgs.delete(toolCallId);
+      if (isRecord(event.args)) pendingArgs.set(toolCallId, event.args);
+      while (pendingArgs.size > MAX_PENDING_TOOL_ARGS) {
+        const oldest = pendingArgs.keys().next().value;
+        if (oldest === undefined) break;
+        pendingArgs.delete(oldest);
+      }
+    }
+    const origin = resolveToolOrigin(typeof event.toolName === "string" ? event.toolName : "");
+    const startArgs = event.type === "tool_execution_end" && toolCallId.length > 0
+      ? pendingArgs.get(toolCallId)
+      : undefined;
+    if (event.type === "tool_execution_end") pendingArgs.delete(toolCallId);
+    return normalizeOwnToolActivityEvent(event, origin, startArgs);
+  };
+}
+
+/**
+ * 已知可选字段的类型门卫：字段缺失返回 false（用默认语义）；存在但类型
+ * 不符合 Pi 原生 schema 时抛出降级信号。值域问题（如负数 limit）不算
+ * 类型错误，由提取条件决定是否携带。
+ */
+class SummaryFieldTypeError extends Error {}
+
+function typedField(args: Record<string, unknown>, key: string, guard: (value: unknown) => boolean): boolean {
+  if (!(key in args)) return false;
+  if (!guard(args[key])) throw new SummaryFieldTypeError(key);
+  return true;
+}
+
+function isCount(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+/**
+ * 从原始 Pi 工具事实提取专用摘要：输入参数部分始终提取；只有成功结束
+ * 才从 result.details 提取结果事实。必需字段缺失、任何已知字段存在但
+ * 类型错误时返回 undefined（完整降级）；值域偏离只导致对应事实不携带。
+ */
+function extractFileToolSummary(
+  toolName: string,
+  args: unknown,
+  result?: unknown,
+  isError?: boolean,
+): SafePiToolSummary | undefined {
+  if (!isRecord(args)) return undefined;
+  const success = isError === false && isRecord(result)
+    ? readRecord(result.details)
+    : undefined;
+  const truncation = success === undefined ? undefined : readRecord(success.truncation);
+  const truncated = truncation?.truncated === true;
+  try {
+    switch (toolName) {
+      case "read": {
+        const path = args.path;
+        if (typeof path !== "string") return undefined;
+        typedField(args, "offset", isCount);
+        typedField(args, "limit", isCount);
+        return {
+          tool: "read",
+          path,
+          ...optionalCount(args, "offset"),
+          ...optionalCount(args, "limit"),
+          ...(truncated ? {
+            truncated: true,
+            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
+              ? { truncatedBy: truncation.truncatedBy }
+              : {}),
+            ...(truncation?.firstLineExceedsLimit === true ? { firstLineExceedsLimit: true } : {}),
+          } : {}),
+        };
+      }
+      case "grep": {
+        const pattern = args.pattern;
+        if (typeof pattern !== "string") return undefined;
+        typedField(args, "path", (value) => typeof value === "string");
+        typedField(args, "glob", (value) => typeof value === "string");
+        typedField(args, "ignoreCase", (value) => typeof value === "boolean");
+        typedField(args, "literal", (value) => typeof value === "boolean");
+        typedField(args, "context", isCount);
+        typedField(args, "limit", isCount);
+        return {
+          tool: "grep",
+          pattern,
+          path: readOptionalPathInput(args),
+          ...optionalInput(args, "glob", (value) => typeof value === "string" && value.length > 0),
+          ...(args.ignoreCase === true ? { ignoreCase: true } : {}),
+          ...(args.literal === true ? { literal: true } : {}),
+          ...optionalCount(args, "context", { positive: true }),
+          ...optionalCount(args, "limit", { exclude: GREP_DEFAULT_LIMIT }),
+          ...(isError === false && matchesKnownEmptyResult(result, "No matches found")
+            ? { noMatches: true }
+            : {}),
+          ...(positiveCountField(success, "matchLimitReached") === undefined
+            ? {}
+            : { matchLimitReached: positiveCountField(success, "matchLimitReached")! }),
+          ...(truncated ? {
+            truncated: true,
+            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
+              ? { truncatedBy: truncation.truncatedBy }
+              : {}),
+          } : {}),
+          ...(success?.linesTruncated === true ? { linesTruncated: true } : {}),
+        };
+      }
+      case "find": {
+        const pattern = args.pattern;
+        if (typeof pattern !== "string") return undefined;
+        typedField(args, "path", (value) => typeof value === "string");
+        typedField(args, "limit", isCount);
+        return {
+          tool: "find",
+          pattern,
+          path: readOptionalPathInput(args),
+          ...optionalCount(args, "limit", { exclude: FIND_DEFAULT_LIMIT }),
+          ...(isError === false && matchesKnownEmptyResult(result, "No files found matching pattern")
+            ? { noFiles: true }
+            : {}),
+          ...(positiveCountField(success, "resultLimitReached") === undefined
+            ? {}
+            : { resultLimitReached: positiveCountField(success, "resultLimitReached")! }),
+          ...(truncated ? {
+            truncated: true,
+            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
+              ? { truncatedBy: truncation.truncatedBy }
+              : {}),
+          } : {}),
+        };
+      }
+      case "ls": {
+        typedField(args, "path", (value) => typeof value === "string");
+        typedField(args, "limit", isCount);
+        return {
+          tool: "ls",
+          path: readOptionalPathInput(args),
+          ...optionalCount(args, "limit", { exclude: LS_DEFAULT_LIMIT }),
+          ...(isError === false && matchesKnownEmptyResult(result, "(empty directory)")
+            ? { emptyDirectory: true }
+            : {}),
+          ...(positiveCountField(success, "entryLimitReached") === undefined
+            ? {}
+            : { entryLimitReached: positiveCountField(success, "entryLimitReached")! }),
+          ...(truncated ? {
+            truncated: true,
+            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
+              ? { truncatedBy: truncation.truncatedBy }
+              : {}),
+          } : {}),
+        };
+      }
+      default:
+        return undefined;
+    }
+  } catch (error) {
+    if (error instanceof SummaryFieldTypeError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * 失败事实的完整原始错误正文：Pi 把工具异常包装为 content 中的 text 块。
+ * 连接全部文本块、净化后返回；无可用文本时返回 undefined。
+ */
+function extractErrorText(result: unknown): string | undefined {
+  if (!isRecord(result) || !Array.isArray(result.content)) return undefined;
+  const parts: string[] = [];
+  for (const item of result.content) {
+    if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+    parts.push(item.text);
+  }
+  if (parts.length === 0) return undefined;
+  const sanitized = sanitizeSafeActivityText(parts.join("\n")).trim();
+  return sanitized.length === 0 ? undefined : sanitized;
+}
+
+/** Pi 已知空结果文案：content 全部为单个匹配文本时认定对应空结果事实。 */
+function matchesKnownEmptyResult(result: unknown, text: string): boolean {
+  if (!isRecord(result) || !Array.isArray(result.content) || result.content.length === 0) return false;
+  const parts: string[] = [];
+  for (const item of result.content) {
+    if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") return false;
+    parts.push(item.text);
+  }
+  return parts.join("\n") === text;
+}
+
+function readRecord(value: unknown): Record<string, unknown> | undefined {
+  return isRecord(value) ? value : undefined;
+}
+
+function positiveCountField(
+  source: Record<string, unknown> | undefined,
+  key: string,
+): number | undefined {
+  const value = source?.[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/** grep/find/ls 的 path：未提供或为空时按 Pi 语义明确为 "."。 */
+function readOptionalPathInput(args: Record<string, unknown>): string {
+  const value = args.path;
+  return typeof value === "string" && value.length > 0 ? value : ".";
+}
+
+function optionalCount(
+  args: Record<string, unknown>,
+  key: string,
+  options: { readonly positive?: boolean; readonly exclude?: number } = {},
+): { readonly [key: string]: number } | {} {
+  const value = args[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return {};
+  if (options.positive === true && value <= 0) return {};
+  if (options.exclude !== undefined && value === options.exclude) return {};
+  return { [key]: value };
+}
+
+function optionalInput(
+  args: Record<string, unknown>,
+  key: string,
+  guard: (value: unknown) => boolean,
+): { readonly [key: string]: unknown } | {} {
+  const value = args[key];
+  return guard(value) ? { [key]: value } : {};
+}
+
+/** wire 闭集校验：摘要只允许 Pi 原生专用工具携带，且键集合与类型严格闭合。 */
+function parseFileToolSummary(
+  toolName: string,
+  origin: SafeToolOrigin,
+  value: unknown,
+): SafePiToolSummary | undefined {
+  if (origin !== "pi_native" || !FILE_TOOL_SUMMARY_NAMES.has(toolName)) return undefined;
+  if (!isRecord(value) || value.tool !== toolName) return undefined;
+  switch (toolName) {
+    case "read": {
+      if (!hasExactSummaryKeys(value, READ_SUMMARY_KEYS)) return undefined;
+      const path = value.path;
+      if (typeof path !== "string") return undefined;
+      if (!validSummaryCount(value, "offset") || !validSummaryCount(value, "limit")) return undefined;
+      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
+      if (
+        value.truncatedBy !== undefined
+        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
+      ) return undefined;
+      if (
+        value.firstLineExceedsLimit !== undefined
+        && typeof value.firstLineExceedsLimit !== "boolean"
+      ) return undefined;
+      return value as unknown as SafePiToolSummary;
+    }
+    case "grep": {
+      if (!hasExactSummaryKeys(value, GREP_SUMMARY_KEYS)) return undefined;
+      if (typeof value.pattern !== "string" || typeof value.path !== "string") return undefined;
+      if (value.glob !== undefined && typeof value.glob !== "string") return undefined;
+      if (value.ignoreCase !== undefined && typeof value.ignoreCase !== "boolean") return undefined;
+      if (value.literal !== undefined && typeof value.literal !== "boolean") return undefined;
+      if (!validSummaryCount(value, "context") || !validSummaryCount(value, "limit")) return undefined;
+      if (value.noMatches !== undefined && typeof value.noMatches !== "boolean") return undefined;
+      if (
+        value.matchLimitReached !== undefined
+        && (typeof value.matchLimitReached !== "number"
+          || !Number.isSafeInteger(value.matchLimitReached)
+          || value.matchLimitReached <= 0)
+      ) return undefined;
+      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
+      if (
+        value.truncatedBy !== undefined
+        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
+      ) return undefined;
+      if (value.linesTruncated !== undefined && typeof value.linesTruncated !== "boolean") return undefined;
+      return value as unknown as SafePiToolSummary;
+    }
+    case "find": {
+      if (!hasExactSummaryKeys(value, FIND_SUMMARY_KEYS)) return undefined;
+      if (typeof value.pattern !== "string" || typeof value.path !== "string") return undefined;
+      if (!validSummaryCount(value, "limit")) return undefined;
+      if (value.noFiles !== undefined && typeof value.noFiles !== "boolean") return undefined;
+      if (
+        value.resultLimitReached !== undefined
+        && (typeof value.resultLimitReached !== "number"
+          || !Number.isSafeInteger(value.resultLimitReached)
+          || value.resultLimitReached <= 0)
+      ) return undefined;
+      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
+      if (
+        value.truncatedBy !== undefined
+        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
+      ) return undefined;
+      return value as unknown as SafePiToolSummary;
+    }
+    case "ls": {
+      if (!hasExactSummaryKeys(value, LS_SUMMARY_KEYS)) return undefined;
+      if (typeof value.path !== "string") return undefined;
+      if (!validSummaryCount(value, "limit")) return undefined;
+      if (value.emptyDirectory !== undefined && typeof value.emptyDirectory !== "boolean") return undefined;
+      if (
+        value.entryLimitReached !== undefined
+        && (typeof value.entryLimitReached !== "number"
+          || !Number.isSafeInteger(value.entryLimitReached)
+          || value.entryLimitReached <= 0)
+      ) return undefined;
+      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
+      if (
+        value.truncatedBy !== undefined
+        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
+      ) return undefined;
+      return value as unknown as SafePiToolSummary;
+    }
+    default:
+      return undefined;
+  }
+}
+
+function hasExactSummaryKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function validSummaryCount(value: Record<string, unknown>, key: string): boolean {
+  const count = value[key];
+  return count === undefined
+    || (typeof count === "number" && Number.isSafeInteger(count) && count >= 0);
 }
 
 /** 把 Pi assistant message_end 收窄为活动消息事件。 */
