@@ -1205,6 +1205,26 @@ export class AgentController {
     this.displayDrafts.applyEvent(agentId, event);
   }
 
+  /**
+   * 构建并校验规范活动条目候选：统一注入契约版本、代理身份、运行实例身份
+   * 与条目身份；契约校验失败返回 undefined。
+   */
+  private buildActivityEntry(
+    agentId: string,
+    body: SafeAgentActivityEvent,
+    entryId: string,
+  ): CanonicalAgentActivityEntry | undefined {
+    const candidate: CanonicalAgentActivityEntry = Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: agentId,
+      incarnation_id: this.activityIncarnationId,
+      entry_id: entryId,
+      body,
+    });
+    const parsed = parseCanonicalAgentActivityEntry(candidate);
+    return parsed.kind === "entry" ? parsed.entry : undefined;
+  }
+
   private recordActivity(agentId: string, entry: CanonicalAgentActivityEntry): boolean {
     // 中间运行时只逐层尽力转发，不保存历史副本；只有顶层运行时缓存回放。
     if (this.actor.kind === "agent") {
@@ -1238,16 +1258,9 @@ export class AgentController {
         Object.freeze({ type: "text", text: sanitizeSafeActivityText(message) }),
       ]),
     });
-    const candidate: CanonicalAgentActivityEntry = Object.freeze({
-      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
-      agent_id: agentId,
-      incarnation_id: this.activityIncarnationId,
-      entry_id: randomUUID(),
-      body,
-    });
-    const parsed = parseCanonicalAgentActivityEntry(candidate);
-    if (parsed.kind !== "entry") return;
-    this.recordActivity(agentId, parsed.entry);
+    const entry = this.buildActivityEntry(agentId, body, randomUUID());
+    if (entry === undefined) return;
+    this.recordActivity(agentId, entry);
   }
 
   private deliverTerminalNotification(agentId: string): boolean {

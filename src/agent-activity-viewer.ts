@@ -1,6 +1,7 @@
 import { Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
 import {
+  isMessageToolSummary,
   sanitizeSafeActivityText,
   type SafeAgentActivityContentBlock,
   type SafeToolOrigin,
@@ -671,11 +672,7 @@ export class AgentActivityViewerModel {
         const expanded = expandable && this.expandedKeys.has(expandKey);
         const marker = expandable ? (expanded ? "▾" : "▸") : "";
         // 失败事实的规范稳定错误码与收束事实并列在行尾。
-        const suffixParts = [
-          ...(visual.suffix === undefined ? [] : [visual.suffix]),
-          ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
-        ];
-        const suffix = suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`;
+        const suffix = toolLineSuffix(visual, entry.errorCode);
         // 摘要预算扣除行首图标/折叠标记与行尾收束事实，避免二次右侧截断。
         const summaryWidth = contentWidth
           - displayWidth(visual.icon) - 1
@@ -1156,11 +1153,19 @@ function shortAgentId(agentId: string): string {
 
 /** 消息类插件工具摘要自包含的完整尝试正文（成功与失败都保留）。 */
 function toolMessageBody(summary: SafeToolSummary): string | undefined {
-  return summary.tool === "send_message"
-    || summary.tool === "normal_reply"
-    || summary.tool === "final_report"
-    ? summary.message
-    : undefined;
+  return isMessageToolSummary(summary) ? summary.message : undefined;
+}
+
+/** 工具行尾收束事实：状态视觉后缀与规范稳定错误码并列。 */
+function toolLineSuffix(
+  visual: { readonly suffix?: string },
+  errorCode: string | undefined,
+): string {
+  const parts = [
+    ...(visual.suffix === undefined ? [] : [visual.suffix]),
+    ...(errorCode === undefined ? [] : [errorCode]),
+  ];
+  return parts.length === 0 ? "" : ` · ${parts.join(SUMMARY_SEPARATOR)}`;
 }
 
 function readTruncationFacts(

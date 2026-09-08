@@ -1248,6 +1248,58 @@ test("五种插件专用工具的开始事实自包含白名单参数并忽略�
   }
 });
 
+test("系统提示、模板正文与上下文文件清单永不进入插件工具摘要", () => {
+  // spawn_agent 的输入与成功结果携带系统内容载荷，摘要只保留白名单字段。
+  const spawned = normalizeOwnToolActivityEvent(
+    pluginEnd(
+      "spawn_agent",
+      {
+        details: {
+          agent_id: PLUGIN_CHILD_ID,
+          state: "idle",
+          system_prompt: "机密系统提示",
+          template_body: "机密模板正文",
+          context_files: [{ path: "AGENTS.md", content: "机密上下文正文" }],
+        },
+      },
+      false,
+    ),
+    "plugin",
+    {
+      name: "worker-a",
+      template_id: "worker",
+      system_prompt: "机密系统提示",
+      context_files: [{ path: "AGENTS.md", content: "机密上下文正文" }],
+    },
+  );
+  assert.equal(spawned.kind, "event");
+  if (spawned.kind !== "event" || spawned.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(spawned.event), {
+    tool: "spawn_agent",
+    name: "worker-a",
+    template_id: "worker",
+    agent_id: PLUGIN_CHILD_ID,
+  });
+
+  // send_message 的输入携带系统内容字段，摘要只保留白名单字段。
+  const send = normalizeOwnToolActivityEvent(
+    pluginStart("send_message", {
+      agent_id: PLUGIN_CHILD_ID,
+      message: "普通投递正文",
+      system_prompt: "机密系统提示",
+      context_files: [{ path: "CONTEXT.md", content: "机密上下文正文" }],
+    }),
+    "plugin",
+  );
+  assert.equal(send.kind, "event");
+  if (send.kind !== "event" || send.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(send.event), {
+    tool: "send_message",
+    agent_id: PLUGIN_CHILD_ID,
+    message: "普通投递正文",
+  });
+});
+
 test("插件工具结束事实区分成功与失败摘要并只携带白名单稳定错误码", () => {
   // get_agent_templates 成功只提取模板数量；details 缺失或非数组时不携带。
   const counted = normalizeOwnToolActivityEvent(

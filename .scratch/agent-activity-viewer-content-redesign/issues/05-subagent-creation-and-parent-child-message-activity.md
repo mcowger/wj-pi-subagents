@@ -28,7 +28,7 @@
 - **插件专用摘要闭集与契约演进**（`src/rpc-bridge-event.ts`）：新增 `PLUGIN_TOOL_SUMMARY_NAMES` 闭集（`get_agent_templates`/`spawn_agent`/`send_message`/`normal_reply`/`final_report`），`SafeToolSummary` 扩展五个插件分支。专用规则只作用于来源验证为 `plugin` 的实现；同名覆盖（origin 为 `pi_native`/`unknown`）一律无载荷安全兜底。`normalizeOwnToolActivityEvent` 按来源分派到 `extractPluginToolSummary`（产生端）与 `parsePluginToolSummary`（wire 校验），成功事实提取 `result.details`、失败事实提取稳定错误码。插件失败不携带 `errorText`（wire 层拒绝），只携带 `errorCode`；`extractPluginErrorCode` 只从 `SubagentToolError` 的稳定 JSON 外壳取 `PUBLIC_ERROR_CODES` 白名单内的 `error.code`，白名单外、非 JSON 与缺失外壳静默省略。这是原子正文不兼容变化，规范活动契约 `/4` → `/5`、监督协议 `/22` → `/23`；旧契约条目/帧按既有协议故障路径拒绝。
 - **产生端专用提取规则**（`extractPluginToolSummary`）：
   - `get_agent_templates`：无输入参数；成功只提取 `details` 模板数组数量，模板 ID、描述、工具、扩展等配置永不进入摘要；失败或 details 缺失/非数组时只保留无载荷工具名摘要。
-  - `spawn_agent`：开始与失败摘要只保留 `name` + `template_id`；成功追加完整规范 UUID `agent_id`；depth、初始 state、任务正文等未来字段与敏感载荷一律忽略。
+  - `spawn_agent`：开始与失败摘要只保留 `name` + `template_id`；成功追加完整规范 UUID `agent_id`（成功结果缺失或非规范 UUID 时不追加，仍保留 `name` + `template_id`）；depth、初始 state、任务正文等未来字段与敏感载荷一律忽略。
   - `send_message`：开始事实即自包含完整尝试正文（经 `sanitizeSafeActivityText` 净化）与目标 `agent_id`；可选 `resolveAgentName` 命中时携带目标名称，未命中不携带；`accepted` 等其它字段忽略。
   - `normal_reply`/`final_report`：摘要只含工具名 + 完整 `message`；无论成功或失败正文都保留。
   - 必需字段缺失或类型错误（非 UUID、非 string message 等）完整降级为无载荷兜底；结束事实缺少缓存的开始参数时同样降级，但失败事实的稳定错误码仍提取。

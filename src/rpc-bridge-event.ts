@@ -225,6 +225,19 @@ export type SafeToolSummary =
       readonly tool: "get_agent_tree";
     };
 
+/**
+ * 消息类插件工具摘要：send_message、normal_reply 与 final_report 的摘要
+ * 自包含完整尝试正文（成功与失败都保留）。显示层的正文展开入口共用本谓词，
+ * 消息工具闭集以摘要类型为单一真相源。
+ */
+export type MessageToolSummary = Extract<SafeToolSummary, { readonly message: string }>;
+
+export function isMessageToolSummary(summary: SafeToolSummary): summary is MessageToolSummary {
+  return summary.tool === "send_message"
+    || summary.tool === "normal_reply"
+    || summary.tool === "final_report";
+}
+
 const READ_SUMMARY_KEYS = Object.freeze([
   "tool", "path", "offset", "limit", "truncated", "truncatedBy", "firstLineExceedsLimit", "hasMoreLines",
 ] as const);
