@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  normalizeOwnToolActivityEvent,
   normalizeRpcBridgeEvent,
   parseAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
@@ -86,7 +87,7 @@ test("assistant 消息正文聚合不设置字节上限", () => {
   assert.equal(normalized.event.content[0]?.text, large);
 });
 
-test("活动事件闭集对 message 正文不再按字节拒绝，工具正文预算保持不变", () => {
+test("活动事件闭集对 message 正文不再按字节拒绝，旧工具字段不属于闭集", () => {
   const large = "x".repeat(64 * 1024);
   const message = parseAgentActivityEvent({
     type: "message",
@@ -94,11 +95,97 @@ test("活动事件闭集对 message 正文不再按字节拒绝，工具正文�
   });
   assert.equal(message.kind, "event");
 
-  const oversizedArgs = parseAgentActivityEvent({
+  // 旧契约的原始参数字段不再是合法活动事件。
+  const legacyArgs = parseAgentActivityEvent({
     type: "tool_execution_start",
     toolCallId: "call_1",
     toolName: "read",
+    origin: "pi_native",
     args: JSON.stringify({ path: "a".repeat(64 * 1024) }),
   });
-  assert.equal(oversizedArgs.kind, "rejected");
+  assert.equal(legacyArgs.kind, "invalid");
+});
+
+test("产生端规范化把原始 Pi 工具事实缩减为无载荷状态事实，来源身份随输入传递", () => {
+  assert.deepEqual(normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    args: { path: "/secret/path.txt", limit: 10 },
+  }, "pi_native"), {
+    kind: "event",
+    event: {
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "read",
+      origin: "pi_native",
+    },
+  });
+  assert.deepEqual(normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    result: { text: "文件正文不得跨进程", truncated: false },
+    isError: false,
+  }, "pi_native"), {
+    kind: "event",
+    event: {
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "read",
+      origin: "pi_native",
+      isError: false,
+    },
+  });
+});
+
+test("产生端规范化宽容未来新增字段并忽略未知载荷", () => {
+  assert.deepEqual(normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "grep",
+    pattern: "x",
+    futureField: { nested: [1, 2, 3] },
+    args: "遗留字段",
+  }, "plugin"), {
+    kind: "event",
+    event: {
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "grep",
+      origin: "plugin",
+    },
+  });
+});
+
+test("产生端规范化拒绝来源闭集之外的身份与结构违约，但不涉及载荷内容", () => {
+  // 来源身份是闭集；无效来源不降级为 unknown，而是拒绝事件。
+  assert.equal(normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+  }, "extension" as never).kind, "invalid");
+  // 关联身份缺失无法建立条目。
+  assert.equal(normalizeOwnToolActivityEvent({
+    type: "tool_execution_start",
+    toolName: "read",
+  }, "unknown").kind, "invalid");
+  // 来源不明的合法事实仍按安全兜底产生。
+  assert.equal(normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    isError: false,
+  }, "unknown").kind, "event");
+  // 结束事实自包含状态：缺少 isError 拒绝。
+  assert.equal(normalizeOwnToolActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+  }, "plugin").kind, "invalid");
+  assert.equal(normalizeOwnToolActivityEvent({
+    type: "tool_execution_update",
+    toolCallId: "call_1",
+    toolName: "read",
+  }, "plugin").kind, "invalid");
 });

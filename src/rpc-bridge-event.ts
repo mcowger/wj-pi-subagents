@@ -1,8 +1,9 @@
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 
 /**
- * 活动事件正文按 JSON 转义后 UTF-8 字节计算。它限制单个工具参数/结果载荷与
- * 单个实时增量帧的尺寸；assistant 消息正文聚合不设字节上限，由传输分块解决。
+ * 活动事件正文按 JSON 转义后 UTF-8 字节计算。它限制单个实时增量帧的尺寸；
+ * assistant 消息正文聚合与工具状态事实不设载荷预算：工具参数、结果与错误
+ * 正文在产生端规范化时就被丢弃，不跨进程传输。
  */
 export const ACTIVITY_MAX_TEXT_BYTES = 16 * 1024;
 const MAX_ACTIVITY_CONTENT_BLOCKS = 64;
@@ -14,6 +15,33 @@ export type SafeAgentActivityContentBlock =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "thinking"; readonly thinking: string };
 
+/**
+ * 工具来源身份闭集。只有来源验证通过的工具才能获得 pi_native 或 plugin 身份；
+ * 第三方扩展、MCP、同名覆盖与来源不明工具一律安全兜底为 unknown。
+ */
+export type SafeToolOrigin = "pi_native" | "plugin" | "unknown";
+
+const SAFE_TOOL_ORIGINS: readonly SafeToolOrigin[] = Object.freeze([
+  "pi_native",
+  "plugin",
+  "unknown",
+]);
+
+/**
+ * Pi 原生工具名闭集。只有来源验证确认当前会话注册实现仍是 Pi 内置实现时，
+ * 同名工具才携带 pi_native 身份；同名覆盖后同名事件走安全兜底。
+ */
+export const PI_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "bash",
+  "edit",
+  "find",
+  "grep",
+  "ls",
+  "powershell",
+  "read",
+  "write",
+]);
+
 /** 加宽后的子代理会话活动事件闭集；监督通道活动流帧承载同一闭集。 */
 export type SafeAgentActivityEvent =
   | {
@@ -24,14 +52,14 @@ export type SafeAgentActivityEvent =
       readonly type: "tool_execution_start";
       readonly toolCallId: string;
       readonly toolName: string;
-      readonly args?: string;
+      readonly origin: SafeToolOrigin;
     }
   | {
       readonly type: "tool_execution_end";
       readonly toolCallId: string;
       readonly toolName: string;
-      readonly result?: string;
-      readonly isError?: boolean;
+      readonly origin: SafeToolOrigin;
+      readonly isError: boolean;
     };
 
 /**
@@ -106,10 +134,6 @@ const INVALID_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "invali
 const INVALID_ACTIVITY_EVENT: AgentActivityEventNormalization = Object.freeze({ kind: "invalid" });
 const INVALID_ACTIVITY_DISPLAY_EVENT: AgentActivityDisplayEventNormalization = Object.freeze({ kind: "invalid" });
 const IGNORED_ACTIVITY_DISPLAY_EVENT: AgentActivityDisplayEventNormalization = Object.freeze({ kind: "ignored" });
-const ACTIVITY_REJECTED: AgentActivityEventNormalization = Object.freeze({
-  kind: "rejected",
-  reason: "reply_too_large",
-});
 const ACTIVITY_DISPLAY_REJECTED: AgentActivityDisplayEventNormalization = Object.freeze({
   kind: "rejected",
   reason: "reply_too_large",
@@ -156,31 +180,28 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
       }));
     case "tool_execution_start":
     case "tool_execution_end": {
+      // 桥接 RPC 副本只服务活动阶段跟踪；来源无法在桥接进程验证，固定
+      // 标记为 unknown。参数与结果正文不再越过该闭集。
       if (
         !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
         || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
       ) return INVALID_EVENT;
       if (event.type === "tool_execution_start") {
-        const args = encodeBoundedActivityJson(event.args);
-        if (args === "invalid") return INVALID_EVENT;
-        if (args === "rejected") return REPLY_TOO_LARGE_EVENT;
+        // 桥接输入是 Pi 原始事件：旧字段与未来新增字段一律剥离。
         return safeEvent(Object.freeze({
           type: event.type,
           toolCallId: event.toolCallId,
           toolName: event.toolName,
-          ...(args === undefined ? {} : { args }),
+          origin: "unknown",
         }));
       }
-      const result = encodeBoundedActivityJson(event.result);
-      if (result === "invalid") return INVALID_EVENT;
-      if (result === "rejected") return REPLY_TOO_LARGE_EVENT;
-      if (event.isError !== undefined && typeof event.isError !== "boolean") return INVALID_EVENT;
+      if (typeof event.isError !== "boolean") return INVALID_EVENT;
       return safeEvent(Object.freeze({
         type: event.type,
         toolCallId: event.toolCallId,
         toolName: event.toolName,
-        ...(result === undefined ? {} : { result }),
-        ...(event.isError === undefined ? {} : { isError: event.isError }),
+        origin: "unknown",
+        isError: event.isError,
       }));
     }
     case "message_end": {
@@ -263,48 +284,40 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       });
     }
     case "tool_execution_start": {
-      const toolCallId = value.toolCallId;
-      const toolName = value.toolName;
-      if (
-        !validBoundedText(toolCallId, MAX_TOOL_ID_BYTES)
-        || !validBoundedText(toolName, MAX_TOOL_ID_BYTES)
-      ) return INVALID_ACTIVITY_EVENT;
-      if (value.args !== undefined) {
-        if (typeof value.args !== "string") return INVALID_ACTIVITY_EVENT;
-        if (encodedJsonLength(value.args) > ACTIVITY_MAX_TEXT_BYTES) return ACTIVITY_REJECTED;
+      if (!validBoundedText(value.toolCallId, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
+      if (!validBoundedText(value.toolName, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
+      if (!hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin"])) {
+        return INVALID_ACTIVITY_EVENT;
       }
+      const origin = value.origin;
+      if (!SAFE_TOOL_ORIGINS.includes(origin as SafeToolOrigin)) return INVALID_ACTIVITY_EVENT;
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
-          type: "tool_execution_start",
-          toolCallId,
-          toolName,
-          ...(value.args === undefined ? {} : { args: value.args }),
+          type: "tool_execution_start" as const,
+          toolCallId: value.toolCallId,
+          toolName: value.toolName,
+          origin: origin as SafeToolOrigin,
         }),
       });
     }
     case "tool_execution_end": {
-      const toolCallId = value.toolCallId;
-      const toolName = value.toolName;
+      if (!validBoundedText(value.toolCallId, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
+      if (!validBoundedText(value.toolName, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
       if (
-        !validBoundedText(toolCallId, MAX_TOOL_ID_BYTES)
-        || !validBoundedText(toolName, MAX_TOOL_ID_BYTES)
+        typeof value.isError !== "boolean"
+        || !hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin", "isError"])
       ) return INVALID_ACTIVITY_EVENT;
-      if (value.result !== undefined) {
-        if (typeof value.result !== "string") return INVALID_ACTIVITY_EVENT;
-        if (encodedJsonLength(value.result) > ACTIVITY_MAX_TEXT_BYTES) return ACTIVITY_REJECTED;
-      }
-      if (value.isError !== undefined && typeof value.isError !== "boolean") {
-        return INVALID_ACTIVITY_EVENT;
-      }
+      const origin = value.origin;
+      if (!SAFE_TOOL_ORIGINS.includes(origin as SafeToolOrigin)) return INVALID_ACTIVITY_EVENT;
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
-          type: "tool_execution_end",
-          toolCallId,
-          toolName,
-          ...(value.result === undefined ? {} : { result: value.result }),
-          ...(value.isError === undefined ? {} : { isError: value.isError }),
+          type: "tool_execution_end" as const,
+          toolCallId: value.toolCallId,
+          toolName: value.toolName,
+          origin: origin as SafeToolOrigin,
+          isError: value.isError,
         }),
       });
     }
@@ -397,6 +410,47 @@ export function normalizeAssistantMessageUpdate(
   });
 }
 
+/**
+ * 产生端规范化：把子代理自身观察到的原始 Pi 工具执行事实缩减为无载荷状态
+ * 事实。原始参数、结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方
+ * 验证后随规范化输入传递。允许未来新增字段并忽略它们；关联身份缺失或来源
+ * 闭集之外属于结构违约，由调用方决定是否升级，不在本函数内降级。
+ */
+export function normalizeOwnToolActivityEvent(
+  event: unknown,
+  origin: SafeToolOrigin,
+): AgentActivityEventNormalization {
+  if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
+  if (!SAFE_TOOL_ORIGINS.includes(origin)) return INVALID_ACTIVITY_EVENT;
+  if (event.type === "tool_execution_start") {
+    if (
+      !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
+      || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
+    ) return INVALID_ACTIVITY_EVENT;
+    return parseAgentActivityEvent({
+      type: "tool_execution_start",
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      origin,
+    });
+  }
+  if (event.type === "tool_execution_end") {
+    if (
+      !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
+      || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
+      || typeof event.isError !== "boolean"
+    ) return INVALID_ACTIVITY_EVENT;
+    return parseAgentActivityEvent({
+      type: "tool_execution_end",
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      origin,
+      isError: event.isError,
+    });
+  }
+  return INVALID_ACTIVITY_EVENT;
+}
+
 /** 把 Pi assistant message_end 收窄为活动消息事件。 */
 function normalizeActivityMessageEnd(
   message: Record<string, unknown>,
@@ -446,20 +500,10 @@ function normalizeActivityContent(
   return Object.freeze(content);
 }
 
-/** 把工具参数/结果 JSON 值编码为有界字符串；不可序列化值属于结构违约。 */
-function encodeBoundedActivityJson(value: unknown): string | "invalid" | "rejected" | undefined {
-  if (value === undefined) return undefined;
-  let encoded: string;
-  try {
-    encoded = JSON.stringify(value);
-  } catch {
-    return "invalid";
-  }
-  if (encoded === undefined) return undefined;
-  if (encodedJsonLength(encoded) > ACTIVITY_MAX_TEXT_BYTES) return "rejected";
-  return encoded;
+/** 工具活动闭集字段检查：旧契约字段（args/result）出现即违约。 */
+function hasOnlyToolEventKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
 }
-
 function encodedJsonLength(value: string): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }

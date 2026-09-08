@@ -8,6 +8,7 @@ import {
 } from "../src/agent-activity-viewer.ts";
 import type {
   SafeAgentActivityDisplayEvent,
+  SafeToolOrigin,
 } from "../src/rpc-bridge-event.ts";
 import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
 import {
@@ -32,7 +33,7 @@ function messageEntry(
   content: ReadonlyArray<{ type: "text"; text: string } | { type: "thinking"; thinking: string }>,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
-    contract_version: "wj-pi-subagents.activity/1",
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
     incarnation_id: randomUUID(),
     entry_id: randomUUID(),
@@ -47,39 +48,42 @@ function textMessage(text: string): CanonicalAgentActivityEntry {
   return messageEntry([{ type: "text", text }]);
 }
 
-function toolEntry(
+function toolStart(
   toolCallId: string,
   toolName: string,
-  args?: string,
-  result?: string,
-  isError?: boolean,
+  origin: SafeToolOrigin = "unknown",
 ): CanonicalAgentActivityEntry {
-  const incarnation = randomUUID();
-  const entryId = randomUUID();
-  const start: CanonicalAgentActivityEntry = Object.freeze({
-    contract_version: "wj-pi-subagents.activity/1",
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
-    incarnation_id: incarnation,
-    entry_id: entryId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
     body: Object.freeze({
       type: "tool_execution_start",
       toolCallId,
       toolName,
-      ...(args === undefined ? {} : { args }),
+      origin,
     }),
   });
-  if (result === undefined) return start;
+}
+
+function toolEnd(
+  toolCallId: string,
+  toolName: string,
+  isError: boolean,
+  origin: SafeToolOrigin = "unknown",
+): CanonicalAgentActivityEntry {
   return Object.freeze({
-    contract_version: "wj-pi-subagents.activity/1",
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
-    incarnation_id: incarnation,
-    entry_id: entryId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
     body: Object.freeze({
       type: "tool_execution_end",
       toolCallId,
       toolName,
-      result,
-      ...(isError === undefined ? {} : { isError }),
+      origin,
+      isError,
     }),
   });
 }
@@ -105,11 +109,12 @@ function displayComplete(streamId: string, sequence: number): SafeAgentActivityD
   return Object.freeze({ type: "message_complete", streamId, sequence });
 }
 
-/** 4 行正文消息 + 工具开始/结束各 1 行 = 6 行事件正文。 */
+/** 4 行正文消息 + 一条完成工具 = 6 行事件正文。 */
 function replayFixture(): readonly CanonicalAgentActivityEntry[] {
   return Object.freeze([
     textMessage("line1\nline2\nline3\nline4"),
-    toolEntry("t1", "read_file", '{"path":"src/a.ts"}', '{"ok":true}'),
+    toolStart("t1", "read_file"),
+    toolEnd("t1", "read_file", false),
   ]);
 }
 
@@ -120,9 +125,186 @@ test("打开即回放全部规范条目历史", () => {
   assert.match(lines[0] ?? "", /worker · worker-a · working/);
   assert.ok(lines.some((line) => line.includes("line1")), lines.join("\n"));
   assert.ok(lines.some((line) => line.includes("line4")));
-  assert.ok(lines.some((line) => line.includes("▶ read_file")), lines.join("\n"));
-  assert.ok(lines.some((line) => line.includes("read_file") && line.includes('{"ok":true}')));
+  assert.ok(lines.some((line) => line.includes("read_file")), lines.join("\n"));
+  assert.equal(viewer.getPublicState().event_count, 3);
+});
+
+test("工具开始立即建立运行中条目，结束原地更新同一条目且不产生独立结果行", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  let lines = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(lines, /▶ read_file/u);
+  assert.doesNotMatch(lines, /✓|×/u);
+
+  viewer.syncFrom([toolStart("t1", "read_file"), toolEnd("t1", "read_file", false)]);
+  lines = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(lines, /✓ read_file/u);
+  assert.doesNotMatch(lines, /▶/u);
+  // 不显示执行耗时。
+  assert.doesNotMatch(lines, /ms|耗时|elapsed/u);
+  // 一次调用只有一个条目：结束不产生第二行。
+  assert.equal(
+    viewer.render(160).slice(1, -1).filter((line) => line.includes("read_file")).length,
+    1,
+  );
+
+  viewer.syncFrom([
+    toolStart("t1", "read_file"),
+    toolEnd("t1", "read_file", false),
+    toolStart("t2", "run_cmd"),
+    toolEnd("t2", "run_cmd", true),
+  ]);
+  lines = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(lines, /✓ read_file/u);
+  assert.match(lines, /× run_cmd/u);
+});
+
+test("运行中强调色、成功与中性弱化、警告色、失败整行错误色", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+
+  const running = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  const runningLines = renderAgentActivityViewerSurface(running, 120, theme).join("\n");
+  assert.match(runningLines, /<fg:accent>[^]*▶ read_file/u);
+
+  const success = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "read_file"),
+    toolEnd("t1", "read_file", false),
+  ], { viewport_height: 20 });
+  const successLines = renderAgentActivityViewerSurface(success, 120, theme).join("\n");
+  assert.match(successLines, /<fg:dim>[^]*✓ read_file/u);
+  assert.doesNotMatch(successLines, /<fg:error>/u);
+
+  const failure = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "read_file"),
+    toolEnd("t1", "read_file", true),
+  ], { viewport_height: 20 });
+  const failureLines = renderAgentActivityViewerSurface(failure, 120, theme).join("\n");
+  assert.match(failureLines, /<fg:error>[^]*× read_file/u);
+});
+
+test("安全兜底只显示工具名与状态，不显示参数、结果或错误正文", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "read_file", "unknown"),
+    toolEnd("t1", "read_file", true, "unknown"),
+    toolStart("t2", "query_database", "unknown"),
+    toolEnd("t2", "query_database", false, "unknown"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  assert.match(body, /× read_file/u);
+  assert.match(body, /✓ query_database/u);
+  // 任何载荷、错误正文与可展开入口都不出现。
+  assert.doesNotMatch(body, /collapsed|Enter to expand/u);
+  assert.equal(
+    viewer.render(160).slice(1, -1).filter((line) => line.includes("read_file")).length,
+    1,
+  );
+  // 兜底条目不可展开：不参与选择循环。
+  for (const key of viewer.getExpandedKeys()) {
+    assert.doesNotMatch(key, /tool:/u);
+  }
+});
+
+test("结束先到时自建完成条目，迟到开始被忽略且不重置状态", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "read_file", false),
+  ], { viewport_height: 20 });
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /✓ read_file/u);
+
+  // 迟到开始不得把完成条目退回运行中。
+  viewer.syncFrom([toolEnd("t1", "read_file", false), toolStart("t1", "read_file")]);
+  const body = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(body, /✓ read_file/u);
+  assert.doesNotMatch(body, /▶/u);
   assert.equal(viewer.getPublicState().event_count, 2);
+});
+
+test("重复开始与重复结束保持幂等", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "read_file"),
+    toolStart("t1", "read_file"),
+    toolEnd("t1", "read_file", false),
+    toolEnd("t1", "read_file", false),
+  ], { viewport_height: 20 });
+
+  const body = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(body, /✓ read_file/u);
+  assert.doesNotMatch(body, /▶/u);
+  assert.equal(
+    viewer.render(160).slice(1, -1).filter((line) => line.includes("read_file")).length,
+    1,
+  );
+});
+
+test("代理进入 idle 时运行中工具收束为警告 result unavailable，匹配结束仍可回填", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent("idle"), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.match(lines.join("\n"), /read_file · result unavailable/u);
+  assert.ok(lines.some((line) => line.includes("read_file") && !line.includes("▶")));
+
+  // 收束后身份匹配的结束事实回填真实状态。
+  viewer.syncFrom([toolStart("t1", "read_file"), toolEnd("t1", "read_file", false)]);
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /✓ read_file/u);
+  assert.doesNotMatch(viewer.render(160).slice(1, -1).join("\n"), /result unavailable/u);
+});
+
+test("代理进入 failed 与 terminated 时按各自语义收束运行中工具", () => {
+  const failed = new AgentActivityViewerModel(viewerAgent("failed"), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  const failedLines = failed.render(160).slice(1, -1);
+  assert.ok(failedLines.some((line) => line.includes("read_file") && !line.includes("▶")));
+
+  const terminated = new AgentActivityViewerModel(viewerAgent("terminated"), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  const terminatedBody = terminated.render(160).slice(1, -1).join("\n");
+  assert.match(terminatedBody, /read_file · terminated before result/u);
+
+  // 终态收束后匹配结束仍可回填；失败结束回填为真实失败。
+  terminated.syncFrom([toolStart("t1", "read_file"), toolEnd("t1", "read_file", true)]);
+  assert.match(terminated.render(160).slice(1, -1).join("\n"), /× read_file/u);
+  assert.doesNotMatch(
+    terminated.render(160).slice(1, -1).join("\n"),
+    /terminated before result/u,
+  );
+});
+
+test("非终态生命周期不收束运行中工具，收束只发生在 idle/failed/terminated", () => {
+  for (const state of [
+    "starting",
+    "working",
+    "interrupting",
+    "terminating",
+  ] as const) {
+    const viewer = new AgentActivityViewerModel(viewerAgent(state), [
+      toolStart("t1", "read_file"),
+    ], { viewport_height: 20 });
+    const body = viewer.render(160).slice(1, -1).join("\n");
+    assert.match(body, /▶ read_file/u, state);
+    assert.doesNotMatch(body, /result unavailable|terminated before result/u, state);
+  }
+});
+
+test("生命周期收束不可逆：回看与重放不会把收束条目退回运行中", () => {
+  const entries = [toolStart("t1", "read_file")];
+  const viewer = new AgentActivityViewerModel(viewerAgent("terminated"), entries, {
+    viewport_height: 20,
+  });
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /terminated before result/u);
+
+  // lifecycle 回到 working 也不恢复运行中显示（收束只由条目事实回填）。
+  viewer.updateLifecycle("working");
+  assert.doesNotMatch(viewer.render(160).slice(1, -1).join("\n"), /▶ read_file/u);
 });
 
 test("text block 独立按正常 Markdown 完整渲染，不加角色标签或分隔线", () => {
@@ -263,7 +445,7 @@ test("打开时默认选择当前视口最新可展开项，新活动不抢选�
     messageEntry([{ type: "thinking", thinking: "早思考" }]),
     textMessage("正文\n正文\n正文\n正文"),
     messageEntry([{ type: "thinking", thinking: "晚思考" }]),
-    toolEntry("new-1", "run_cmd", '{"cmd":"ls"}'),
+    toolStart("new-1", "run_cmd"),
   ]);
   assert.equal(viewer.getSelectedKey(), initial);
 });
@@ -325,7 +507,7 @@ test("展开保持屏幕位置并暂停 follow；折叠不自动恢复；滚到�
   // 展开动作后追加新条目不拉到底部；屏幕位置保持。
   const offsetAfterExpand = viewer.getPublicState().scroll_offset;
   viewer.syncFrom(entries.concat([
-    toolEntry("late-1", "run_cmd", '{"cmd":"ls"}'),
+    toolStart("late-1", "run_cmd"),
   ]));
   assert.equal(viewer.getPublicState().scroll_offset, offsetAfterExpand);
   assert.equal(viewer.getSelectedKey(), selectedBefore);
@@ -358,7 +540,7 @@ test("向上滚动暂停 follow，向下滚到底恢复，footer 始终固定且
   );
   assert.doesNotMatch(viewer.render(160).at(-1) ?? "", /paused/u);
 
-  viewer.syncFrom([...replayFixture(), toolEntry("t2", "run_cmd", '{"cmd":"ls"}')]);
+  viewer.syncFrom([...replayFixture(), toolStart("t2", "run_cmd")]);
   // 暂停后追加新条目保持用户回看位置。
   assert.equal(viewer.getPublicState().follow_enabled, false);
   const pausedOffset = viewer.getPublicState().scroll_offset;
@@ -389,29 +571,6 @@ test("选中条目使用整行选中背景渲染", () => {
   const selectedLines = surface.filter((line) => line.includes("<bg:selectedBg>"));
   assert.equal(selectedLines.length, 1, surface.join("\n"));
   assert.match(selectedLines[0] ?? "", /Thinking/u);
-});
-
-test("工具长结果仍是可展开条目，展开状态按调用身份保持", () => {
-  const result = Array.from({ length: 8 }, (_, index) => `result-line-${index + 1}`).join("\n");
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [
-    toolEntry("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
-    toolEntry("t-long", "read_file", undefined, JSON.stringify(result)),
-  ], { viewport_height: 20 });
-
-  const collapsed = viewer.render(120).slice(1, -1).join("\n");
-  assert.match(collapsed, /collapsed/u);
-  assert.doesNotMatch(collapsed, /result-line-8/u);
-
-  assert.equal(viewer.handleInput("\t"), "changed");
-  assert.equal(viewer.handleInput("\r"), "changed");
-  assert.match(viewer.render(120).slice(1, -1).join("\n"), /result-line-8/u);
-
-  viewer.syncFrom([
-    toolEntry("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
-    toolEntry("t-long", "read_file", undefined, JSON.stringify(result)),
-    textMessage("after result"),
-  ]);
-  assert.match(viewer.render(120).slice(1, -1).join("\n"), /result-line-8/u);
 });
 
 test("逐 token 显示事件只驻留查看器投影，并在完整条目抵达时收束", () => {
@@ -469,14 +628,14 @@ test("标题展示模板、名称与生命周期状态并净化控制字符", ()
 test("违约条目被静默忽略", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture());
   const stale = Object.freeze({
-    contract_version: "wj-pi-subagents.activity/0",
+    contract_version: "wj-pi-subagents.activity/1",
     agent_id: AGENT_ID,
     incarnation_id: randomUUID(),
     entry_id: randomUUID(),
     body: Object.freeze({ type: "message", content: [] }),
   }) as unknown as CanonicalAgentActivityEntry;
   assert.equal(viewer.syncFrom([stale]), "ignored");
-  assert.equal(viewer.getPublicState().event_count, 2);
+  assert.equal(viewer.getPublicState().event_count, 3);
 });
 
 test("查看器表面使用既定框线布局并应用主题", () => {

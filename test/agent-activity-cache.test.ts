@@ -36,7 +36,7 @@ test("活动缓存按 agent_id 追加规范条目，并按到达序全量回放"
       type: "tool_execution_start",
       toolCallId: "call_1",
       toolName: "read",
-      args: '{"path":"a.ts"}',
+      origin: "pi_native",
     }),
   });
   cache.append(AGENT_A, first);

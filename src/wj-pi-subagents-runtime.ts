@@ -27,8 +27,11 @@ import type {
   ExtensionApiSurface,
 } from "./host-gate.ts";
 import {
+  normalizeOwnToolActivityEvent,
   normalizeRpcBridgeEvent,
+  PI_NATIVE_TOOL_NAMES,
   type SafeAgentActivityEvent,
+  type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
 import {
   RUNTIME_EPHEMERAL_ENV_KEYS,
@@ -607,6 +610,56 @@ function defaultSelfExtensionPath(): string {
   }
 }
 
+/**
+ * 来源验证：按当前会话注册表判定工具实现来源。只有注册来源确认是 Pi 内置
+ * 实现（builtin）或本插件自身入口时，才授予 pi_native/plugin 身份；第三方
+ * 扩展、MCP、SDK 工具与同名覆盖一律安全兜底为 unknown。
+ */
+export function classifyRegisteredToolOrigin(
+  toolName: string,
+  sourceInfo: unknown,
+  selfExtensionPath: string,
+): SafeToolOrigin {
+  if (!isRecord(sourceInfo)) return "unknown";
+  if (sourceInfo.source === "builtin") {
+    return PI_NATIVE_TOOL_NAMES.has(toolName) ? "pi_native" : "unknown";
+  }
+  if (typeof sourceInfo.path !== "string") return "unknown";
+  if (!sameExtensionPath(sourceInfo.path, selfExtensionPath)) return "unknown";
+  return SYSTEM_TOOL_NAMES.has(toolName) ? "plugin" : "unknown";
+}
+
+/**
+ * 构建工具事件发生时使用的实时来源解析器。每次解析都查询当前注册表，
+ * 因此晚于本扩展加载的覆盖与动态注册都能被正确识别；宿主查询失败时
+ * 全部工具保守兜底为 unknown。
+ */
+export function createToolOriginResolver(
+  api: { readonly getAllTools: () => unknown },
+  selfExtensionPath: string,
+): (toolName: string) => SafeToolOrigin {
+  return (toolName: string): SafeToolOrigin => {
+    let tools: unknown;
+    try {
+      tools = api.getAllTools();
+    } catch {
+      return "unknown";
+    }
+    if (!Array.isArray(tools)) return "unknown";
+    const registered = tools.find((tool) => isRecord(tool) && tool.name === toolName);
+    if (registered === undefined) return "unknown";
+    return classifyRegisteredToolOrigin(toolName, registered.sourceInfo, selfExtensionPath);
+  };
+}
+
+function sameExtensionPath(left: string, right: string): boolean {
+  const normalize = (value: string): string => {
+    const resolved = resolvePath(value).replace(/\\/g, "/");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
 function childCapabilityManifest(
   api: RuntimeExtensionApi,
   context: RuntimeContextView,
@@ -700,22 +753,32 @@ function readDirectChildDisplayName(
   }
 }
 
-function readOwnActivityEvent(event: unknown): SafeAgentActivityEvent | undefined {
+function readOwnActivityEvent(
+  event: unknown,
+  resolveToolOrigin: (toolName: string) => SafeToolOrigin,
+): SafeAgentActivityEvent | undefined {
+  // 工具事实走产生端专用规范化：来源身份随输入传递，原始参数与结果在此
+  // 处丢弃，永不跨进程；message 事实仍复用桥接事件闭集。
+  if (
+    isRecord(event)
+    && (event.type === "tool_execution_start" || event.type === "tool_execution_end")
+  ) {
+    const origin = resolveToolOrigin(typeof event.toolName === "string" ? event.toolName : "");
+    const normalized = normalizeOwnToolActivityEvent(event, origin);
+    return normalized.kind === "event" ? normalized.event : undefined;
+  }
   const normalized = normalizeRpcBridgeEvent(event);
   if (normalized.kind !== "event") return undefined;
-  switch (normalized.event.type) {
-    case "message":
-    case "tool_execution_start":
-    case "tool_execution_end":
-      return normalized.event;
-    default:
-      return undefined;
-  }
+  return normalized.event.type === "message" ? normalized.event : undefined;
 }
 
-function observeOwnActivity(current: ActiveRuntime | undefined, event: unknown): void {
+function observeOwnActivity(
+  current: ActiveRuntime | undefined,
+  event: unknown,
+  resolveToolOrigin: (toolName: string) => SafeToolOrigin,
+): void {
   if (current === undefined || !current.isChild || current.handoffPending === true) return;
-  const activity = readOwnActivityEvent(event);
+  const activity = readOwnActivityEvent(event, resolveToolOrigin);
   if (activity !== undefined) current.controller.recordOwnActivity(activity);
 }
 
@@ -725,6 +788,11 @@ export function createWjPiSubagentsRuntimeActivator(
   const reloadLeaseTimeoutMs = validateRuntimeReloadLeaseTimeout(options.reloadLeaseTimeoutMs);
   return async (extensionApi, capabilities) => {
     const api = asRuntimeApi(extensionApi);
+    // 工具事件发生时实时查询注册表：晚加载扩展的同名覆盖也能被正确识别。
+    const resolveToolOrigin = createToolOriginResolver(
+      api,
+      options.selfExtensionPath ?? defaultSelfExtensionPath(),
+    );
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
@@ -884,17 +952,17 @@ export function createWjPiSubagentsRuntimeActivator(
     api.on("message_end", (event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      observeOwnActivity(current, event);
+      observeOwnActivity(current, event, resolveToolOrigin);
       current.replyCoordinator?.observeAssistantMessageEnd(event);
       refreshContextUsage(current, rawContext);
     });
 
     api.on("tool_execution_start", (event) => {
-      observeOwnActivity(active, event);
+      observeOwnActivity(active, event, resolveToolOrigin);
     });
 
     api.on("tool_execution_end", (event) => {
-      observeOwnActivity(active, event);
+      observeOwnActivity(active, event, resolveToolOrigin);
     });
 
     api.on("agent_end", (_event, rawContext) => {

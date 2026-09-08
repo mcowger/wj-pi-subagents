@@ -1101,12 +1101,13 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
     || value.toolName.length > 256
   ) return false;
   const allowed = value.type === "tool_execution_start"
-    ? ["type", "toolCallId", "toolName", "args"]
-    : ["type", "toolCallId", "toolName", "result", "isError"];
+    ? ["type", "toolCallId", "toolName", "origin"]
+    : ["type", "toolCallId", "toolName", "origin", "isError"];
   if (!Object.keys(value).every((key) => allowed.includes(key))) return false;
-  if (value.args !== undefined && !isBoundedActivityText(value.args)) return false;
-  if (value.result !== undefined && !isBoundedActivityText(value.result)) return false;
-  return value.isError === undefined || typeof value.isError === "boolean";
+  return value.type === "tool_execution_start"
+    ? value.origin === "pi_native" || value.origin === "plugin" || value.origin === "unknown"
+    : (value.origin === "pi_native" || value.origin === "plugin" || value.origin === "unknown")
+      && typeof value.isError === "boolean";
 }
 
 /**
@@ -1115,16 +1116,6 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
  */
 function isActivityTextShape(value: unknown): value is string {
   return typeof value === "string";
-}
-
-/**
- * 工具参数/结果按转义前 UTF-8 上限粗校验：转义后只会更长，因此防线放行
- * 的字符串未必满足转义后预算（由下游精确保留裁决），但被防线拒绝的字符
- * 串必然超限。空字符串无害，允许通过。
- */
-function isBoundedActivityText(value: unknown): value is string {
-  return typeof value === "string"
-    && new TextEncoder().encode(value).byteLength <= ACTIVITY_MAX_TEXT_BYTES;
 }
 
 function decodeBase64Bytes(value: string): Uint8Array | undefined {

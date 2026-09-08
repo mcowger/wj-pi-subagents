@@ -8,7 +8,7 @@ import { isCanonicalUuid } from "./tree-controller.ts";
  * 规范活动条目契约版本。版本字符串随原子正文或身份语义的不兼容变化递增；
  * 旧版本条目不得与当前运行实例混用，接收端按协议故障处理。
  */
-export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/1";
+export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/2";
 
 /** 规范活动条目的原子正文闭集：assistant 消息与工具活动状态事实。 */
 export type CanonicalActivityBody = SafeAgentActivityEvent;

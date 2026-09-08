@@ -295,7 +295,7 @@ test("桥接闭集加宽：assistant 正文规范化为携带 text 与 thinking 
   });
 });
 
-test("消息活动正文聚合不设字节上限，工具正文预算保持不变", () => {
+test("消息活动正文聚合不设字节上限", () => {
   // assistant 正文任意长，全部合法（传输分块由监督通道承担）。
   const large = normalizeRpcBridgeEvent({
     type: "message_end",
@@ -305,14 +305,6 @@ test("消息活动正文聚合不设字节上限，工具正文预算保持不�
     },
   });
   assert.equal(large.kind, "event");
-
-  // 工具参数/结果仍按单帧预算拒绝。
-  assert.equal(normalizeRpcBridgeEvent({
-    type: "tool_execution_start",
-    toolCallId: "call_1",
-    toolName: "read",
-    args: { path: "a".repeat(ACTIVITY_MAX_TEXT_BYTES) },
-  }).kind, "rejected");
 });
 
 test("消息活动事件仍拒绝结构违约与非字符串正文", () => {
@@ -365,16 +357,10 @@ test("活动事件闭集校验器拒绝空正文，与桥接端‘空块跳过�
     type: "message",
     content: [{ type: "text", text: "" }],
   }).kind, "invalid");
-  // 空字符串 args/result 不属于违约：空参数与空结果无害。
-  assert.equal(parseAgentActivityEvent({
-    type: "tool_execution_end",
-    toolCallId: "call_1",
-    toolName: "read",
-    result: "",
-  }).kind, "event");
 });
 
-test("桥接闭集加宽：工具执行事件携带参数与结果 JSON 摘要", () => {
+test("桥接副本工具事件不再携带参数与结果，来源身份标记为未知", () => {
+  // 桥接 RPC 副本只服务活动阶段跟踪；参数与结果正文在产生端被丢弃。
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "tool_execution_start",
     toolCallId: "call_1",
@@ -386,7 +372,7 @@ test("桥接闭集加宽：工具执行事件携带参数与结果 JSON 摘要",
       type: "tool_execution_start",
       toolCallId: "call_1",
       toolName: "read",
-      args: '{"path":"a.ts","limit":10}',
+      origin: "unknown",
     },
   });
   assert.deepEqual(normalizeRpcBridgeEvent({
@@ -401,52 +387,42 @@ test("桥接闭集加宽：工具执行事件携带参数与结果 JSON 摘要",
       type: "tool_execution_end",
       toolCallId: "call_1",
       toolName: "read",
-      result: '{"lines":["a","b"],"truncated":false}',
+      origin: "unknown",
       isError: false,
-    },
-  });
-  // 缺省字段保持缺省，旧事件形状不变。
-  assert.deepEqual(normalizeRpcBridgeEvent({
-    type: "tool_execution_end",
-    toolCallId: "call_2",
-    toolName: "edit",
-  }), {
-    kind: "event",
-    event: {
-      type: "tool_execution_end",
-      toolCallId: "call_2",
-      toolName: "edit",
     },
   });
 });
 
-test("工具参数或结果超过活动预算拒绝该事件，不可序列化参数按结构违约拒绝", () => {
-  const oversized = { text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES) };
-  assert.deepEqual(normalizeRpcBridgeEvent({
-    type: "tool_execution_start",
-    toolCallId: "call_1",
-    toolName: "write",
-    args: oversized,
-  }), { kind: "rejected", reason: "reply_too_large" });
+test("桥接工具结束事件缺少 isError 布尔事实时按结构违约拒绝", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "tool_execution_end",
-    toolCallId: "call_1",
-    toolName: "bash",
-    result: { output: "y".repeat(ACTIVITY_MAX_TEXT_BYTES) },
-    isError: true,
-  }), { kind: "rejected", reason: "reply_too_large" });
-  assert.deepEqual(normalizeRpcBridgeEvent({
-    type: "tool_execution_start",
-    toolCallId: "call_1",
-    toolName: "write",
-    args: BigInt(1),
+    toolCallId: "call_2",
+    toolName: "edit",
   }), { kind: "invalid" });
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "tool_execution_end",
-    toolCallId: "call_1",
-    toolName: "bash",
+    toolCallId: "call_2",
+    toolName: "edit",
     isError: "false",
   }), { kind: "invalid" });
+});
+
+test("工具事件携带旧参数或结果字段时闭集校验器按违约拒绝，不再存在预算路径", () => {
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "write",
+    origin: "unknown",
+    args: { path: "a.ts" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "bash",
+    origin: "unknown",
+    isError: true,
+    result: { output: "stdout" },
+  }).kind, "invalid");
 });
 
 test("活动事件闭集校验器接受合法事件并拒绝违约、未知与超限", () => {
@@ -470,16 +446,74 @@ test("活动事件闭集校验器接受合法事件并拒绝违约、未知与�
     type: "tool_execution_start",
     toolCallId: "call_1",
     toolName: "read",
-    args: '{"path":"a.ts"}',
+    origin: "pi_native",
   }), {
     kind: "event",
     event: {
       type: "tool_execution_start",
       toolCallId: "call_1",
       toolName: "read",
-      args: '{"path":"a.ts"}',
+      origin: "pi_native",
     },
   });
+  assert.deepEqual(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "unknown",
+    isError: true,
+  }), {
+    kind: "event",
+    event: {
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "read",
+      origin: "unknown",
+      isError: true,
+    },
+  });
+  // 旧契约的原始参数/结果字段不再属于闭集：出现即违约。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "pi_native",
+    args: '{"path":"a.ts"}',
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "unknown",
+    isError: false,
+    result: '"ok"',
+  }).kind, "invalid");
+  // 来源身份是必填闭集字段。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "extension",
+  }).kind, "invalid");
+  // 结束事实自包含状态：isError 缺失或非布尔属于违约。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "unknown",
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "unknown",
+    isError: "false",
+  }).kind, "invalid");
   assert.equal(parseAgentActivityEvent({ type: "agent_start" }).kind, "invalid");
   assert.equal(parseAgentActivityEvent({
     type: "message",
@@ -496,13 +530,4 @@ test("活动事件闭集校验器接受合法事件并拒绝违约、未知与�
     content: [{ type: "text", text: "z".repeat(ACTIVITY_MAX_TEXT_BYTES + 1) }],
   });
   assert.equal(oversized.kind, "event");
-  assert.equal(
-    parseAgentActivityEvent({
-      type: "tool_execution_start",
-      toolCallId: "call_1",
-      toolName: "read",
-      args: JSON.stringify({ path: "a".repeat(ACTIVITY_MAX_TEXT_BYTES) }),
-    }).kind,
-    "rejected",
-  );
 });

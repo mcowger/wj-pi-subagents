@@ -113,13 +113,13 @@ test("真实桥接进程把加宽的活动事件闭集传给父端，大正文�
         type: "tool_execution_start",
         toolCallId: "call_1",
         toolName: "read",
-        args: '{"path":"src/a.ts"}',
+        origin: "unknown",
       },
       {
         type: "tool_execution_end",
         toolCallId: "call_1",
         toolName: "read",
-        result: '{"lines":["const a = 1;"],"truncated":false}',
+        origin: "unknown",
         isError: false,
       },
       // 空 text 块被跳过，非空 thinking 块保留。

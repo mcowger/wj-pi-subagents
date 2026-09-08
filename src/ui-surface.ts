@@ -4,7 +4,7 @@ const EXTENDED_PICTOGRAPHIC_PATTERN = /\p{Extended_Pictographic}/u;
 const REGIONAL_INDICATOR_PATTERN = /\p{Regional_Indicator}/u;
 const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/gu;
 
-export type UiPanelLineStyle = "header" | "body" | "terminal" | "error" | "footer";
+export type UiPanelLineStyle = "header" | "body" | "terminal" | "error" | "footer" | "accent" | "warning";
 
 interface UiPanelTheme {
   fg?(color: string, text: string): string;
@@ -90,6 +90,10 @@ export function stylePanelText(value: string, style: UiPanelLineStyle, theme: un
       return themeFg(theme, "customMessageText", value);
     case "error":
       return themeFg(theme, "error", value);
+    case "accent":
+      return themeFg(theme, "accent", value);
+    case "warning":
+      return themeFg(theme, "warning", value);
     case "footer":
     case "terminal":
       return themeFg(theme, "dim", value);

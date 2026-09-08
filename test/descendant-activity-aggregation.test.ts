@@ -193,13 +193,13 @@ test("子模式扩展把本进程完整活动规范化上行且不在本层缓�
       type: "tool_execution_start",
       toolCallId: "call_1",
       toolName: "read",
-      args: '{"path":"src/a.ts"}',
+      origin: "unknown",
     });
     assert.deepEqual(delivered[2]?.entry.body, {
       type: "tool_execution_end",
       toolCallId: "call_1",
       toolName: "read",
-      result: '{"lines":["const a = 1;"]}',
+      origin: "unknown",
       isError: false,
     });
     // 中间运行时不保存历史：本层回放为空。

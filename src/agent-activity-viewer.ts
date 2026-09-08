@@ -5,6 +5,7 @@ import {
   parseAgentActivityDisplayEvent,
   type SafeAgentActivityContentBlock,
   type SafeAgentActivityDisplayEvent,
+  type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
@@ -21,11 +22,6 @@ export { displayWidth } from "./ui-surface.ts";
 
 const DEFAULT_VIEWER_VIEWPORT_HEIGHT = 20;
 const DEFAULT_LAYOUT_WIDTH = 80;
-const DEFAULT_TOOL_RESULT_COLLAPSE_LINES = 4;
-const DEFAULT_TOOL_RESULT_COLLAPSE_CHARS = 240;
-const MAX_TOOL_SUMMARY_KEYS = 3;
-const MAX_TOOL_SUMMARY_VALUE_CHARS = 96;
-const MAX_TOOL_SUMMARY_WIDTH = 160;
 const THINKING_COLLAPSED_TEXT = "Thinking";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
@@ -34,7 +30,6 @@ const RENDER_VIEWER_LINES = Symbol("renderViewerLines");
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const ANSI_ESCAPE_PATTERN = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~]|[()][0-2])/gu;
 const UNSAFE_CONTROL_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
-const SUMMARY_OMIT_KEYS = /^(?:content|contents|body|text|data|payload|patch|stdout|stderr)$/iu;
 
 const PLAIN_MARKDOWN_THEME: MarkdownTheme = Object.freeze({
   heading: identity,
@@ -63,10 +58,6 @@ export interface AgentActivityViewerAgent {
 export interface AgentActivityViewerOptions {
   /** 同时显示的活动正文行数，不包含标题和键位提示。 */
   readonly viewport_height?: number;
-  /** 结果超过该行数后默认折叠。 */
-  readonly tool_result_collapse_lines?: number;
-  /** 结果超过该显示字符数后默认折叠。 */
-  readonly tool_result_collapse_chars?: number;
 }
 
 export type AgentActivityViewerInputOutcome = "changed" | "ignored" | "close";
@@ -84,21 +75,51 @@ export interface AgentActivityViewerPublicState {
 interface ViewerSemanticLine {
   readonly text: string;
   readonly style: UiPanelLineStyle;
-  /** 可展开条目身份：thinking 组或长工具结果；选中背景只作用于该行。 */
+  /** 可展开条目身份：thinking 组；选中背景只作用于该行。 */
   readonly selectable_key?: string;
   /** 该行是否为当前选中条目；仅渲染层消费。 */
   readonly selected?: boolean;
 }
 
+/**
+ * 工具活动的运行状态。完成态不可退回运行中；unavailable/terminated 是生命
+ * 周期收束语义，仍可被身份匹配的结束事实回填为真实结果。
+ */
+type ToolRunState =
+  | { readonly phase: "running" }
+  | { readonly phase: "success" }
+  | { readonly phase: "failure" }
+  | { readonly phase: "unavailable" }
+  | { readonly phase: "terminated" };
+
 interface ToolDisplayEntry {
   readonly kind: "tool";
   readonly toolCallId: string;
   toolName: string;
-  args: string | undefined;
-  result: string | undefined;
-  isError: boolean;
-  hasResult: boolean;
+  origin: SafeToolOrigin;
+  state: ToolRunState;
 }
+
+/**
+ * 安全兜底视觉规则：运行中强调色；成功与中性弱化；警告色；失败整行错误色。
+ * 行首结构预留“状态图标、折叠标记、摘要”的稳定位置；兜底条目没有可展开
+ * 正文，折叠标记恒为空，后续专用规则的附属正文将共用整行背景顶格显示。
+ */
+const TOOL_STATE_VISUALS: Readonly<Record<ToolRunState["phase"], {
+  readonly icon: string;
+  readonly style: UiPanelLineStyle;
+  readonly suffix?: string;
+}>> = Object.freeze({
+  running: Object.freeze({ icon: "▶", style: "accent" as const }),
+  success: Object.freeze({ icon: "✓", style: "terminal" as const }),
+  failure: Object.freeze({ icon: "×", style: "error" as const }),
+  unavailable: Object.freeze({ icon: "⚠", style: "warning" as const, suffix: "result unavailable" }),
+  terminated: Object.freeze({
+    icon: "○",
+    style: "terminal" as const,
+    suffix: "terminated before result",
+  }),
+});
 
 interface LiveMessageBlock {
   readonly contentType: "text" | "thinking";
@@ -111,8 +132,8 @@ interface LiveMessageEntry {
 }
 
 /**
- * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；长工具
- * 结果使用工具调用身份；实时草稿使用 live 前缀。身份跨重绘稳定。
+ * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；实时草稿
+ * 使用 live 前缀。身份跨重绘稳定。
  */
 function thinkingKey(entryId: string, blockIndex: number): string {
   return `thinking:${entryId}:${blockIndex}`;
@@ -120,10 +141,6 @@ function thinkingKey(entryId: string, blockIndex: number): string {
 
 function liveThinkingKey(streamId: string, contentIndex: number): string {
   return `thinking:live:${streamId}:${contentIndex}`;
-}
-
-function toolResultKey(toolCallId: string): string {
-  return `tool:${toolCallId}`;
 }
 
 /**
@@ -141,8 +158,6 @@ export class AgentActivityViewerModel {
   /** 从 bridge 短暂转发的 token 增量；不进入回放、事件数或父端缓存。 */
   private readonly liveMessages = new Map<string, LiveMessageEntry>();
   private readonly viewportHeight: number;
-  private readonly collapseLines: number;
-  private readonly collapseChars: number;
   private readonly expandedKeys = new Set<string>();
   private selectedKey: string | undefined;
   private replayCursor = 0;
@@ -167,14 +182,6 @@ export class AgentActivityViewerModel {
     this.name = agent.name;
     this.lifecycleState = agent.state;
     this.viewportHeight = validViewportHeight(options.viewport_height);
-    this.collapseLines = validPositiveOption(
-      options.tool_result_collapse_lines,
-      DEFAULT_TOOL_RESULT_COLLAPSE_LINES,
-    );
-    this.collapseChars = validPositiveOption(
-      options.tool_result_collapse_chars,
-      DEFAULT_TOOL_RESULT_COLLAPSE_CHARS,
-    );
     this.syncFrom(replay);
     this.initializeSelection();
   }
@@ -466,9 +473,7 @@ export class AgentActivityViewerModel {
 
   private isExpandableKey(key: string): boolean {
     if (typeof key !== "string" || key.length === 0) return false;
-    if (key.startsWith("thinking:")) return true;
-    if (key.startsWith("tool:")) return this.hasExpandableToolResult(key.slice("tool:".length));
-    return false;
+    return key.startsWith("thinking:");
   }
 
   private replayPrefixMatches(replay: readonly CanonicalAgentActivityEntry[]): boolean {
@@ -481,25 +486,14 @@ export class AgentActivityViewerModel {
     return true;
   }
 
-  private hasExpandableToolResult(toolCallId: string): boolean {
-    if (typeof toolCallId !== "string" || toolCallId.length === 0) return false;
-    return this.projectEntries().some((entry) =>
-      entry.kind === "tool"
-      && entry.toolCallId === toolCallId
-      && entry.hasResult
-      && this.isLongResult(decodeToolResult(entry.result))
-    );
-  }
-
-  private isLongResult(result: string): boolean {
-    const safe = sanitizeViewerMarkup(result);
-    return safe.split("\n").length > this.collapseLines || displayWidth(safe) > this.collapseChars;
-  }
-
-  /** 将规范条目投影成消息与工具行，保留每条 message 的权威边界。 */
+  /**
+   * 将规范条目重放为显示条目。工具开始/结束按稳定调用身份合并为同一原子
+   * 条目：结束先到或开始缺失时自建完成条目；重复与迟到事实幂等；完成态
+   * 不可退回运行中。重放后仍运行中的工具按当前生命周期收束。
+   */
   private projectEntries(): DisplayEntry[] {
     const entries: DisplayEntry[] = [];
-    const activeTools = new Map<string, ToolDisplayEntry>();
+    const toolIndex = new Map<string, ToolDisplayEntry>();
 
     for (const entry of this.entries) {
       const body = entry.body;
@@ -509,38 +503,48 @@ export class AgentActivityViewerModel {
       }
 
       if (body.type === "tool_execution_start") {
+        // 重复开始与完成后迟到开始都幂等忽略；完成态不退回运行中。
+        if (toolIndex.has(body.toolCallId)) continue;
         const tool: ToolDisplayEntry = {
           kind: "tool",
           toolCallId: body.toolCallId,
           toolName: body.toolName,
-          args: body.args,
-          result: undefined,
-          isError: false,
-          hasResult: false,
+          origin: body.origin,
+          state: { phase: "running" },
         };
         entries.push(tool);
-        activeTools.set(body.toolCallId, tool);
+        toolIndex.set(body.toolCallId, tool);
         continue;
       }
 
-      const existing = activeTools.get(body.toolCallId);
+      // 结束事实自包含状态：开始缺失时仍建立完成条目。
+      const existing = toolIndex.get(body.toolCallId);
+      const state: ToolRunState = body.isError ? { phase: "failure" } : { phase: "success" };
       if (existing === undefined) {
         const tool: ToolDisplayEntry = {
           kind: "tool",
           toolCallId: body.toolCallId,
           toolName: body.toolName,
-          args: undefined,
-          result: body.result,
-          isError: body.isError === true,
-          hasResult: true,
+          origin: body.origin,
+          state,
         };
         entries.push(tool);
-        activeTools.set(body.toolCallId, tool);
-      } else {
-        existing.toolName = body.toolName;
-        existing.result = body.result;
-        existing.isError = body.isError === true;
-        existing.hasResult = true;
+        toolIndex.set(body.toolCallId, tool);
+        continue;
+      }
+      // 匹配结束原地更新（幂等或回填），绝不退回运行中。
+      existing.toolName = body.toolName;
+      existing.origin = body.origin;
+      existing.state = state;
+    }
+
+    if (toolIndex.size > 0) {
+      for (const tool of toolIndex.values()) {
+        if (tool.state.phase !== "running") continue;
+        // 代理进入终态时收束仍运行中的工具；后续匹配结束事实可回填。
+        if (this.lifecycleState === "idle") tool.state = { phase: "unavailable" };
+        else if (this.lifecycleState === "failed") tool.state = { phase: "failure" };
+        else if (this.lifecycleState === "terminated") tool.state = { phase: "terminated" };
       }
     }
     for (const [streamId, live] of this.liveMessages) {
@@ -608,32 +612,17 @@ export class AgentActivityViewerModel {
         continue;
       }
 
-      const args = summarizeToolArguments(entry.args);
+      const visual = TOOL_STATE_VISUALS[entry.state.phase];
+      const summary = safeUiFact(entry.toolName);
+      // 行首顺序固定为状态图标、折叠标记、摘要；兜底条目不可展开，折叠
+      // 标记恒为空，位置保持稳定。
+      const marker = "";
       lines.push(Object.freeze({
-        text: `▶ ${safeUiFact(entry.toolName)}${args.length === 0 ? "" : ` · ${args}`}`,
-        style: "body" as const,
+        text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${summary}${
+          visual.suffix === undefined ? "" : ` · ${visual.suffix}`
+        }`,
+        style: visual.style,
       }));
-      if (!entry.hasResult) continue;
-
-      const result = decodeToolResult(entry.result);
-      const long = this.isLongResult(result);
-      const key = toolResultKey(entry.toolCallId);
-      if (long && !this.expandedKeys.has(key)) {
-        const count = result.split("\n").length;
-        lines.push(Object.freeze({
-          text: `${entry.isError ? "×" : "✓"} ${safeUiFact(entry.toolName)} · result collapsed (${count} lines; Enter to expand)`,
-          style: entry.isError ? "error" : "footer",
-          selectable_key: key,
-        }));
-        continue;
-      }
-
-      lines.push(...renderToolResult(
-        entry,
-        result,
-        contentWidth,
-        long ? key : undefined,
-      ));
     }
 
     const frozen = Object.freeze(lines.map((line) => Object.freeze(line)));
@@ -755,90 +744,6 @@ function renderThinkingBlock(
   return Object.freeze([title, ...body]);
 }
 
-function renderToolResult(
-  entry: ToolDisplayEntry,
-  result: string,
-  width: number,
-  selectableKey?: string,
-): readonly ViewerSemanticLine[] {
-  const marker = entry.isError ? "×" : "✓";
-  const style: UiPanelLineStyle = entry.isError ? "error" : "terminal";
-  if (result.length === 0) {
-    return Object.freeze([Object.freeze({
-      text: `${marker} ${safeUiFact(entry.toolName)}`,
-      style,
-      ...(selectableKey === undefined ? {} : { selectable_key: selectableKey }),
-    })]);
-  }
-  const wrapped = result
-    .split("\n")
-    .flatMap((line) => wrapPlainLine(line, Math.max(1, width - 2)));
-  const first = wrapped[0] ?? "";
-  const lines: ViewerSemanticLine[] = [Object.freeze({
-    text: `${marker} ${safeUiFact(entry.toolName)}${first.length === 0 ? "" : ` · ${first}`}`,
-    style,
-    ...(selectableKey === undefined ? {} : { selectable_key: selectableKey }),
-  })];
-  for (const line of wrapped.slice(1)) lines.push(Object.freeze({ text: `  ${line}`, style }));
-  return Object.freeze(lines);
-}
-
-function summarizeToolArguments(raw: string | undefined): string {
-  if (raw === undefined) return "";
-  const safe = sanitizeViewerMarkup(raw);
-  if (safe.length === 0) return "";
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(safe);
-  } catch {
-    return truncateToDisplayWidth(safeUiFact(safe), MAX_TOOL_SUMMARY_WIDTH);
-  }
-  if (!isRecord(parsed)) return truncateToDisplayWidth(formatSummaryValue(parsed) ?? safeUiFact(safe), MAX_TOOL_SUMMARY_WIDTH);
-
-  const entries = Object.entries(parsed);
-  const shown: string[] = [];
-  let omitted = 0;
-  const ordered = [...entries].sort(([left], [right]) => summaryKeyRank(left) - summaryKeyRank(right));
-  for (const [key, value] of ordered) {
-    const formatted = formatSummaryValue(value);
-    if (formatted === undefined || (SUMMARY_OMIT_KEYS.test(key) && isVerboseSummaryValue(value))) {
-      omitted += 1;
-      continue;
-    }
-    shown.push(`${safeUiFact(key)}=${formatted}`);
-    if (shown.length >= MAX_TOOL_SUMMARY_KEYS) break;
-  }
-  omitted += Math.max(0, ordered.length - shown.length - omitted);
-  if (shown.length === 0) return entries.length === 0 ? "{}" : `{${entries.length} keys}`;
-  if (omitted > 0) shown.push(`+${omitted} more`);
-  return truncateToDisplayWidth(shown.join(" · "), MAX_TOOL_SUMMARY_WIDTH);
-}
-
-function formatSummaryValue(value: unknown): string | undefined {
-  if (typeof value === "string") {
-    const safe = safeUiFact(sanitizeViewerMarkup(value));
-    if (safe.length > MAX_TOOL_SUMMARY_VALUE_CHARS) return undefined;
-    return safe.includes(" ") ? JSON.stringify(safe) : safe;
-  }
-  if (value === null) return "null";
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (Array.isArray(value)) return `[${value.length} items]`;
-  if (isRecord(value)) return `{${Object.keys(value).length} keys}`;
-  return undefined;
-}
-
-function isVerboseSummaryValue(value: unknown): boolean {
-  return typeof value === "string" && value.length > 24;
-}
-
-function summaryKeyRank(key: string): number {
-  const rank = [
-    "path", "file_path", "command", "cmd", "query", "pattern", "url", "agent_id",
-    "agent_ids", "template_id", "name", "cwd", "recursive",
-  ].indexOf(key);
-  return rank < 0 ? 100 : rank;
-}
-
 function isLiveMessageWithinBudget(entry: LiveMessageEntry): boolean {
   let bytes = 0;
   let blocks = 0;
@@ -848,19 +753,6 @@ function isLiveMessageWithinBudget(entry: LiveMessageEntry): boolean {
     if (bytes > ACTIVITY_MAX_TEXT_BYTES) return false;
   }
   return true;
-}
-
-function decodeToolResult(raw: string | undefined): string {
-  if (raw === undefined) return "";
-  try {
-    const decoded: unknown = JSON.parse(raw);
-    if (typeof decoded === "string") return sanitizeViewerMarkup(decoded);
-    const formatted = JSON.stringify(decoded);
-    return sanitizeViewerMarkup(formatted ?? "");
-  } catch {
-    // 测试替身和旧缓存可能保存原始文本，保留其可读回退。
-    return sanitizeViewerMarkup(raw);
-  }
 }
 
 function wrapPlainText(value: string, width: number): readonly string[] {
@@ -931,10 +823,6 @@ function validViewportHeight(value: number | undefined): number {
 
 function validRenderWidth(value: number): number {
   return Number.isSafeInteger(value) && value > 0 ? value : 1;
-}
-
-function validPositiveOption(value: number | undefined, fallback: number): number {
-  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : fallback;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {
