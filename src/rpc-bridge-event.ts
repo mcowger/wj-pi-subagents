@@ -320,6 +320,11 @@ export type SafeAgentActivityEvent =
   | {
       readonly type: "message";
       readonly content: readonly SafeAgentActivityContentBlock[];
+      /**
+       * 与实时显示流的精确关联身份；由同一运行实例的扩展在产生端携带。
+       * 缺省表示该消息没有可关联的实时流（例如启动前已存在的消息）。
+       */
+      readonly streamId?: string;
     }
   | {
       /** 接收侧实际接纳的父代理输入；未接纳输入不产生该事件。 */
@@ -349,10 +354,11 @@ export type SafeAgentActivityEvent =
     };
 
 /**
- * 仅供已打开查看器使用的短暂 assistant 增量；它绝不进入活动缓存。
- * sequence 在每个 streamId 内严格递增，接收端据此拒绝乱序或重复帧。
+ * 产生端（子代理运行时扩展）生成的短暂 assistant 增量：还不携带代理身份。
+ * sequence 在每个 streamId 内严格递增；它只在控制器登记身份后成为可跨进程
+ * 转发的 SafeAgentActivityDisplayEvent。
  */
-export type SafeAgentActivityDisplayEvent =
+export type AgentDisplayStreamUpdate =
   | {
       readonly type: "message_delta";
       readonly streamId: string;
@@ -366,6 +372,23 @@ export type SafeAgentActivityDisplayEvent =
       readonly streamId: string;
       readonly sequence: number;
     };
+
+export type AgentDisplayStreamUpdateNormalization =
+  | { readonly kind: "event"; readonly event: AgentDisplayStreamUpdate }
+  | { readonly kind: "ignored" }
+  | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
+  | { readonly kind: "invalid" };
+
+/**
+ * 仅供已打开查看器使用的短暂 assistant 增量；它绝不进入活动缓存。
+ * 实时流身份至少包含 agentId、incarnationId 与 streamId，且 delta 与
+ * complete 携带同一身份；sequence 在每个 streamId 内严格递增。不同代理、
+ * 重启实例或复用 stream ID 不会关联到同一草稿。
+ */
+export type SafeAgentActivityDisplayEvent = AgentDisplayStreamUpdate & {
+  readonly agentId: string;
+  readonly incarnationId: string;
+};
 
 export type AgentActivityDisplayEventNormalization =
   | { readonly kind: "event"; readonly event: SafeAgentActivityDisplayEvent }
@@ -418,9 +441,14 @@ export type AssistantMessageEndNormalization = RpcBridgeEventNormalization;
 const IGNORED_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "ignored" });
 const INVALID_EVENT: RpcBridgeEventNormalization = Object.freeze({ kind: "invalid" });
 const INVALID_ACTIVITY_EVENT: AgentActivityEventNormalization = Object.freeze({ kind: "invalid" });
-const INVALID_ACTIVITY_DISPLAY_EVENT: AgentActivityDisplayEventNormalization = Object.freeze({ kind: "invalid" });
-const IGNORED_ACTIVITY_DISPLAY_EVENT: AgentActivityDisplayEventNormalization = Object.freeze({ kind: "ignored" });
-const ACTIVITY_DISPLAY_REJECTED: AgentActivityDisplayEventNormalization = Object.freeze({
+/** 显示事件的非事件归一结果在产生端与身份校验两端结构一致，共用同一常量。 */
+type AgentDisplayStreamRejection =
+  | { readonly kind: "ignored" }
+  | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
+  | { readonly kind: "invalid" };
+const INVALID_ACTIVITY_DISPLAY_EVENT: AgentDisplayStreamRejection = Object.freeze({ kind: "invalid" });
+const IGNORED_ACTIVITY_DISPLAY_EVENT: AgentDisplayStreamRejection = Object.freeze({ kind: "ignored" });
+const ACTIVITY_DISPLAY_REJECTED: AgentDisplayStreamRejection = Object.freeze({
   kind: "rejected",
   reason: "reply_too_large",
 });
@@ -560,10 +588,23 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
     case "parent_message": {
       const content = normalizeActivityContent(value.content);
       if (content === undefined || content.length === 0) return INVALID_ACTIVITY_EVENT;
-      return Object.freeze({
-        kind: "event",
-        event: Object.freeze({ type: value.type, content }),
-      });
+      // streamId 是 assistant 消息与实时显示流的精确关联身份；只有 message
+      // 事件可携带，必须是产生端约定内的有界文本。
+      let messageStreamId: string | undefined;
+      if (value.type === "message" && value.streamId !== undefined) {
+        if (!validBoundedText(value.streamId, MAX_ACTIVITY_STREAM_ID_BYTES)) {
+          return INVALID_ACTIVITY_EVENT;
+        }
+        messageStreamId = value.streamId;
+      }
+      const event: SafeAgentActivityEvent = value.type === "message"
+        ? Object.freeze({
+          type: "message",
+          content,
+          ...(messageStreamId === undefined ? {} : { streamId: messageStreamId }),
+        })
+        : Object.freeze({ type: "parent_message", content });
+      return Object.freeze({ kind: "event", event });
     }
     case "tool_execution_start": {
       if (!validBoundedText(value.toolCallId, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
@@ -646,8 +687,9 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
 }
 
 /**
- * 校验 bridge 生成的显示层短暂事件。它与完整活动事件使用相同的正文预算，
- * 但不会被 AgentActivityCache 接收或回放。
+ * 校验携带完整实时流身份的显示层短暂事件。它与完整活动事件使用相同的正文
+ * 预算，但不会被 AgentActivityCache 接收或回放；监督通道 display 帧、控制器
+ * 转发与顶层草稿登记共用同一校验。
  */
 export function parseAgentActivityDisplayEvent(
   value: unknown,
@@ -661,6 +703,11 @@ export function parseAgentActivityDisplayEvent(
   if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= 0) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
   }
+  // 实时流身份：代理与运行实例必须是规范 UUID，delta 与 complete 携带同一
+  // 身份；不同代理、重启实例或复用 stream ID 不会关联到同一草稿。
+  if (!isCanonicalUuid(value.agentId) || !isCanonicalUuid(value.incarnationId)) {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
   if (value.type === "message_complete") {
     return Object.freeze({
       kind: "event",
@@ -668,6 +715,8 @@ export function parseAgentActivityDisplayEvent(
         type: "message_complete" as const,
         streamId,
         sequence,
+        agentId: value.agentId,
+        incarnationId: value.incarnationId,
       }),
     });
   }
@@ -696,19 +745,22 @@ export function parseAgentActivityDisplayEvent(
       contentIndex,
       contentType,
       delta,
+      agentId: value.agentId,
+      incarnationId: value.incarnationId,
     }),
   });
 }
 
 /**
- * 从 Pi JSON/RPC message_update 中只提取文本与 thinking 增量。工具调用增量
- * 由完整 tool_execution_start/end 负责呈现，因此在此显示通道中明确忽略。
+ * 从子代理运行时扩展收到的 message_update 事件中只提取文本与 thinking 增量。
+ * 工具调用增量由完整 tool_execution_start/end 负责呈现，因此在此显示通道中
+ * 明确忽略；返回值不携带代理身份，由控制器登记后跨进程转发。
  */
 export function normalizeAssistantMessageUpdate(
   value: unknown,
   streamId: string,
   sequence: number,
-): AgentActivityDisplayEventNormalization {
+): AgentDisplayStreamUpdateNormalization {
   if (!isRecord(value) || value.type !== "message_update" || !isRecord(value.assistantMessageEvent)) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
   }
@@ -717,16 +769,37 @@ export function normalizeAssistantMessageUpdate(
     return IGNORED_ACTIVITY_DISPLAY_EVENT;
   }
   // Pi 声明 delta 为普通 string；空增量没有可显示内容，不应把合法上游
-  // 心跳/边界事件升级为 bridge 协议故障。
+  // 心跳/边界事件升级为产生端协议故障。
   if (update.delta === "") return IGNORED_ACTIVITY_DISPLAY_EVENT;
-  return parseAgentActivityDisplayEvent({
+  if (typeof update.delta !== "string") return INVALID_ACTIVITY_DISPLAY_EVENT;
+  const contentIndex = update.contentIndex;
+  const delta: string = update.delta;
+  if (
+    typeof contentIndex !== "number"
+    || !Number.isSafeInteger(contentIndex)
+    || contentIndex < 0
+    || contentIndex >= MAX_ACTIVITY_CONTENT_BLOCKS
+  ) return INVALID_ACTIVITY_DISPLAY_EVENT;
+  const event: AgentDisplayStreamUpdate = Object.freeze({
     type: "message_delta",
     streamId,
     sequence,
-    contentIndex: update.contentIndex,
+    contentIndex,
     contentType: update.type === "text_delta" ? "text" : "thinking",
-    delta: update.delta,
+    delta,
   });
+  if (encodedJsonLength(delta) > ACTIVITY_MAX_TEXT_BYTES) {
+    return ACTIVITY_DISPLAY_REJECTED;
+  }
+  return Object.freeze({ kind: "event", event });
+}
+
+/** 由产生端 streamId 与序号构造收束帧；空 delta 一样不占用序号。 */
+export function buildDisplayStreamComplete(
+  streamId: string,
+  sequence: number,
+): AgentDisplayStreamUpdate {
+  return Object.freeze({ type: "message_complete", streamId, sequence });
 }
 
 /**

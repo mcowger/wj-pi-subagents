@@ -1,14 +1,12 @@
 import { Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
 import {
-  ACTIVITY_MAX_TEXT_BYTES,
-  parseAgentActivityDisplayEvent,
   sanitizeSafeActivityText,
   type SafeAgentActivityContentBlock,
-  type SafeAgentActivityDisplayEvent,
   type SafeToolOrigin,
   type SafeToolSummary,
 } from "./rpc-bridge-event.ts";
+import type { AgentDisplayDraftView } from "./agent-display-drafts.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
   displayWidth,
@@ -25,6 +23,12 @@ export { displayWidth } from "./ui-surface.ts";
 const DEFAULT_VIEWER_VIEWPORT_HEIGHT = 20;
 const DEFAULT_LAYOUT_WIDTH = 80;
 const THINKING_COLLAPSED_TEXT = "Thinking";
+/** 流式 thinking 的折叠标题：完整权威消息到达后恢复普通 `Thinking`。 */
+const THINKING_STREAMING_TEXT = "Thinking · streaming";
+/** 冻结流的折叠标题：异常乱序冻结后等待权威完整消息。 */
+const THINKING_FROZEN_TEXT = "Thinking · streaming incomplete";
+/** 冻结草稿末尾的弱化省略号：实时预览不完整的显示事实。 */
+const FROZEN_DRAFT_ELLIPSIS = "…";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
 const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back";
@@ -58,6 +62,8 @@ export interface AgentActivityViewerAgent {
 export interface AgentActivityViewerOptions {
   /** 同时显示的活动正文行数，不包含标题和键位提示。 */
   readonly viewport_height?: number;
+  /** 打开时的初始实时草稿快照；后续通过 setLiveDrafts 持续替换。 */
+  readonly drafts?: readonly AgentDisplayDraftView[];
 }
 
 export type AgentActivityViewerInputOutcome = "changed" | "ignored" | "close";
@@ -163,16 +169,6 @@ function toolDisplayVisual(entry: ToolDisplayEntry): {
   return base;
 }
 
-interface LiveMessageBlock {
-  readonly contentType: "text" | "thinking";
-  value: string;
-}
-
-interface LiveMessageEntry {
-  lastSequence: number;
-  readonly blocks: Map<number, LiveMessageBlock>;
-}
-
 /**
  * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；工具错误
  * 正文与消息正文使用独立前缀；父代理消息与实时草稿使用独立前缀。身份跨
@@ -194,8 +190,8 @@ function parentMessageKey(entryId: string): string {
   return `parent-message:${entryId}`;
 }
 
-function liveThinkingKey(streamId: string, contentIndex: number): string {
-  return `thinking:live:${streamId}:${contentIndex}`;
+function liveThinkingKey(draftKey: string, contentIndex: number): string {
+  return `thinking:live:${draftKey}:${contentIndex}`;
 }
 
 /**
@@ -210,8 +206,11 @@ export class AgentActivityViewerModel {
   private readonly name: string;
   private lifecycleState: AgentLifecycleState;
   private readonly entries: CanonicalAgentActivityEntry[] = [];
-  /** 从 bridge 短暂转发的 token 增量；不进入回放、事件数或父端缓存。 */
-  private readonly liveMessages = new Map<string, LiveMessageEntry>();
+  /**
+   * 顶层草稿登记表的快照：从 sequence 1 开始的连续前缀。它只渲染到显示层，
+   * 不进入回放、事件数或父端缓存；由 setLiveDrafts 整体替换保持单一事实源。
+   */
+  private liveDrafts: readonly AgentDisplayDraftView[] = Object.freeze([]);
   private readonly viewportHeight: number;
   private readonly expandedKeys = new Set<string>();
   private selectedKey: string | undefined;
@@ -243,6 +242,7 @@ export class AgentActivityViewerModel {
     }
     this.viewportHeight = validViewportHeight(options.viewport_height);
     this.syncFrom(replay);
+    this.setLiveDrafts(options.drafts ?? []);
     this.initializeSelection();
   }
 
@@ -299,60 +299,14 @@ export class AgentActivityViewerModel {
   }
 
   /**
-   * 接收仅显示层的有序 token 增量。乱序、重复、超预算或结构违约帧不会进入
-   * 完整活动历史；检测到序号缺口时丢弃该草稿，等待权威条目收束。
+   * 以顶层草稿登记表的最新快照替换本投影的实时草稿。登记表是唯一事实源：
+   * 查看 detail 打开时立即看到当前连续前缀，期间到达的新帧经登记表应用后
+   * 再以快照形式到达这里。草稿增长与普通追加一样服从 follow 规则。
    */
-  applyDisplayEvent(event: SafeAgentActivityDisplayEvent): AgentActivityViewerUpdateOutcome {
-    const parsed = parseAgentActivityDisplayEvent(event);
-    if (parsed.kind !== "event") return "ignored";
-    const update = parsed.event;
-    const existing = this.liveMessages.get(update.streamId);
-    if (update.type === "message_complete") {
-      if (existing === undefined || update.sequence !== existing.lastSequence + 1) return "ignored";
-      this.liveMessages.delete(update.streamId);
-      this.touchProjection();
-      return "changed";
-    }
-    if (existing === undefined) {
-      if (update.sequence !== 1) return "ignored";
-      const entry: LiveMessageEntry = { lastSequence: update.sequence, blocks: new Map() };
-      entry.blocks.set(update.contentIndex, { contentType: update.contentType, value: update.delta });
-      if (!isLiveMessageWithinBudget(entry)) return "ignored";
-      this.liveMessages.set(update.streamId, entry);
-      this.touchProjection();
-      this.settleFollow();
-      return "changed";
-    }
-    if (update.sequence !== existing.lastSequence + 1) {
-      if (update.sequence > existing.lastSequence) {
-        this.liveMessages.delete(update.streamId);
-        this.touchProjection();
-        return "changed";
-      }
-      return "ignored";
-    }
-    const block = existing.blocks.get(update.contentIndex);
-    if (block !== undefined && block.contentType !== update.contentType) {
-      this.liveMessages.delete(update.streamId);
-      this.touchProjection();
-      return "changed";
-    }
-    const previous = block?.value;
-    if (block === undefined) {
-      existing.blocks.set(update.contentIndex, { contentType: update.contentType, value: update.delta });
-    } else {
-      block.value += update.delta;
-    }
-    if (!isLiveMessageWithinBudget(existing)) {
-      if (block === undefined) existing.blocks.delete(update.contentIndex);
-      else block.value = previous ?? "";
-      this.liveMessages.delete(update.streamId);
-      this.touchProjection();
-      return "changed";
-    }
-    existing.lastSequence = update.sequence;
+  setLiveDrafts(drafts: readonly AgentDisplayDraftView[]): AgentActivityViewerUpdateOutcome {
+    this.liveDrafts = Object.freeze([...drafts]);
     this.touchProjection();
-    this.settleFollow();
+    if (!this.batching) this.settleFollow();
     return "changed";
   }
 
@@ -648,16 +602,9 @@ export class AgentActivityViewerModel {
         }
       }
     }
-    for (const [streamId, live] of this.liveMessages) {
-      const content = [...live.blocks.entries()]
-        .sort(([left], [right]) => left - right)
-        .map(([contentIndex, block]) => Object.freeze({
-          key: liveThinkingKey(streamId, contentIndex),
-          block: (block.contentType === "text"
-            ? Object.freeze({ type: "text" as const, text: block.value })
-            : Object.freeze({ type: "thinking" as const, thinking: block.value })),
-        }));
-      if (content.length > 0) entries.push({ kind: "live", content });
+    for (const draft of this.liveDrafts) {
+      if (draft.blocks.length === 0) continue;
+      entries.push({ kind: "live", draft });
     }
     return entries;
   }
@@ -671,7 +618,7 @@ export class AgentActivityViewerModel {
       && this.cachedProjection.revision === this.projectionRevision
     ) return this.cachedProjection.lines;
 
-    if (this.entries.length === 0 && this.liveMessages.size === 0) {
+    if (this.entries.length === 0 && this.liveDrafts.every((draft) => draft.blocks.length === 0)) {
       const empty = Object.freeze([{ text: EMPTY_ACTIVITY_TEXT, style: "body" as const }]);
       this.cachedProjection = { width: contentWidth, revision: this.projectionRevision, lines: empty };
       return empty;
@@ -708,18 +655,7 @@ export class AgentActivityViewerModel {
       }
 
       if (entry.kind === "live") {
-        for (const item of entry.content) {
-          if (item.block.type === "text") {
-            lines.push(...renderMarkdownBlock(item.block.text, contentWidth, "body"));
-          } else {
-            lines.push(...renderThinkingBlock(
-              item.block.thinking,
-              contentWidth,
-              item.key,
-              this.expandedKeys.has(item.key),
-            ));
-          }
-        }
+        renderLiveDraft(entry.draft, contentWidth, this.expandedKeys, lines);
         continue;
       }
 
@@ -801,12 +737,48 @@ type DisplayEntry =
     }
   | {
       readonly kind: "live";
-      readonly content: readonly {
-        readonly key: string;
-        readonly block: SafeAgentActivityContentBlock;
-      }[];
+      readonly draft: AgentDisplayDraftView;
     }
   | ToolDisplayEntry;
+
+/**
+ * 实时草稿渲染：text 块实时按 Markdown 重渲染，不增加流式标签、角色标签
+ * 或消息分隔线；thinking 默认折叠，标题按草稿状态区分流式与冻结，手动
+ * 展开后持续增长。冻结 text 在草稿末尾显示弱化省略号；冻结且展开的
+ * thinking 正文末尾同样显示。
+ */
+function renderLiveDraft(
+  draft: AgentDisplayDraftView,
+  width: number,
+  expandedKeys: ReadonlySet<string>,
+  lines: ViewerSemanticLine[],
+): void {
+  const thinkingTitle = draft.state === "frozen"
+    ? THINKING_FROZEN_TEXT
+    : THINKING_STREAMING_TEXT;
+  for (const block of draft.blocks) {
+    if (block.contentType === "text") {
+      lines.push(...renderMarkdownBlock(block.value, width, "body"));
+      continue;
+    }
+    const key = liveThinkingKey(draft.key, block.contentIndex);
+    const expanded = expandedKeys.has(key);
+    const title: ViewerSemanticLine = Object.freeze({
+      text: thinkingTitle,
+      style: "terminal" as const,
+      selectable_key: key,
+    });
+    lines.push(title);
+    if (expanded) lines.push(...renderMarkdownBlock(block.value, width, "terminal"));
+  }
+  if (draft.state !== "frozen" || draft.blocks.length === 0) return;
+  const last = draft.blocks.at(-1)!;
+  const lastExpanded = last.contentType === "text"
+    || expandedKeys.has(liveThinkingKey(draft.key, last.contentIndex));
+  if (lastExpanded) {
+    lines.push(Object.freeze({ text: FROZEN_DRAFT_ELLIPSIS, style: "terminal" as const }));
+  }
+}
 
 /** 将纯查看器投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
 export function renderAgentActivityViewerSurface(
@@ -943,17 +915,6 @@ function renderParentMessageBlock(
     blockIndex += 1;
   }
   return Object.freeze(lines);
-}
-
-function isLiveMessageWithinBudget(entry: LiveMessageEntry): boolean {
-  let bytes = 0;
-  let blocks = 0;
-  for (const block of entry.blocks.values()) {
-    bytes += (blocks === 0 ? 0 : 1) + new TextEncoder().encode(JSON.stringify(block.value)).byteLength;
-    blocks += 1;
-    if (bytes > ACTIVITY_MAX_TEXT_BYTES) return false;
-  }
-  return true;
 }
 
 function wrapPlainText(value: string, width: number): readonly string[] {

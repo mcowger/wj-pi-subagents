@@ -1,5 +1,6 @@
 import type { Readable, Writable } from "node:stream";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
+import type { SafeAgentActivityDisplayEvent } from "./rpc-bridge-event.ts";
 import {
   SupervisorChannel,
   SupervisorFrameDecoder,
@@ -8,6 +9,7 @@ import {
   type SupervisorCapabilityManifest,
   type SupervisorControlRequest,
   type SupervisorControlResponse,
+  type SupervisorDisplayDelivery,
   type SupervisorFrame,
   type SupervisorEvent,
   type SupervisorReceiveResult,
@@ -68,6 +70,7 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   private readonly faults = new Set<(fault: RpcSupervisorChannelFault) => void>();
   private readonly eventListeners = new Set<(event: SupervisorEvent) => void>();
   private readonly activityListeners = new Set<(activity: SupervisorActivityDelivery) => void>();
+  private readonly displayListeners = new Set<(delivery: SupervisorDisplayDelivery) => void>();
   private readonly snapshotListeners = new Set<(snapshot: SupervisorSnapshot) => void>();
   private readonly capabilityListeners = new Set<(capability: SupervisorCapabilityManifest) => void>();
   private readonly controlRequestListeners = new Set<(request: SupervisorControlRequest) => void>();
@@ -194,6 +197,18 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     for (const frame of frames) await this.send(frame);
   }
 
+  /**
+   * child 端发布实时显示事件；fire-and-forget，发布端拒绝时静默返回，会话
+   * 不受影响。
+   */
+  async publishDisplayActivity(input: {
+    readonly agent_id?: string;
+    readonly event: SafeAgentActivityDisplayEvent;
+  }): Promise<void> {
+    const frames = this.protocol.publishDisplayActivity(input);
+    for (const frame of frames) await this.send(frame);
+  }
+
   /** child 端发布新的完整子树；修订和正文边界仍由协议状态机校验。 */
   async publishSnapshot(nodes: readonly unknown[], subtreeRevision: number): Promise<void> {
     await this.send(this.protocol.publishSnapshot(nodes, subtreeRevision));
@@ -257,6 +272,11 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   onActivity(listener: (activity: SupervisorActivityDelivery) => void): () => void {
     this.activityListeners.add(listener);
     return () => this.activityListeners.delete(listener);
+  }
+
+  onDisplay(listener: (delivery: SupervisorDisplayDelivery) => void): () => void {
+    this.displayListeners.add(listener);
+    return () => this.displayListeners.delete(listener);
   }
 
   onSnapshot(listener: (snapshot: SupervisorSnapshot) => void): () => void {
@@ -329,6 +349,15 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
           listener(result.activity);
         } catch {
           // 活动观察者异常不能改变协议状态。
+        }
+      }
+    }
+    if (result.kind === "accepted" && result.display !== undefined) {
+      for (const listener of this.displayListeners) {
+        try {
+          listener(result.display);
+        } catch {
+          // 显示观察者异常不能改变协议状态。
         }
       }
     }

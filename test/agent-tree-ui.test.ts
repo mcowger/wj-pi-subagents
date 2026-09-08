@@ -9,12 +9,10 @@ import {
   type AgentActivityStreamSource,
   type AgentTreeUiContext,
 } from "../src/agent-tree-ui.ts";
-import type {
-  SafeAgentActivityDisplayEvent,
-} from "../src/rpc-bridge-event.ts";
+import type { AgentDisplayDraftView } from "../src/agent-display-drafts.ts";
+import type { CanonicalAgentActivityEntry } from "../src/canonical-activity.ts";
 import {
   CANONICAL_ACTIVITY_CONTRACT_VERSION,
-  type CanonicalAgentActivityEntry,
 } from "../src/canonical-activity.ts";
 import { randomUUID } from "node:crypto";
 import type {
@@ -405,7 +403,9 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   })];
   const replayReads: string[] = [];
   let activityChange: ((agentId: string) => void) | undefined;
-  let displayChange: ((agentId: string, event: SafeAgentActivityDisplayEvent) => void) | undefined;
+  let displayChange: ((agentId: string) => void) | undefined;
+  const drafts: AgentDisplayDraftView[] = [];
+  const draftReads: string[] = [];
   const activity: AgentActivityStreamSource = {
     readReplay: (agentId) => {
       replayReads.push(agentId);
@@ -414,6 +414,10 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
     onChange: (listener) => {
       activityChange = listener;
       return () => { if (activityChange === listener) activityChange = undefined; };
+    },
+    readDisplayDrafts: (agentId) => {
+      draftReads.push(agentId);
+      return agentId === WORKING_CHILD_ID ? drafts : [];
     },
     onDisplayChange: (listener) => {
       displayChange = listener;
@@ -432,6 +436,8 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   assert.ok(activityChange !== undefined);
   assert.ok(displayChange !== undefined);
   assert.deepEqual(replayReads, [WORKING_CHILD_ID]);
+  // 打开详情时立即读取顶层草稿快照（此时为空）。
+  assert.deepEqual(draftReads, [WORKING_CHILD_ID]);
   assert.match(viewer?.render(120).join("\n") ?? "", /working-child.*孙代理历史/us);
 
   replay.push(Object.freeze({
@@ -449,26 +455,22 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   activityChange?.(WORKING_CHILD_ID);
   assert.match(viewer?.render(120).join("\n") ?? "", /孙代理实时完整事件/u);
 
-  displayChange?.(WORKING_CHILD_ID, Object.freeze({
-    type: "message_delta",
-    streamId: "message-1",
-    sequence: 1,
-    contentIndex: 0,
-    contentType: "text",
-    delta: "partial",
+  // 草稿变更通知携带代理身份；查看器重新拉取快照后显示当前连续前缀。
+  drafts.push(Object.freeze({
+    key: "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81|message-1",
+    state: "streaming" as const,
+    blocks: Object.freeze([Object.freeze({
+      contentIndex: 0,
+      contentType: "text" as const,
+      value: "partial",
+    })]),
   }));
+  displayChange?.(WORKING_CHILD_ID);
   assert.match(viewer?.render(120).join("\n") ?? "", /partial/u);
 
   currentSnapshot = Object.freeze({ ...treeSnapshot(), tree_revision: 8 });
   treeChange?.();
-  displayChange?.(WORKING_CHILD_ID, Object.freeze({
-    type: "message_delta",
-    streamId: "message-1",
-    sequence: 2,
-    contentIndex: 0,
-    contentType: "text",
-    delta: " text",
-  }));
+  displayChange?.(WORKING_CHILD_ID);
   assert.equal(renderRequests[1] ?? 0, 0);
   await new Promise<void>((resolve) => setTimeout(resolve, 65));
   assert.equal(renderRequests[1], 1);

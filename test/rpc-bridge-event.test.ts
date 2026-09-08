@@ -10,6 +10,9 @@ import {
   parseAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
 
+const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
+const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+
 test("真正 child 回复端点只公开文本，明确丢弃 thinking、toolCall 和图片内容", () => {
   const result = normalizeAssistantMessageEnd({
     type: "message_end",
@@ -168,10 +171,27 @@ test("显示层 message_update 只提取有序文本与 thinking delta，不进�
     type: "message_complete",
     streamId: "message-1",
     sequence: 3,
+    agentId: AGENT_ID,
+    incarnationId: INCARNATION_ID,
   }), {
     kind: "event",
-    event: { type: "message_complete", streamId: "message-1", sequence: 3 },
+    event: {
+      type: "message_complete",
+      streamId: "message-1",
+      sequence: 3,
+      agentId: AGENT_ID,
+      incarnationId: INCARNATION_ID,
+    },
   });
+  // 实时流身份必须是规范 UUID：不同代理、重启实例或复用 stream ID 不会
+  // 关联到同一草稿。
+  assert.deepEqual(parseAgentActivityDisplayEvent({
+    type: "message_complete",
+    streamId: "message-1",
+    sequence: 3,
+    agentId: "not-a-uuid",
+    incarnationId: INCARNATION_ID,
+  }), { kind: "invalid" });
   assert.deepEqual(parseAgentActivityDisplayEvent({
     type: "message_delta",
     streamId: "",
@@ -179,6 +199,8 @@ test("显示层 message_update 只提取有序文本与 thinking delta，不进�
     contentIndex: 0,
     contentType: "text",
     delta: "bad",
+    agentId: AGENT_ID,
+    incarnationId: INCARNATION_ID,
   }), { kind: "invalid" });
 });
 

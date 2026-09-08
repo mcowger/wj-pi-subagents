@@ -5,7 +5,10 @@ import {
   AgentController,
   type AgentSupervisor,
 } from "../src/agent-controller.ts";
-import type { SupervisorActivityDelivery } from "../src/supervisor-channel.ts";
+import type {
+  SupervisorActivityDelivery,
+  SupervisorDisplayDelivery,
+} from "../src/supervisor-channel.ts";
 import type {
   RpcSupervisorCommandResult,
   RpcSupervisorEvent,
@@ -31,6 +34,28 @@ import {
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const GRANDCHILD_ID = "660e8400-e29b-41d4-a716-446655440001";
 const GREAT_GRANDCHILD_ID = "770e8400-e29b-41d4-a716-446655440002";
+const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+
+function displayDelta(
+  streamId: string,
+  sequence: number,
+  contentIndex: number,
+  contentType: "text" | "thinking",
+  delta: string,
+  agentId: string = AGENT_ID,
+  incarnationId: string = INCARNATION_ID,
+): SafeAgentActivityDisplayEvent {
+  return Object.freeze({
+    type: "message_delta",
+    streamId,
+    sequence,
+    contentIndex,
+    contentType,
+    delta,
+    agentId,
+    incarnationId,
+  });
+}
 
 class FakeSupervisor implements AgentSupervisor {
   private readonly listeners = new Set<(event: RpcSupervisorEvent) => void>();
@@ -91,9 +116,22 @@ class FakeSupervisor implements AgentSupervisor {
     }
   }
 
-  emitActivityDisplay(event: SafeAgentActivityDisplayEvent): void {
+  emitActivityDisplay(delivery: SupervisorDisplayDelivery): void {
     for (const listener of this.listeners) {
-      listener(Object.freeze({ kind: "activity_display", event }));
+      listener(Object.freeze({
+        kind: "activity_display",
+        agent_id: delivery.agent_id,
+        event: delivery.event,
+      }));
+    }
+  }
+
+  emitLifecycle(
+    agentId: string,
+    event: Extract<RpcSupervisorEvent, { kind: "lifecycle" }>["event"],
+  ): void {
+    for (const listener of this.listeners) {
+      listener(Object.freeze({ kind: "lifecycle", agent_id: agentId, event }));
     }
   }
 }
@@ -111,6 +149,26 @@ function messageEntry(agentId: string, text: string): CanonicalAgentActivityEntr
   });
 }
 
+/** 权威条目携带与实时流精确关联的身份：运行实例身份 + streamId。 */
+function messageEntryWithStream(
+  agentId: string,
+  text: string,
+  streamId: string,
+  incarnationId: string,
+): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: incarnationId,
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text })]),
+      streamId,
+    }),
+  });
+}
+
 function makeChildModeController(options: {
   readonly agentId: string;
   readonly parentAgentId: string | null;
@@ -118,6 +176,7 @@ function makeChildModeController(options: {
   readonly directChildId: string;
   readonly directChildSupervisor: FakeSupervisor;
   readonly publishUpstreamActivity: (delivery: SupervisorActivityDelivery) => void;
+  readonly publishUpstreamDisplayActivity?: (delivery: SupervisorDisplayDelivery) => void;
 }): AgentController {
   const tree = new TreeController({
     config: {
@@ -148,6 +207,9 @@ function makeChildModeController(options: {
     },
     replyNotificationsHandledByInbox: false,
     publishUpstreamActivity: options.publishUpstreamActivity,
+    ...(options.publishUpstreamDisplayActivity === undefined
+      ? {}
+      : { publishUpstreamDisplayActivity: options.publishUpstreamDisplayActivity }),
   });
 }
 
@@ -201,29 +263,130 @@ test("顶层控制器把活动条目写入缓存，按到达序可回放且修�
   unsubscribe();
 });
 
-test("逐 token 显示事件只通知查看器，不写入缓存或上行活动流", async () => {
+test("顶层把实时显示事实组装为按代理隔离的草稿，不写入缓存或上行活动流", async () => {
   const fake = new FakeSupervisor();
   const { controller, upstream } = makeController(fake);
   const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
   assert.equal(spawned.ok, true, JSON.stringify(spawned));
 
-  const observed: Array<{ readonly agentId: string; readonly event: SafeAgentActivityDisplayEvent }> = [];
-  const unsubscribe = controller.onActivityDisplayChange((agentId, event) => observed.push({ agentId, event }));
-  const delta: SafeAgentActivityDisplayEvent = Object.freeze({
-    type: "message_delta",
-    streamId: "message-1",
-    sequence: 1,
-    contentIndex: 0,
-    contentType: "text",
-    delta: "partial",
+  const notified: string[] = [];
+  const unsubscribe = controller.onActivityDisplayChange((agentId: string) => notified.push(agentId));
+  fake.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: displayDelta("message-1", 1, 0, "text", "partial"),
   });
-  fake.emitActivityDisplay(delta);
 
-  assert.deepEqual(observed, [{ agentId: AGENT_ID, event: delta }]);
+  assert.deepEqual(notified, [AGENT_ID]);
+  const drafts = controller.getDisplayDrafts(AGENT_ID);
+  assert.equal(drafts.length, 1);
+  assert.deepEqual(drafts[0]?.blocks.map((block) => block.value), ["partial"]);
+  assert.deepEqual(controller.getDisplayDrafts(GRANDCHILD_ID), []);
   assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
   assert.equal(controller.getActivityRevision(AGENT_ID), 0);
   assert.deepEqual(upstream, []);
   unsubscribe();
+});
+
+test("任意深度的实时显示事实逐层转发到顶层并保持代理隔离", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  const rootSpawned = await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+  assert.equal(rootSpawned.ok, true, JSON.stringify(rootSpawned));
+
+  const childToRoot: SupervisorDisplayDelivery[] = [];
+  const grandchildSupervisor = new FakeSupervisor(GRANDCHILD_ID);
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: grandchildSupervisor,
+    publishUpstreamActivity: (delivery) => rootSupervisor.emitActivityDelivery(delivery),
+    publishUpstreamDisplayActivity: (delivery) => {
+      childToRoot.push(delivery);
+      rootSupervisor.emitActivityDisplay(delivery);
+    },
+  });
+  const childSpawned = await child.spawnAgent({ template_id: "demo", name: "孙代理" });
+  assert.equal(childSpawned.ok, true, JSON.stringify(childSpawned));
+
+  // 孙代理的显示事实经中间层转发；中间层自身不缓存草稿。
+  const grandchildDelta = displayDelta("message-7", 1, 0, "text", "孙代理实时", GRANDCHILD_ID);
+  grandchildSupervisor.emitActivityDisplay({ agent_id: GRANDCHILD_ID, event: grandchildDelta });
+  assert.deepEqual(child.getDisplayDrafts(GRANDCHILD_ID), []);
+  assert.deepEqual(childToRoot.map((delivery) => delivery.agent_id), [GRANDCHILD_ID]);
+
+  const rootDrafts = root.getDisplayDrafts(GRANDCHILD_ID);
+  assert.equal(rootDrafts.length, 1);
+  assert.deepEqual(rootDrafts[0]?.blocks.map((block) => block.value), ["孙代理实时"]);
+  // 直接子与孙代理草稿按代理隔离，不串流。
+  assert.deepEqual(root.getDisplayDrafts(AGENT_ID), []);
+});
+
+test("子模式 recordOwnDisplayEvent 登记完整流身份并沿上游转发", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+
+  const upstream: SupervisorDisplayDelivery[] = [];
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: new FakeSupervisor(GRANDCHILD_ID),
+    publishUpstreamActivity: (delivery) => rootSupervisor.emitActivityDelivery(delivery),
+    publishUpstreamDisplayActivity: (delivery) => {
+      upstream.push(delivery);
+      rootSupervisor.emitActivityDisplay(delivery);
+    },
+  });
+
+  assert.equal(child.recordOwnDisplayEvent(displayDelta("message-1", 1, 0, "text", "自身")), true);
+  assert.equal(upstream.length, 1);
+  const delivered = upstream[0]!;
+  assert.equal(delivered.agent_id, AGENT_ID);
+  assert.equal(delivered.event.agentId, AGENT_ID);
+  assert.match(delivered.event.incarnationId, /^[0-9a-f-]{36}$/u);
+  // 顶层收到同身份草稿；与 recordOwnActivity 的权威条目身份一致。
+  const rootDrafts = root.getDisplayDrafts(AGENT_ID);
+  assert.deepEqual(rootDrafts[0]?.blocks.map((block) => block.value), ["自身"]);
+  // 根没有可上行的自身代理身份。
+  assert.equal(root.recordOwnDisplayEvent(displayDelta("message-1", 1, 0, "text", "根")), false);
+});
+
+test("权威完整消息携带 streamId 到达后原地替换对应草稿", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  fake.emitActivityDisplay({ agent_id: AGENT_ID, event: displayDelta("message-1", 1, 0, "text", "实时前缀") });
+  assert.equal(controller.getDisplayDrafts(AGENT_ID).length, 1);
+
+  // 权威条目经活动流落账：身份精确关联 → 草稿被清除，历史只保留完整正文。
+  const entry = messageEntryWithStream(AGENT_ID, "完整正文", "message-1", INCARNATION_ID);
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry });
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+  assert.match(controller.getActivityReplay(AGENT_ID)[0]?.body.type ?? "", /message/u);
+});
+
+test("生命周期收束清除草稿；随后迟到的权威消息仍可写入历史", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  fake.emitActivityDisplay({ agent_id: AGENT_ID, event: displayDelta("message-1", 1, 0, "text", "未收束") });
+  assert.equal(controller.getDisplayDrafts(AGENT_ID).length, 1);
+
+  fake.emitLifecycle(AGENT_ID, { type: "agent_settled", expected_generation: 0 });
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+
+  // 同一运行实例迟到的合法权威消息仍可写入历史。
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, "迟到的完整正文") });
+  assert.equal(controller.getActivityReplay(AGENT_ID).length, 1);
+  // 收束后迟到的同流 delta 不复活旧草稿。
+  fake.emitActivityDisplay({ agent_id: AGENT_ID, event: displayDelta("message-1", 2, 0, "text", "迟到") });
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
 });
 
 test("后代活动条目按其真实身份分组写入顶层缓存", async () => {

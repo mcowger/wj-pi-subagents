@@ -10,6 +10,10 @@ import {
   type CanonicalAgentActivityEntry,
 } from "./canonical-activity.ts";
 import {
+  parseAgentActivityDisplayEvent,
+  type SafeAgentActivityDisplayEvent,
+} from "./rpc-bridge-event.ts";
+import {
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
 } from "./child-reply-envelope.ts";
@@ -35,7 +39,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/24";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/25";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -46,6 +50,7 @@ export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "capability",
   "reply",
   "activity",
+  "display",
   "control_request",
   "control_response",
   "close",
@@ -199,6 +204,15 @@ export interface SupervisorActivityDelivery {
   readonly entry: CanonicalAgentActivityEntry;
 }
 
+/**
+ * 实时显示流交付：代理身份加携带完整流身份的短暂 token 事件。它只服务
+ * 顶层显示草稿，无确认、不缓存、不进入活动历史。
+ */
+export interface SupervisorDisplayDelivery {
+  readonly agent_id: string;
+  readonly event: SafeAgentActivityDisplayEvent;
+}
+
 /** 监督器向直接父/子控制器传播的脱敏生命周期事实。 */
 export interface SupervisorEvent {
   readonly root_id: string;
@@ -272,6 +286,8 @@ export interface SupervisorReceiveAccepted {
   readonly event?: SupervisorEvent;
   /** 本次通过身份与闭集校验的上行活动流交付。 */
   readonly activity?: SupervisorActivityDelivery;
+  /** 本次通过身份与闭集校验的上行实时显示流交付。 */
+  readonly display?: SupervisorDisplayDelivery;
   /** 本次接收原子替换的完整快照；调用方可直接交给树控制器。 */
   readonly snapshot?: SupervisorSnapshot;
   /** 本次通过身份、分支和正文边界校验的上行内部控制请求。 */
@@ -1321,6 +1337,33 @@ export class SupervisorChannel {
     )));
   }
 
+  /**
+   * child 沿监督通道上行一条实时显示事件。fire-and-forget，无确认、无屏障、
+   * 不承诺跨事件顺序；事件必须携带与外层代理身份一致的完整流身份。结构
+   * 违约或身份越权抛出 SupervisorProtocolError。
+   */
+  publishDisplayActivity(input: {
+    readonly agent_id?: string;
+    readonly event: SafeAgentActivityDisplayEvent;
+  }): readonly SupervisorFrame[] {
+    if (
+      this.role !== "child" ||
+      this.terminationBarrier ||
+      this.state !== "ready"
+    ) throw new SupervisorProtocolError("closed");
+    const agentId = input.agent_id ?? this.localAgentId;
+    if (!isCanonicalUuid(agentId)) throw new SupervisorProtocolError("identity_mismatch");
+    if (!this.eventAgentIsInScope(agentId)) throw new SupervisorProtocolError("identity_mismatch");
+    const parsed = parseAgentActivityDisplayEvent(input.event);
+    if (parsed.kind === "invalid") throw new SupervisorProtocolError("invalid_frame");
+    if (parsed.kind !== "event" || parsed.event.agentId !== agentId) {
+      throw new SupervisorProtocolError("identity_mismatch");
+    }
+    return Object.freeze([
+      this.createFrame("display", Object.freeze({ agent_id: agentId, event: parsed.event })),
+    ]);
+  }
+
   /** child 仅在普通 ready 后发布一次固定的内部能力快照。 */
   publishCapability(manifest: SupervisorCapabilityManifest): SupervisorFrame {
     if (
@@ -1577,6 +1620,7 @@ export class SupervisorChannel {
     let capability: SupervisorCapabilityManifest | undefined;
     let event: SupervisorEvent | undefined;
     let activity: SupervisorActivityDelivery | undefined;
+    let display: SupervisorDisplayDelivery | undefined;
     let controlRequest: SupervisorControlRequest | undefined;
     let controlResponse: SupervisorControlResponse | undefined;
     let closeRequested = false;
@@ -1629,6 +1673,9 @@ export class SupervisorChannel {
       case "activity":
         activity = this.applyActivity(frame);
         break;
+      case "display":
+        display = this.applyDisplay(frame);
+        break;
       case "close":
         this.applyClose(frame);
         closeRequested = true;
@@ -1645,6 +1692,7 @@ export class SupervisorChannel {
       ...(capability === undefined ? {} : { capability }),
       ...(event === undefined ? {} : { event }),
       ...(activity === undefined ? {} : { activity }),
+      ...(display === undefined ? {} : { display }),
       ...(acceptedSnapshot === undefined ? {} : { snapshot: acceptedSnapshot }),
       ...(controlRequest === undefined ? {} : { control_request: controlRequest }),
       ...(controlResponse === undefined ? {} : { control_response: controlResponse }),
@@ -1803,6 +1851,23 @@ export class SupervisorChannel {
     if (!isCanonicalUuid(value)) frameError("invalid_frame");
     if (!this.eventAgentIsInScope(value as string)) frameError("identity_mismatch");
     return value as string;
+  }
+
+  /**
+   * 实时显示帧只分发与外层代理身份一致、携带完整流身份的短暂事件；它不
+   * 进入活动缓存，也不参与生命周期或阶段跟踪。
+   */
+  private applyDisplay(frame: InternalFrame): SupervisorDisplayDelivery {
+    if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+    const payload = frame.payload;
+    if (!isRecord(payload) || !hasExactObjectKeys(payload, ["agent_id", "event"])) {
+      frameError("invalid_frame");
+    }
+    const agentId = this.resolveInScopeActivityAgentId(payload.agent_id);
+    const parsed = parseAgentActivityDisplayEvent(payload.event);
+    if (parsed.kind !== "event") frameError("invalid_frame");
+    if (parsed.event.agentId !== agentId) frameError("invalid_frame");
+    return Object.freeze({ agent_id: agentId, event: parsed.event });
   }
 
   /** 同一条目的分块按身份聚合；缺块不产生部分权威正文，静默等待或丢弃。 */

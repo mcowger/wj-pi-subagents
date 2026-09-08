@@ -13,6 +13,10 @@ import type {
 } from "../src/rpc-bridge-event.ts";
 import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
 import {
+  AgentDisplayDraftRegistry,
+  type AgentDisplayDraftView,
+} from "../src/agent-display-drafts.ts";
+import {
   CANONICAL_ACTIVITY_CONTRACT_VERSION,
   type CanonicalAgentActivityEntry,
 } from "../src/canonical-activity.ts";
@@ -33,15 +37,17 @@ function viewerAgent(state: AgentLifecycleState = "working") {
 
 function messageEntry(
   content: ReadonlyArray<{ type: "text"; text: string } | { type: "thinking"; thinking: string }>,
+  streamId?: string,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
-    incarnation_id: randomUUID(),
+    incarnation_id: streamId === undefined ? randomUUID() : INCARNATION_ID,
     entry_id: randomUUID(),
     body: Object.freeze({
       type: "message",
       content: Object.freeze(content.map((block) => Object.freeze(block))),
+      ...(streamId === undefined ? {} : { streamId }),
     }),
   });
 }
@@ -106,6 +112,8 @@ function displayDelta(
   contentIndex: number,
   contentType: "text" | "thinking",
   delta: string,
+  agentId: string = AGENT_ID,
+  incarnationId: string = INCARNATION_ID,
 ): SafeAgentActivityDisplayEvent {
   return Object.freeze({
     type: "message_delta",
@@ -114,11 +122,28 @@ function displayDelta(
     contentIndex,
     contentType,
     delta,
+    agentId,
+    incarnationId,
   });
 }
 
-function displayComplete(streamId: string, sequence: number): SafeAgentActivityDisplayEvent {
-  return Object.freeze({ type: "message_complete", streamId, sequence });
+function displayComplete(
+  streamId: string,
+  sequence: number,
+  agentId: string = AGENT_ID,
+  incarnationId: string = INCARNATION_ID,
+): SafeAgentActivityDisplayEvent {
+  return Object.freeze({ type: "message_complete", streamId, sequence, agentId, incarnationId });
+}
+
+/** 顶层草稿登记表装配：按给定事件序列组装后返回该代理的草稿快照。 */
+function assembledDrafts(
+  events: readonly SafeAgentActivityDisplayEvent[],
+  agentId: string = AGENT_ID,
+): readonly AgentDisplayDraftView[] {
+  const registry = new AgentDisplayDraftRegistry();
+  for (const event of events) registry.applyEvent(agentId, event);
+  return registry.drafts(agentId);
 }
 
 /** 4 行正文消息 + 一条完成工具 = 6 行事件正文。 */
@@ -628,36 +653,101 @@ test("选中条目使用整行选中背景渲染", () => {
   assert.match(selectedLines[0] ?? "", /Thinking/u);
 });
 
-test("逐 token 显示事件只驻留查看器投影，并在完整条目抵达时收束", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 1, 0, "text", "Hel")), "changed");
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 2, 0, "text", "lo")), "changed");
+test("实时草稿驻留查看器投影，complete 后保持显示并被权威条目原地替换", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  assert.equal(registry.applyEvent(AGENT_ID, displayDelta("message-1", 1, 0, "text", "Hel")), true);
+  assert.equal(registry.applyEvent(AGENT_ID, displayDelta("message-1", 2, 0, "text", "lo")), true);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [], {
+    drafts: registry.drafts(AGENT_ID),
+  });
   assert.equal(viewer.getPublicState().event_count, 0);
   assert.match(viewer.render(120).join("\n"), /Hello/u);
 
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 4, 0, "text", "!")), "changed");
-  assert.doesNotMatch(viewer.render(120).join("\n"), /Hello!/u);
-  assert.equal(viewer.applyDisplayEvent(displayComplete("message-1", 3)), "ignored");
+  // message_complete 只收束显示流：连续草稿继续显示，等待权威消息不闪空。
+  assert.equal(registry.applyEvent(AGENT_ID, displayComplete("message-1", 3)), true);
+  viewer.setLiveDrafts(registry.drafts(AGENT_ID));
+  assert.match(viewer.render(120).join("\n"), /Hello/u);
 
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-2", 1, 0, "text", "done")), "changed");
-  assert.equal(viewer.applyDisplayEvent(displayComplete("message-2", 2)), "changed");
-  assert.doesNotMatch(viewer.render(120).join("\n"), /done/u);
-  viewer.syncFrom([textMessage("done")]);
+  // 权威完整消息携带可精确关联的身份：原地替换并清除对应草稿。
+  assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), true);
+  viewer.setLiveDrafts(registry.drafts(AGENT_ID));
+  assert.doesNotMatch(viewer.render(120).join("\n"), /Hello/u);
+  viewer.syncFrom([messageEntry([{ type: "text", text: "Hello" }], "message-1")]);
   assert.equal(viewer.getPublicState().event_count, 1);
-  assert.match(viewer.render(120).join("\n"), /done/u);
+  assert.match(viewer.render(120).join("\n"), /Hello/u);
 });
 
-test("实时 thinking 草稿默认折叠并可展开观察流式内容", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 1, 0, "thinking", "流式思考")), "changed");
+test("权威消息先到时迟到 delta 与 complete 被忽略，旧流不复活", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  // 权威消息先落账：草稿登记表登记该流墓碑。
+  assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), false);
+  assert.equal(registry.applyEvent(AGENT_ID, displayDelta("message-1", 1, 0, "text", "迟到")), false);
+  assert.equal(registry.applyEvent(AGENT_ID, displayComplete("message-1", 2)), false);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "text", text: "完整正文" }], "message-1"),
+  ], { drafts: registry.drafts(AGENT_ID) });
+  const lines = viewer.render(120).join("\n");
+  assert.doesNotMatch(lines, /迟到/u);
+  assert.match(lines, /完整正文/u);
+});
+
+test("实时 thinking 草稿默认折叠为 Thinking · streaming 并可展开观察流式内容", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [], {
+    drafts: assembledDrafts([displayDelta("message-1", 1, 0, "thinking", "流式思考")]),
+  });
   const collapsed = viewer.render(120).join("\n");
-  assert.match(collapsed, /Thinking/u);
+  assert.match(collapsed, /Thinking · streaming/u);
   assert.doesNotMatch(collapsed, /流式思考/u);
 
   // 选择实时 thinking 折叠条目并展开。
   assert.equal(viewer.handleInput("\t"), "changed");
   assert.equal(viewer.handleInput("\r"), "changed");
   assert.match(viewer.render(120).join("\n"), /流式思考/u);
+});
+
+test("冻结 text 草稿末尾显示弱化省略号，冻结 thinking 标题显示 streaming incomplete", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  // 256 个未来帧恰好到达边界（帧 3..258），第 257 个未来帧（帧 259）触发冻结：
+  // 保留已验证前缀，丢弃 future buffer。
+  const events = [displayDelta("message-1", 1, 0, "text", "前缀")];
+  for (let sequence = 3; sequence <= 258; sequence += 1) {
+    events.push(displayDelta("message-1", sequence, 0, "text", "x"));
+  }
+  for (const event of events) registry.applyEvent(AGENT_ID, event);
+  assert.equal(registry.applyEvent(AGENT_ID, displayDelta("message-1", 259, 0, "text", "x")), true);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [], {
+    drafts: registry.drafts(AGENT_ID),
+  });
+  const lines = viewer.render(120);
+  assert.match(lines.join("\n"), /前缀/u);
+  assert.ok(lines.some((line) => line === "…"), lines.join("\n"));
+  // 冻结后不再应用任何 token，等待权威完整消息。
+  assert.equal(registry.applyEvent(AGENT_ID, displayDelta("message-1", 2, 0, "text", "y")), false);
+  assert.equal(registry.applyEvent(AGENT_ID, displayComplete("message-1", 260)), false);
+  viewer.setLiveDrafts(registry.drafts(AGENT_ID));
+  assert.doesNotMatch(viewer.render(120).join("\n"), /前缀y/u);
+
+  const thinkingRegistry = new AgentDisplayDraftRegistry();
+  const thinkingEvents = [
+    displayDelta("message-2", 1, 0, "thinking", "冻结的思考"),
+    ...Array.from({ length: 300 }, (_, index) =>
+      displayDelta("message-2", index + 3, 0, "thinking", "x")),
+  ];
+  for (const event of thinkingEvents) thinkingRegistry.applyEvent(AGENT_ID, event);
+  const thinkingViewer = new AgentActivityViewerModel(viewerAgent(), [], {
+    drafts: thinkingRegistry.drafts(AGENT_ID),
+    viewport_height: 20,
+  });
+  // 折叠状态只由标题表达 streaming incomplete，不显示省略号。
+  const collapsedThinking = thinkingViewer.render(120);
+  assert.match(collapsedThinking.join("\n"), /Thinking · streaming incomplete/u);
+  assert.ok(!collapsedThinking.some((line) => line === "…"), collapsedThinking.join("\n"));
+  // 展开后正文末尾同时显示弱化省略号。
+  assert.equal(thinkingViewer.handleInput("\t"), "changed");
+  assert.equal(thinkingViewer.handleInput("\r"), "changed");
+  const expandedThinking = thinkingViewer.render(120);
+  assert.match(expandedThinking.join("\n"), /冻结的思考/u);
+  assert.ok(expandedThinking.some((line) => line === "…"), expandedThinking.join("\n"));
 });
 
 test("Esc 关闭查看器，其余未知输入被忽略", () => {

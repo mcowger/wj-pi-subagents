@@ -1,9 +1,6 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
-import {
-  parseAgentActivityDisplayEvent,
-  type SafeAgentActivityDisplayEvent,
-} from "./rpc-bridge-event.ts";
+import type { SafeAgentActivityDisplayEvent } from "./rpc-bridge-event.ts";
 import {
   ManagedRpcCommandRejectedError,
   ManagedRpcStartupError,
@@ -15,6 +12,7 @@ import type {
   SupervisorCapabilityManifest,
   SupervisorControlRequest,
   SupervisorControlResponse,
+  SupervisorDisplayDelivery,
   SupervisorEvent,
   SupervisorReply,
   SupervisorSnapshot,
@@ -310,7 +308,8 @@ export type RpcSupervisorEvent =
     }
   | {
       readonly kind: "activity_display";
-      /** 仅本进程查看器消费的 transient 帧，禁止写入活动缓存或向上汇聚。 */
+      /** 实时流身份所属代理；由监督通道 display 帧的外层身份保证。 */
+      readonly agent_id: string;
       readonly event: SafeAgentActivityDisplayEvent;
     }
   | {
@@ -337,6 +336,8 @@ export interface RpcSupervisorChannel {
   onEvent?(listener: (event: SupervisorEvent) => void): () => void;
   /** 父端收到子端活动流交付时调用；旧替身可省略。 */
   onActivity?(listener: (activity: SupervisorActivityDelivery) => void): () => void;
+  /** 父端收到子端实时显示流交付时调用；旧替身可省略。 */
+  onDisplay?(listener: (delivery: SupervisorDisplayDelivery) => void): () => void;
   onSnapshot?(listener: (snapshot: SupervisorSnapshot) => void): () => void;
   /** parent 端缓存的 child 启动能力证明；仅用于启动裁决。 */
   getCapability?(): SupervisorCapabilityManifest | undefined;
@@ -554,6 +555,7 @@ export class RpcSupervisor {
   private unsubscribeChannelFault: (() => void) | undefined;
   private unsubscribeChannelEvent: (() => void) | undefined;
   private unsubscribeChannelActivity: (() => void) | undefined;
+  private unsubscribeChannelDisplay: (() => void) | undefined;
   private unsubscribeChannelSnapshot: (() => void) | undefined;
   private readonly eventListeners = new Set<(event: RpcSupervisorEvent) => void>();
   private readonly activeTools = new Set<string>();
@@ -980,6 +982,12 @@ export class RpcSupervisor {
         this.receiveSupervisorActivity(activity);
       });
     }
+    const onChannelDisplay = channel.onDisplay;
+    if (typeof onChannelDisplay === "function") {
+      this.unsubscribeChannelDisplay = onChannelDisplay.call(channel, (delivery) => {
+        this.receiveSupervisorDisplayActivity(delivery);
+      });
+    }
     const onChannelSnapshot = channel.onSnapshot;
     if (typeof onChannelSnapshot === "function") {
       this.unsubscribeChannelSnapshot = onChannelSnapshot.call(channel, (snapshot) => {
@@ -989,10 +997,7 @@ export class RpcSupervisor {
   }
 
   private receiveRpcEvent(event: unknown): void {
-    if (this.phase === "terminating") {
-      this.receiveTerminatingDisplayEvent(event);
-      return;
-    }
+    if (this.phase === "terminating") return;
     if (this.phase !== "ready") return;
     if (!isRecord(event) || typeof event.type !== "string") {
       this.failRuntime("invalid_rpc_event");
@@ -1076,15 +1081,6 @@ export class RpcSupervisor {
         return;
       case "message":
         return;
-      case "activity_display": {
-        const display = parseAgentActivityDisplayEvent(event.event);
-        if (display.kind !== "event") {
-          this.failRuntime("invalid_rpc_event");
-          return;
-        }
-        this.emitEvent(Object.freeze({ kind: "activity_display", event: display.event }));
-        return;
-      }
       case "message_end":
         // 回复只能由真正 child 扩展经监督通道上行；任务 RPC 事件不再发布回复。
         return;
@@ -1118,15 +1114,27 @@ export class RpcSupervisor {
     this.failRuntime(code);
   }
 
+  /** 活动流交付只分发事实，不参与生命周期、阶段跟踪或会话通知。 */
+  private receiveSupervisorActivity(activity: SupervisorActivityDelivery): void {
+    if (this.phase !== "ready" && this.phase !== "starting") return;
+    this.emitEvent(Object.freeze({
+      kind: "activity_stream",
+      agent_id: activity.agent_id,
+      entry: activity.entry,
+    }));
+  }
+
   /**
-   * 终止启动后，普通 Pi 事件不再可改变生命周期；唯独 bridge 在 close 前排队的
-   * display 收束帧必须送到已打开查看器，以清除未落账的 token 草稿。
+   * 实时显示流交付只分发展示事实：它不进入活动缓存，也不参与生命周期、
+   * 阶段跟踪或会话通知；事件身份由监督通道 display 帧校验。
    */
-  private receiveTerminatingDisplayEvent(event: unknown): void {
-    if (!isRecord(event) || event.type !== "activity_display") return;
-    const display = parseAgentActivityDisplayEvent(event.event);
-    if (display.kind !== "event" || display.event.type !== "message_complete") return;
-    this.emitEvent(Object.freeze({ kind: "activity_display", event: display.event }));
+  private receiveSupervisorDisplayActivity(delivery: SupervisorDisplayDelivery): void {
+    if (this.phase !== "ready" && this.phase !== "starting") return;
+    this.emitEvent(Object.freeze({
+      kind: "activity_display",
+      agent_id: delivery.agent_id,
+      event: delivery.event,
+    }));
   }
 
   /** 父端只接受监督协议已脱敏的生命周期事实，并按当前代际提交。 */
@@ -1185,16 +1193,6 @@ export class RpcSupervisor {
     } catch {
       this.receiveTransportFault("protocol_fault", "supervisor");
     }
-  }
-
-  /** 活动流交付只分发事实，不参与生命周期、阶段跟踪或会话通知。 */
-  private receiveSupervisorActivity(activity: SupervisorActivityDelivery): void {
-    if (this.phase !== "ready" && this.phase !== "starting") return;
-    this.emitEvent(Object.freeze({
-      kind: "activity_stream",
-      agent_id: activity.agent_id,
-      entry: activity.entry,
-    }));
   }
 
   /** 完整快照先由通道校验，再由树控制器在一个修订中合并。 */
@@ -1774,6 +1772,7 @@ export class RpcSupervisor {
     this.unsubscribeChannelFault?.();
     this.unsubscribeChannelEvent?.();
     this.unsubscribeChannelActivity?.();
+    this.unsubscribeChannelDisplay?.();
     this.unsubscribeChannelSnapshot?.();
     this.channelBindingCleanup?.();
     this.unsubscribeRpcEvent = undefined;
@@ -1781,6 +1780,7 @@ export class RpcSupervisor {
     this.unsubscribeChannelFault = undefined;
     this.unsubscribeChannelEvent = undefined;
     this.unsubscribeChannelActivity = undefined;
+    this.unsubscribeChannelDisplay = undefined;
     this.unsubscribeChannelSnapshot = undefined;
     this.runtimeCompactionActive = false;
     this.compactionEndFenceVersion = undefined;

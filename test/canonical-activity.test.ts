@@ -42,11 +42,33 @@ function validEntry(overrides: Partial<CanonicalAgentActivityEntry> = {}): Canon
 }
 
 test("规范条目契约版本是固定字符串，解析器只接受当前版本", () => {
-  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/6");
+  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/7");
   assert.equal(parseCanonicalAgentActivityEntry(validEntry()).kind, "entry");
 
-  const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/5" });
+  const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/6" });
   assert.equal(parseCanonicalAgentActivityEntry(legacy).kind, "invalid");
+});
+
+test("assistant 消息正文可携带与实时流精确关联的 streamId，身份违约被拒绝", () => {
+  const correlated = parseCanonicalAgentActivityEntry(validEntry({
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text: "回复正文" })]),
+      streamId: "message-1",
+    }),
+  }));
+  assert.equal(correlated.kind, "entry");
+  if (correlated.kind === "entry") {
+    assert.equal(correlated.entry.body.type === "message" ? correlated.entry.body.streamId : undefined, "message-1");
+  }
+
+  assert.equal(parseCanonicalAgentActivityEntry(validEntry({
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text: "回复正文" })]),
+      streamId: "",
+    }),
+  })).kind, "invalid");
 });
 
 test("规范条目校验代理身份、运行实例身份、条目身份与原子正文闭集", () => {

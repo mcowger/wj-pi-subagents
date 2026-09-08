@@ -12,9 +12,7 @@ import {
   renderAgentActivityViewerSurface,
 } from "./agent-activity-viewer.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
-import type {
-  SafeAgentActivityDisplayEvent,
-} from "./rpc-bridge-event.ts";
+import type { AgentDisplayDraftView } from "./agent-display-drafts.ts";
 import {
   displayWidth,
   renderFramedPanelLine,
@@ -77,14 +75,17 @@ export interface AgentTreeSnapshotSource {
   onChange(listener: () => void): () => void;
 }
 
-/** 活动流缓存来源 seam：查看器 overlay 只通过它读取回放与变更通知。 */
+/** 活动流缓存来源 seam：查看器 overlay 只通过它读取回放、草稿与变更通知。 */
 export interface AgentActivityStreamSource {
   readReplay(agentId: string): readonly CanonicalAgentActivityEntry[];
   onChange(listener: (agentId: string) => void): () => void;
-  /** 可选的 display-only token delta；无回放、无缓存、不向父层汇聚。 */
-  onDisplayChange?(
-    listener: (agentId: string, event: SafeAgentActivityDisplayEvent) => void,
-  ): () => void;
+  /**
+   * 可选的顶层实时草稿快照。草稿只存在于顶层登记表：即使详情未打开也持续
+   * 组装，打开时立即显示当前连续前缀；无回放、无缓存、不进入持久历史。
+   */
+  readDisplayDrafts?(agentId: string): readonly AgentDisplayDraftView[];
+  /** 实时草稿变更通知；观察者应重新拉取对应代理的草稿快照。 */
+  onDisplayChange?(listener: (agentId: string) => void): () => void;
 }
 
 interface AgentTreeTui {
@@ -393,6 +394,15 @@ export function bindAgentTreeUi(
         } catch {
           // 初始读取失败落到空态，不阻断 overlay 打开。
         }
+        let initialDrafts: readonly AgentDisplayDraftView[] = [];
+        if (typeof activity.readDisplayDrafts === "function") {
+          try {
+            // 打开详情时立即显示顶层已组装的当前连续前缀。
+            initialDrafts = activity.readDisplayDrafts(node.agent_id);
+          } catch {
+            initialDrafts = [];
+          }
+        }
         const model = new AgentActivityViewerModel(
           {
             agent_id: node.agent_id,
@@ -401,6 +411,7 @@ export function bindAgentTreeUi(
             state: node.state,
           },
           replay,
+          { drafts: initialDrafts },
         );
         let renderTimer: ReturnType<typeof setTimeout> | undefined;
         const scheduleActivityRender = (): void => {
@@ -433,9 +444,15 @@ export function bindAgentTreeUi(
         }
         if (typeof activity.onDisplayChange === "function") {
           try {
-            unsubscribeDisplay = activity.onDisplayChange((changedAgentId, event) => {
+            unsubscribeDisplay = activity.onDisplayChange((changedAgentId) => {
               if (closed || changedAgentId !== node.agent_id) return;
-              if (model.applyDisplayEvent(event) === "changed") scheduleActivityRender();
+              if (typeof activity.readDisplayDrafts !== "function") return;
+              try {
+                model.setLiveDrafts(activity.readDisplayDrafts(node.agent_id));
+              } catch {
+                // 草稿读取失败保持当前内容，不中断查看器。
+              }
+              scheduleActivityRender();
             });
           } catch {
             unsubscribeDisplay = undefined;

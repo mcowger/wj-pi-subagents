@@ -250,8 +250,8 @@ test("RPC 桥完整活动副本不再重复分发，权威活动由子扩展监�
   }
 });
 
-test("监督器将合法短暂显示帧仅作为 activity_display 分发", async () => {
-  const { rpc, supervisor, channels, cleanup } = setup();
+test("监督通道 display 帧只作为携带代理身份的 activity_display 分发", async () => {
+  const { supervisor, channels, cleanup } = setup();
   const events: RpcSupervisorEvent[] = [];
   const unsubscribe = supervisor.onEvent((event) => events.push(event));
   try {
@@ -259,80 +259,24 @@ test("监督器将合法短暂显示帧仅作为 activity_display 分发", async
     await channels.child.bind(new AbortController().signal);
     assert.equal((await startup).ok, true);
 
-    rpc.emitEvent({
-      type: "activity_display",
-      event: {
-        type: "message_delta",
-        streamId: "message-1",
-        sequence: 1,
-        contentIndex: 0,
-        contentType: "text",
-        delta: "partial",
-      },
-    });
+    const event = {
+      type: "message_delta" as const,
+      streamId: "message-1",
+      sequence: 1,
+      contentIndex: 0,
+      contentType: "text" as const,
+      delta: "partial",
+      agentId: CHILD_ID,
+      incarnationId: randomUUID(),
+    };
+    await channels.child.publishDisplayActivity({ agent_id: CHILD_ID, event });
 
     assert.deepEqual(events.filter((event) => event.kind === "activity_display"), [{
       kind: "activity_display",
-      event: {
-        type: "message_delta",
-        streamId: "message-1",
-        sequence: 1,
-        contentIndex: 0,
-        contentType: "text",
-        delta: "partial",
-      },
+      agent_id: CHILD_ID,
+      event,
     }]);
     assert.deepEqual(activityEntries(events), []);
-  } finally {
-    unsubscribe();
-    await cleanup();
-  }
-});
-
-test("终止阶段仍转发 bridge close 的 display 收束帧", async () => {
-  const { rpc, supervisor, channels, cleanup } = setup((client) => {
-    client.emitEvent({
-      type: "activity_display",
-      event: { type: "message_complete", streamId: "message-1", sequence: 2 },
-    });
-  });
-  const events: RpcSupervisorEvent[] = [];
-  const unsubscribe = supervisor.onEvent((event) => events.push(event));
-  try {
-    const startup = supervisor.start();
-    await channels.child.bind(new AbortController().signal);
-    assert.equal((await startup).ok, true);
-    rpc.emitEvent({
-      type: "activity_display",
-      event: {
-        type: "message_delta",
-        streamId: "message-1",
-        sequence: 1,
-        contentIndex: 0,
-        contentType: "text",
-        delta: "partial",
-      },
-    });
-
-    const terminated = await supervisor.terminate();
-    assert.ok(terminated.ok || terminated.code === "termination_incomplete", JSON.stringify(terminated));
-    assert.deepEqual(events.filter((event) => event.kind === "activity_display"), [
-      {
-        kind: "activity_display",
-        event: {
-          type: "message_delta",
-          streamId: "message-1",
-          sequence: 1,
-          contentIndex: 0,
-          contentType: "text",
-          delta: "partial",
-        },
-      },
-      {
-        kind: "activity_display",
-        event: { type: "message_complete", streamId: "message-1", sequence: 2 },
-      },
-    ]);
   } finally {
     unsubscribe();
     await cleanup();

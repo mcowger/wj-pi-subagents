@@ -27,9 +27,12 @@ import type {
   ExtensionApiSurface,
 } from "./host-gate.ts";
 import {
+  buildDisplayStreamComplete,
   createOwnToolActivityNormalizer,
+  normalizeAssistantMessageUpdate,
   normalizeRpcBridgeEvent,
   type AgentActivityEventNormalization,
+  type AgentDisplayStreamUpdate,
   type SafeAgentActivityEvent,
   type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
@@ -791,10 +794,109 @@ function observeOwnActivity(
   current: ActiveRuntime | undefined,
   event: unknown,
   normalizeOwnActivity: (event: unknown) => AgentActivityEventNormalization,
+  displayStreamId?: string,
 ): void {
   if (current === undefined || !current.isChild || current.handoffPending === true) return;
   const activity = readOwnActivityEvent(event, normalizeOwnActivity);
-  if (activity !== undefined) current.controller.recordOwnActivity(activity);
+  if (activity !== undefined) current.controller.recordOwnActivity(activity, displayStreamId);
+}
+
+/** 产生端显示事实逐层 fire-and-forget 转发；recordOwnDisplayEvent 自身吞掉转发失败。 */
+function observeOwnDisplayEvent(
+  current: ActiveRuntime | undefined,
+  updates: readonly AgentDisplayStreamUpdate[],
+): void {
+  if (current === undefined || !current.isChild || current.handoffPending === true) return;
+  for (const update of updates) {
+    current.controller.recordOwnDisplayEvent(update);
+  }
+}
+
+interface ActiveOwnDisplayStream {
+  readonly streamId: string;
+  nextSequence: number;
+  hasDelta: boolean;
+}
+
+/**
+ * 产生端实时显示流跟踪器。Pi 事件流不提供 message id；本运行实例按
+ * assistant 消息顺序分配单调 streamId。Pi 的 agent 循环只为 text/thinking/
+ * toolcall 增量发出 message_update，start 与 done/error 分别以独立
+ * message_start / message_end 事件到达：message_start 轮换 streamId 并收束
+ * 上一条消息的流（覆盖无 message_end 的中断），message_end 收束当前流。
+ * delta、complete 与权威 assistant 消息共享同一代理与运行实例身份（由控制
+ * 器登记时补充），因此顶层可以把完整消息原地替换对应草稿。
+ */
+export class OwnDisplayStreamTracker {
+  private nextStreamId = 0;
+  private active: ActiveOwnDisplayStream | undefined;
+  private discarding = false;
+  /** 最近一条 assistant 消息流身份；message_end 生成权威条目时携带。 */
+  latestStreamId: string | undefined;
+
+  observe(event: unknown): readonly AgentDisplayStreamUpdate[] {
+    if (!isRecord(event) || typeof event.type !== "string") return [];
+    if (event.type === "message_start" && isAssistantMessage(event)) {
+      const previous = this.completeActive();
+      this.discarding = false;
+      this.active = this.newStream();
+      return previous === undefined ? [] : [previous];
+    }
+    if (event.type === "message_update" && isRecord(event.assistantMessageEvent)) {
+      return this.observeUpdate(event.assistantMessageEvent);
+    }
+    if (event.type === "message_end" && isAssistantMessage(event)) {
+      const completed = this.completeActive();
+      this.discarding = false;
+      return completed === undefined ? [] : [completed];
+    }
+    return [];
+  }
+
+  private observeUpdate(update: Record<string, unknown>): readonly AgentDisplayStreamUpdate[] {
+    // done/error 收束当前流：中断与完成都不再接受后续 token。
+    if (update.type === "done" || update.type === "error") {
+      const completed = this.completeActive();
+      this.discarding = false;
+      return completed === undefined ? [] : [completed];
+    }
+    if (this.discarding) return [];
+    const active = this.active ?? this.newStream();
+    const normalized = normalizeAssistantMessageUpdate(
+      { type: "message_update", assistantMessageEvent: update },
+      active.streamId,
+      active.nextSequence,
+    );
+    if (normalized.kind === "rejected") {
+      // 单帧超预算：收束可见草稿并丢弃该消息的后续增量，等待权威消息。
+      const completed = this.completeActive();
+      this.discarding = true;
+      return completed === undefined ? [] : [completed];
+    }
+    if (normalized.kind !== "event") return [];
+    active.nextSequence += 1;
+    active.hasDelta = true;
+    this.active ??= active;
+    return [normalized.event];
+  }
+
+  private newStream(): ActiveOwnDisplayStream {
+    this.nextStreamId += 1;
+    const streamId = `message-${this.nextStreamId}`;
+    this.latestStreamId = streamId;
+    return { streamId, nextSequence: 1, hasDelta: false };
+  }
+
+  private completeActive(): AgentDisplayStreamUpdate | undefined {
+    const active = this.active;
+    this.active = undefined;
+    if (active === undefined || !active.hasDelta) return undefined;
+    return buildDisplayStreamComplete(active.streamId, active.nextSequence);
+  }
+}
+
+function isAssistantMessage(event: Record<string, unknown>): boolean {
+  return isRecord(event.message) && event.message.role === "assistant";
 }
 
 export function createWjPiSubagentsRuntimeActivator(
@@ -814,6 +916,9 @@ export function createWjPiSubagentsRuntimeActivator(
     const normalizeOwnActivity = createOwnToolActivityNormalizer(resolveToolOrigin, (agentId) =>
       readDirectChildDisplayName(active, agentId, false),
     );
+    // 产生端实时显示流跟踪器：与权威 assistant 消息共享同一运行实例身份，
+    // 使顶层草稿可以被完整消息精确替换。
+    const ownDisplayTracker = new OwnDisplayStreamTracker();
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
@@ -836,6 +941,7 @@ export function createWjPiSubagentsRuntimeActivator(
         }, context, {
           readReplay: (agentId) => current.controller.getActivityReplay(agentId),
           onChange: (listener) => current.controller.onActivityChange(listener),
+          readDisplayDrafts: (agentId) => current.controller.getDisplayDrafts(agentId),
           onDisplayChange: (listener) => current.controller.onActivityDisplayChange(listener),
         }),
       });
@@ -970,10 +1076,24 @@ export function createWjPiSubagentsRuntimeActivator(
       refreshContextUsage(active, rawContext);
     });
 
+    // Pi 的 agent 循环只为 text/thinking/toolcall 增量发出 message_update；
+    // start/done/error 分别以独立 message_start / message_end 事件到达。三个
+    // 事件都必须喂给跟踪器：message_start 轮换 streamId，message_end 收束
+    // 当前流，缺失任何一个都会使后续消息复用同一草稿身份而被墓碑拦截。
+    api.on("message_start", (event) => {
+      observeOwnDisplayEvent(active, ownDisplayTracker.observe(event));
+    });
+
+    api.on("message_update", (event) => {
+      observeOwnDisplayEvent(active, ownDisplayTracker.observe(event));
+    });
+
     api.on("message_end", (event, rawContext) => {
       const current = active;
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
-      observeOwnActivity(current, event, normalizeOwnActivity);
+      // 先收束当前流，再让权威条目携带同一实时流身份，使顶层可以原地替换。
+      observeOwnDisplayEvent(current, ownDisplayTracker.observe(event));
+      observeOwnActivity(current, event, normalizeOwnActivity, ownDisplayTracker.latestStreamId);
       current.replyCoordinator?.observeAssistantMessageEnd(event);
       refreshContextUsage(current, rawContext);
     });
@@ -1345,6 +1465,13 @@ export function createWjPiSubagentsRuntimeActivator(
             void state.upstream?.channel.publishActivity({
               agent_id: delivery.agent_id,
               entry: delivery.entry,
+            }).catch(() => {});
+          },
+          // 实时显示事实同样逐层 fire-and-forget 上行；只有顶层维护草稿。
+          publishUpstreamDisplayActivity: (delivery) => {
+            void state.upstream?.channel.publishDisplayActivity({
+              agent_id: delivery.agent_id,
+              event: delivery.event,
             }).catch(() => {});
           },
         }),

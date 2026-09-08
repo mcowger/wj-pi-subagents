@@ -38,11 +38,20 @@ import {
 import { randomUUID } from "node:crypto";
 import { AgentActivityCache } from "./agent-activity-cache.ts";
 import {
+  AgentDisplayDraftRegistry,
+  type AgentDisplayDraftView,
+} from "./agent-display-drafts.ts";
+import {
+  parseAgentActivityDisplayEvent,
   sanitizeSafeActivityText,
+  type AgentDisplayStreamUpdate,
   type SafeAgentActivityDisplayEvent,
   type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
-import type { SupervisorActivityDelivery } from "./supervisor-channel.ts";
+import type {
+  SupervisorActivityDelivery,
+  SupervisorDisplayDelivery,
+} from "./supervisor-channel.ts";
 
 import {
   WAIT_AGENT_DEFAULT_TIMEOUT_MS,
@@ -128,6 +137,11 @@ export interface AgentControllerOptions {
    * 根会话不提供，活动流终止于本地缓存。
    */
   readonly publishUpstreamActivity?: (delivery: SupervisorActivityDelivery) => void;
+  /**
+   * 子模式运行时提供的上游实时显示流转发端口；fire-and-forget。根会话不
+   * 提供，显示草稿终止于本地登记表。
+   */
+  readonly publishUpstreamDisplayActivity?: (delivery: SupervisorDisplayDelivery) => void;
 }
 
 interface ManagedAgentEntry {
@@ -224,14 +238,15 @@ export class AgentController {
   private readonly replyNotificationsHandledByInbox: boolean;
   private readonly authority: TreeAuthorityPort | undefined;
   private readonly publishUpstreamActivity: AgentControllerOptions["publishUpstreamActivity"];
+  private readonly publishUpstreamDisplayActivity: AgentControllerOptions["publishUpstreamDisplayActivity"];
   private readonly activityCache = new AgentActivityCache();
+  /**
+   * 顶层实时显示草稿登记表：即使详情未打开也按代理持续组装连续前缀。
+   * 中间运行时只逐层转发显示事实，不缓存草稿。
+   */
+  private readonly displayDrafts = new AgentDisplayDraftRegistry();
   /** 本控制器运行实例身份：跨进程重启或 reload 后不与旧条目串流。 */
   private readonly activityIncarnationId = randomUUID();
-  /** 短暂逐 token 显示事件只通知已打开查看器，不缓存、不上行。 */
-  private readonly activityDisplayListeners = new Set<(
-    agentId: string,
-    event: SafeAgentActivityDisplayEvent,
-  ) => void>();
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
@@ -269,6 +284,7 @@ export class AgentController {
     this.replyNotificationsHandledByInbox = options.replyNotificationsHandledByInbox === true;
     this.authority = options.authority;
     this.publishUpstreamActivity = options.publishUpstreamActivity;
+    this.publishUpstreamDisplayActivity = options.publishUpstreamDisplayActivity;
     if (!isValidWaitAgentTimeout(this.waitTimeoutMs)) throw new TypeError("默认等待期限无效");
     this.unsubscribeTreeChange = this.tree.onChange(() => this.resolveAllReadyWaiters());
   }
@@ -797,10 +813,14 @@ export class AgentController {
    *
    * 工具开始与结束是同一条目的状态事实：条目身份由运行实例身份与工具
    * 活动 ID 确定性派生，两者在缓存、回放与去重中聚合为同一原子条目；
-   * assistant 消息仍是每条独立身份的原子条目。
+   * assistant 消息仍是每条独立身份的原子条目，且可携带与实时显示流的
+   * 精确关联身份（displayStreamId），供顶层原地替换对应草稿。
    */
-  recordOwnActivity(event: SafeAgentActivityEvent): boolean {
+  recordOwnActivity(event: SafeAgentActivityEvent, displayStreamId?: string): boolean {
     if (this.actor.kind !== "agent") return false;
+    const body = event.type === "message" && displayStreamId !== undefined
+      ? Object.freeze({ ...event, streamId: displayStreamId })
+      : event;
     const entryId = event.type === "tool_execution_start" || event.type === "tool_execution_end"
       ? deriveNamespaceUuid(TOOL_ACTIVITY_ENTRY_NAMESPACE, `${this.activityIncarnationId}:${event.toolCallId}`)
       : randomUUID();
@@ -809,7 +829,7 @@ export class AgentController {
       agent_id: this.actor.agent_id,
       incarnation_id: this.activityIncarnationId,
       entry_id: entryId,
-      body: event,
+      body,
     });
     const parsed = parseCanonicalAgentActivityEntry(candidate);
     if (parsed.kind !== "entry") return false;
@@ -817,6 +837,31 @@ export class AgentController {
       this.publishUpstreamActivity?.(Object.freeze({ agent_id: this.actor.agent_id, entry: parsed.entry }));
     } catch {
       // 上行转发失败静默缺失，不改变节点生命周期。
+    }
+    return true;
+  }
+
+  /**
+   * 子模式运行时把自身产生的实时显示事实沿上游端口逐层转发；fire-and-forget，
+   * 失败静默缺失且不改变节点生命周期。产生端更新在这里登记完整流身份：
+   * agentId 取当前代理，incarnationId 取本运行实例身份，使 delta 与 complete
+   * 携带同一身份，且与权威消息的关联身份一致。
+   */
+  recordOwnDisplayEvent(update: AgentDisplayStreamUpdate): boolean {
+    if (this.actor.kind !== "agent") return false;
+    const candidate = Object.freeze({
+      ...update,
+      agentId: this.actor.agent_id,
+      incarnationId: this.activityIncarnationId,
+    });
+    const parsed = parseAgentActivityDisplayEvent(candidate);
+    if (parsed.kind !== "event") return false;
+    try {
+      this.publishUpstreamDisplayActivity?.(
+        Object.freeze({ agent_id: this.actor.agent_id, event: parsed.event }),
+      );
+    } catch {
+      // 上行转发失败静默缺失；实时预览最终以权威完整消息为准。
     }
     return true;
   }
@@ -839,14 +884,22 @@ export class AgentController {
   }
 
   /**
-   * 注册短暂显示事件观察者。该通道没有 replay、修订号或持久化，故不会把
-   * token delta 混入 AgentActivityCache。
+   * 该代理的实时草稿快照（从 sequence 1 开始的连续前缀）。草稿只存在于
+   * 顶层登记表，不进入回放、修订号或持久历史。
+   */
+  getDisplayDrafts(agentId: unknown): readonly AgentDisplayDraftView[] {
+    if (!isCanonicalUuid(agentId)) return Object.freeze([]);
+    return this.displayDrafts.drafts(agentId);
+  }
+
+  /**
+   * 注册实时显示草稿变更观察者。该通道没有 replay、修订号或持久化；观察者
+   * 收到通知后应重新拉取对应代理的草稿快照。
    */
   onActivityDisplayChange(
-    listener: (agentId: string, event: SafeAgentActivityDisplayEvent) => void,
+    listener: (agentId: string) => void,
   ): () => void {
-    this.activityDisplayListeners.add(listener);
-    return () => this.activityDisplayListeners.delete(listener);
+    return this.displayDrafts.onChange(listener);
   }
 
   async getAgentTemplates(): Promise<ControlResult<readonly AgentTemplateListItem[]>> {
@@ -1072,13 +1125,21 @@ export class AgentController {
       this.recordActivity(event.agent_id ?? agentId, event.entry);
     }
     if (event.kind === "activity_display" && agentId !== undefined) {
-      for (const listener of this.activityDisplayListeners) {
-        try {
-          listener(agentId, event.event);
-        } catch {
-          // 显示观察者异常不得影响控制器、缓存或其他观察者。
-        }
-      }
+      this.handleDisplayEvent(event.agent_id ?? agentId, event.event);
+    }
+    // 实时草稿只服务显示层：代理进入 idle、failed 或 terminated 时清除该代理
+    // 仍未被权威消息替换的草稿。收束不改变生命周期或缓存行为；之后同一运行
+    // 实例迟到的合法权威消息仍可写入历史。
+    if (event.kind === "lifecycle" && this.actor.kind === "root" && lifecycleAgentId !== undefined) {
+      const settledType = event.event.type;
+      if (
+        settledType === "agent_settled"
+        || settledType === "runtime_failed"
+        || settledType === "resources_confirmed"
+      ) this.displayDrafts.settleAgent(lifecycleAgentId);
+    }
+    if (event.kind === "fault" && this.actor.kind === "root" && agentId !== undefined) {
+      this.displayDrafts.settleAgent(agentId);
     }
     // activity 阶段属于安全树快照；工具正文、名称和参数仍只留在监督器本地。
     const lifecycleApplied = directLifecycleAgentId !== undefined
@@ -1127,6 +1188,23 @@ export class AgentController {
     this.resolveAllReadyWaiters();
   }
 
+  /**
+   * 实时显示事实的处置：中间运行时只逐层 fire-and-forget 转发，不缓存草稿；
+   * 顶层应用到登记表，即使详情未打开也持续组装按代理隔离的连续前缀。草稿
+   * 不进入持久历史、条目计数或父模型上下文。
+   */
+  private handleDisplayEvent(agentId: string, event: SafeAgentActivityDisplayEvent): void {
+    if (this.actor.kind === "agent") {
+      try {
+        this.publishUpstreamDisplayActivity?.(Object.freeze({ agent_id: agentId, event }));
+      } catch {
+        // 上行转发失败静默缺失，不改变节点生命周期。
+      }
+      return;
+    }
+    this.displayDrafts.applyEvent(agentId, event);
+  }
+
   private recordActivity(agentId: string, entry: CanonicalAgentActivityEntry): boolean {
     // 中间运行时只逐层尽力转发，不保存历史副本；只有顶层运行时缓存回放。
     if (this.actor.kind === "agent") {
@@ -1139,7 +1217,12 @@ export class AgentController {
     }
     const revision = this.activityCache.revision(agentId);
     this.activityCache.append(agentId, entry);
-    return this.activityCache.revision(agentId) !== revision;
+    const changed = this.activityCache.revision(agentId) !== revision;
+    if (changed && entry.body.type === "message" && typeof entry.body.streamId === "string") {
+      // 权威完整消息携带与实时流精确关联的身份：原地替换并清除对应草稿。
+      this.displayDrafts.replaceDraft(agentId, entry.incarnation_id, entry.body.streamId);
+    }
+    return changed;
   }
 
   /**
