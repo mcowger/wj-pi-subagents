@@ -18,6 +18,7 @@ import {
 import type { AgentLifecycleState } from "../src/agent-snapshot-codec.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440002";
+const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
 const VIEWPORT = 3;
 
 function viewerAgent(state: AgentLifecycleState = "working") {
@@ -52,11 +53,12 @@ function toolStart(
   toolCallId: string,
   toolName: string,
   origin: SafeToolOrigin = "unknown",
+  incarnationId: string = INCARNATION_ID,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
-    incarnation_id: randomUUID(),
+    incarnation_id: incarnationId,
     entry_id: randomUUID(),
     body: Object.freeze({
       type: "tool_execution_start",
@@ -72,11 +74,12 @@ function toolEnd(
   toolName: string,
   isError: boolean,
   origin: SafeToolOrigin = "unknown",
+  incarnationId: string = INCARNATION_ID,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
-    incarnation_id: randomUUID(),
+    incarnation_id: incarnationId,
     entry_id: randomUUID(),
     body: Object.freeze({
       type: "tool_execution_end",
@@ -293,6 +296,49 @@ test("非终态生命周期不收束运行中工具，收束只发生在 idle/fa
     assert.match(body, /▶ read_file/u, state);
     assert.doesNotMatch(body, /result unavailable|terminated before result/u, state);
   }
+});
+
+test("生命周期变化立即失效投影：working 期间进入 idle 即收束运行中工具", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent("working"), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /▶ read_file/u);
+
+  // 不需要任何新事件：进入 idle 后运行中工具立即收束为警告。
+  assert.equal(viewer.updateLifecycle("idle"), "changed");
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /result unavailable/u);
+});
+
+test("不同运行实例的同名工具活动不互相回填或合并", () => {
+  const otherIncarnation = "2c3b4d5e-6f70-4a81-9b2c-3d4e5f6a7b8c";
+  const viewer = new AgentActivityViewerModel(viewerAgent("terminated"), [
+    toolStart("t1", "read_file"),
+  ], { viewport_height: 20 });
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /terminated before result/u);
+
+  // 另一运行实例的同 ID 结束事实身份不匹配：既不回填也不串流。
+  viewer.syncFrom([toolEnd("t1", "read_file", false, "unknown", otherIncarnation)]);
+  const body = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(body, /terminated before result/u);
+  assert.doesNotMatch(body, /✓ read_file/u);
+  assert.doesNotMatch(body, /▶ read_file/u);
+});
+
+test("工具取消按普通失败显示", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "bash"),
+    toolEnd("t1", "bash", true),
+  ], { viewport_height: 20 });
+
+  const body = viewer.render(160).slice(1, -1).join("\n");
+  assert.match(body, /× bash/u);
+  const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
+  assert.match(surface, /<fg:error>[^]*× bash/u);
 });
 
 test("生命周期收束不可逆：回看与重放不会把收束条目退回运行中", () => {

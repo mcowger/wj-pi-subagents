@@ -360,3 +360,44 @@ test("中间层 recordOwnActivity 生成规范身份并保持正文不变", asyn
   assert.match(replay[0]?.incarnation_id ?? "", /^[0-9a-f-]{36}$/u);
   assert.match(replay[0]?.entry_id ?? "", /^[0-9a-f-]{36}$/u);
 });
+
+test("工具开始与结束事实确定性共享同一条目身份", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: new FakeSupervisor(GRANDCHILD_ID),
+    publishUpstreamActivity: (delivery) => rootSupervisor.emitActivityDelivery(delivery),
+  });
+  const startBody: SafeAgentActivityEvent = Object.freeze({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "pi_native",
+  });
+  const endBody: SafeAgentActivityEvent = Object.freeze({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "pi_native",
+    isError: false,
+  });
+  assert.equal(child.recordOwnActivity(startBody), true);
+  assert.equal(child.recordOwnActivity(endBody), true);
+
+  const replay = root.getActivityReplay(AGENT_ID);
+  assert.equal(replay.length, 2);
+  // 同一条目的状态事实：条目身份与运行实例身份在开始与结束间保持一致。
+  assert.equal(replay[0]?.entry_id, replay[1]?.entry_id);
+  assert.equal(replay[0]?.incarnation_id, replay[1]?.incarnation_id);
+
+  // 重复提交同一事实仍派生同一条目身份，下游可按条目身份幂等聚合。
+  assert.equal(child.recordOwnActivity(endBody), true);
+  const replayAfterRepeat = root.getActivityReplay(AGENT_ID);
+  assert.equal(replayAfterRepeat[2]?.entry_id, replay[0]?.entry_id);
+});

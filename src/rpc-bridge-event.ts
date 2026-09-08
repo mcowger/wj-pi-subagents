@@ -21,26 +21,10 @@ export type SafeAgentActivityContentBlock =
  */
 export type SafeToolOrigin = "pi_native" | "plugin" | "unknown";
 
-const SAFE_TOOL_ORIGINS: readonly SafeToolOrigin[] = Object.freeze([
-  "pi_native",
-  "plugin",
-  "unknown",
-]);
-
-/**
- * Pi 原生工具名闭集。只有来源验证确认当前会话注册实现仍是 Pi 内置实现时，
- * 同名工具才携带 pi_native 身份；同名覆盖后同名事件走安全兜底。
- */
-export const PI_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set([
-  "bash",
-  "edit",
-  "find",
-  "grep",
-  "ls",
-  "powershell",
-  "read",
-  "write",
-]);
+/** 来源身份闭集谓词；wire 校验与产生端判定共用同一形状。 */
+export function isSafeToolOrigin(value: unknown): value is SafeToolOrigin {
+  return value === "pi_native" || value === "plugin" || value === "unknown";
+}
 
 /** 加宽后的子代理会话活动事件闭集；监督通道活动流帧承载同一闭集。 */
 export type SafeAgentActivityEvent =
@@ -289,15 +273,14 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       if (!hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin"])) {
         return INVALID_ACTIVITY_EVENT;
       }
-      const origin = value.origin;
-      if (!SAFE_TOOL_ORIGINS.includes(origin as SafeToolOrigin)) return INVALID_ACTIVITY_EVENT;
+      if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
           type: "tool_execution_start" as const,
           toolCallId: value.toolCallId,
           toolName: value.toolName,
-          origin: origin as SafeToolOrigin,
+          origin: value.origin,
         }),
       });
     }
@@ -308,15 +291,14 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
         typeof value.isError !== "boolean"
         || !hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin", "isError"])
       ) return INVALID_ACTIVITY_EVENT;
-      const origin = value.origin;
-      if (!SAFE_TOOL_ORIGINS.includes(origin as SafeToolOrigin)) return INVALID_ACTIVITY_EVENT;
+      if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
           type: "tool_execution_end" as const,
           toolCallId: value.toolCallId,
           toolName: value.toolName,
-          origin: origin as SafeToolOrigin,
+          origin: value.origin,
           isError: value.isError,
         }),
       });
@@ -421,7 +403,7 @@ export function normalizeOwnToolActivityEvent(
   origin: SafeToolOrigin,
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
-  if (!SAFE_TOOL_ORIGINS.includes(origin)) return INVALID_ACTIVITY_EVENT;
+  if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
   if (event.type === "tool_execution_start") {
     if (
       !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)

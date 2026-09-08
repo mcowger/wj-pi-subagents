@@ -30,6 +30,8 @@ import {
 } from "./rpc-supervisor.ts";
 import {
   CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  TOOL_ACTIVITY_ENTRY_NAMESPACE,
+  deriveNamespaceUuid,
   parseCanonicalAgentActivityEntry,
   type CanonicalAgentActivityEntry,
 } from "./canonical-activity.ts";
@@ -789,14 +791,21 @@ export class AgentController {
   /**
    * 子模式运行时把当前 Pi 节点自身的完整活动封装为规范条目并沿上游端口
    * 转发；中间运行时不保存历史。根没有可上行的代理身份，返回 false。
+   *
+   * 工具开始与结束是同一条目的状态事实：条目身份由运行实例身份与工具
+   * 活动 ID 确定性派生，两者在缓存、回放与去重中聚合为同一原子条目；
+   * assistant 消息仍是每条独立身份的原子条目。
    */
   recordOwnActivity(event: SafeAgentActivityEvent): boolean {
     if (this.actor.kind !== "agent") return false;
+    const entryId = event.type === "tool_execution_start" || event.type === "tool_execution_end"
+      ? deriveNamespaceUuid(TOOL_ACTIVITY_ENTRY_NAMESPACE, `${this.activityIncarnationId}:${event.toolCallId}`)
+      : randomUUID();
     const candidate: CanonicalAgentActivityEntry = Object.freeze({
       contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
       agent_id: this.actor.agent_id,
       incarnation_id: this.activityIncarnationId,
-      entry_id: randomUUID(),
+      entry_id: entryId,
       body: event,
     });
     const parsed = parseCanonicalAgentActivityEntry(candidate);

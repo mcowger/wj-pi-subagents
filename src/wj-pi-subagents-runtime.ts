@@ -29,7 +29,6 @@ import type {
 import {
   normalizeOwnToolActivityEvent,
   normalizeRpcBridgeEvent,
-  PI_NATIVE_TOOL_NAMES,
   type SafeAgentActivityEvent,
   type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
@@ -609,6 +608,21 @@ function defaultSelfExtensionPath(): string {
     throw new Error("子代理扩展入口不可用");
   }
 }
+
+/**
+ * Pi 原生工具名闭集。只有来源验证确认当前会话注册实现仍是 Pi 内置实现时，
+ * 同名工具才携带 pi_native 身份；同名覆盖后同名事件走安全兜底。
+ */
+export const PI_NATIVE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "bash",
+  "edit",
+  "find",
+  "grep",
+  "ls",
+  "powershell",
+  "read",
+  "write",
+]);
 
 /**
  * 来源验证：按当前会话注册表判定工具实现来源。只有注册来源确认是 Pi 内置

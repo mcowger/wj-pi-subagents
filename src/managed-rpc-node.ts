@@ -7,6 +7,7 @@ import type { AgentSnapshot } from "./tree-controller.ts";
 import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
 import {
   ACTIVITY_MAX_TEXT_BYTES,
+  isSafeToolOrigin,
   parseAgentActivityDisplayEvent,
 } from "./rpc-bridge-event.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
@@ -1104,10 +1105,8 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
     ? ["type", "toolCallId", "toolName", "origin"]
     : ["type", "toolCallId", "toolName", "origin", "isError"];
   if (!Object.keys(value).every((key) => allowed.includes(key))) return false;
-  return value.type === "tool_execution_start"
-    ? value.origin === "pi_native" || value.origin === "plugin" || value.origin === "unknown"
-    : (value.origin === "pi_native" || value.origin === "plugin" || value.origin === "unknown")
-      && typeof value.isError === "boolean";
+  if (!isSafeToolOrigin(value.origin)) return false;
+  return value.type === "tool_execution_start" || typeof value.isError === "boolean";
 }
 
 /**

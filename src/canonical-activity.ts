@@ -2,6 +2,7 @@ import {
   parseAgentActivityEvent,
   type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
+import { createHash } from "node:crypto";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
 /**
@@ -9,6 +10,28 @@ import { isCanonicalUuid } from "./tree-controller.ts";
  * 旧版本条目不得与当前运行实例混用，接收端按协议故障处理。
  */
 export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/2";
+
+/**
+ * 工具活动条目身份的派生命名空间。工具开始与结束是同一条目的状态事实，
+ * 产生端用固定命名空间从运行实例身份与工具活动 ID 确定性派生同一条目
+ * 身份，使两者在缓存、回放与去重中聚合为同一原子条目。
+ */
+export const TOOL_ACTIVITY_ENTRY_NAMESPACE = "9f6d2c14-8a47-4b8e-9d31-2c5a7f0b4e68";
+
+/**
+ * RFC 4122 命名空间 UUIDv5 派生：同名输入产生稳定一致的规范 UUID，用于
+ * 把同一条目的状态事实聚合到相同条目身份。
+ */
+export function deriveNamespaceUuid(namespace: string, name: string): string {
+  const hash = createHash("sha1")
+    .update(Buffer.from(namespace.replace(/-/gu, ""), "hex"))
+    .update(name, "utf8")
+    .digest();
+  hash[6] = (hash[6]! & 0x0f) | 0x50;
+  hash[8] = (hash[8]! & 0x3f) | 0x80;
+  const hex = hash.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
 /** 规范活动条目的原子正文闭集：assistant 消息与工具活动状态事实。 */
 export type CanonicalActivityBody = SafeAgentActivityEvent;

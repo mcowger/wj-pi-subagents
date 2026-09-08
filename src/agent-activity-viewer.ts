@@ -94,7 +94,14 @@ type ToolRunState =
 
 interface ToolDisplayEntry {
   readonly kind: "tool";
+  /** 运行实例身份；与工具活动 ID、执行代次共同承担回填匹配职责。 */
+  readonly incarnationId: string;
   readonly toolCallId: string;
+  /**
+   * 执行代次：同身份与活动 ID 的重新发起会递增；本状态机对“完成后迟到
+   * 开始”的忽略规则使每个已确立条目的代次固定为首次发起代。
+   */
+  readonly generation: number;
   toolName: string;
   origin: SafeToolOrigin;
   state: ToolRunState;
@@ -165,6 +172,8 @@ export class AgentActivityViewerModel {
   private scrollOffset = 0;
   private followEnabled = true;
   private projectionRevision = 0;
+  /** 最近一次进入的收束型生命周期事实；收束不可逆，不随 working 回退。 */
+  private settledLifecycle: "idle" | "failed" | "terminated" | undefined;
   private cachedProjection: {
     readonly width: number;
     readonly revision: number;
@@ -181,6 +190,9 @@ export class AgentActivityViewerModel {
     this.templateId = agent.template_id;
     this.name = agent.name;
     this.lifecycleState = agent.state;
+    if (agent.state === "idle" || agent.state === "failed" || agent.state === "terminated") {
+      this.settledLifecycle = agent.state;
+    }
     this.viewportHeight = validViewportHeight(options.viewport_height);
     this.syncFrom(replay);
     this.initializeSelection();
@@ -194,6 +206,11 @@ export class AgentActivityViewerModel {
   updateLifecycle(state: AgentLifecycleState): AgentActivityViewerUpdateOutcome {
     if (state === this.lifecycleState) return "ignored";
     this.lifecycleState = state;
+    // 收束事实一旦发生即不可逆；之后回到 working 也不解除已收束条目。
+    if (state === "idle" || state === "failed" || state === "terminated") {
+      this.settledLifecycle = state;
+    }
+    this.touchProjection();
     return "changed";
   }
 
@@ -503,33 +520,41 @@ export class AgentActivityViewerModel {
       }
 
       if (body.type === "tool_execution_start") {
-        // 重复开始与完成后迟到开始都幂等忽略；完成态不退回运行中。
-        if (toolIndex.has(body.toolCallId)) continue;
+        // 关联身份 = 运行实例 + 工具活动 ID + 执行代次：重复开始与完成后
+        // 迟到开始都幂等忽略；完成态不退回运行中。
+        const identity = `${entry.incarnation_id}:${body.toolCallId}`;
+        if (toolIndex.has(identity)) continue;
         const tool: ToolDisplayEntry = {
           kind: "tool",
+          incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
+          generation: 1,
           toolName: body.toolName,
           origin: body.origin,
           state: { phase: "running" },
         };
         entries.push(tool);
-        toolIndex.set(body.toolCallId, tool);
+        toolIndex.set(identity, tool);
         continue;
       }
 
-      // 结束事实自包含状态：开始缺失时仍建立完成条目。
-      const existing = toolIndex.get(body.toolCallId);
+      // 结束事实自包含状态：开始缺失时仍建立完成条目。只有运行实例、
+      // 活动 ID 与代次都匹配的结束事实才能更新或回填既有条目。
+      const identity = `${entry.incarnation_id}:${body.toolCallId}`;
+      const existing = toolIndex.get(identity);
       const state: ToolRunState = body.isError ? { phase: "failure" } : { phase: "success" };
       if (existing === undefined) {
         const tool: ToolDisplayEntry = {
           kind: "tool",
+          incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
+          generation: 1,
           toolName: body.toolName,
           origin: body.origin,
           state,
         };
         entries.push(tool);
-        toolIndex.set(body.toolCallId, tool);
+        toolIndex.set(identity, tool);
         continue;
       }
       // 匹配结束原地更新（幂等或回填），绝不退回运行中。
@@ -539,12 +564,18 @@ export class AgentActivityViewerModel {
     }
 
     if (toolIndex.size > 0) {
-      for (const tool of toolIndex.values()) {
-        if (tool.state.phase !== "running") continue;
-        // 代理进入终态时收束仍运行中的工具；后续匹配结束事实可回填。
-        if (this.lifecycleState === "idle") tool.state = { phase: "unavailable" };
-        else if (this.lifecycleState === "failed") tool.state = { phase: "failure" };
-        else if (this.lifecycleState === "terminated") tool.state = { phase: "terminated" };
+      const settlement = this.settledLifecycle
+        ?? (this.lifecycleState === "idle" || this.lifecycleState === "failed" || this.lifecycleState === "terminated"
+          ? this.lifecycleState
+          : undefined);
+      if (settlement !== undefined) {
+        for (const tool of toolIndex.values()) {
+          if (tool.state.phase !== "running") continue;
+          // 代理进入终态时收束仍运行中的工具；后续匹配结束事实可回填。
+          if (settlement === "idle") tool.state = { phase: "unavailable" };
+          else if (settlement === "failed") tool.state = { phase: "failure" };
+          else tool.state = { phase: "terminated" };
+        }
       }
     }
     for (const [streamId, live] of this.liveMessages) {

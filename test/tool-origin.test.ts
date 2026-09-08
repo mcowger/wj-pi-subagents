@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  PI_NATIVE_TOOL_NAMES,
-} from "../src/rpc-bridge-event.ts";
-import {
   classifyRegisteredToolOrigin,
   createToolOriginResolver,
+  PI_NATIVE_TOOL_NAMES,
 } from "../src/wj-pi-subagents-runtime.ts";
 
 const PLUGIN_PATH = "D:/code/wj-pi-subagents/index.ts";
