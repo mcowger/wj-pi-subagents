@@ -1109,13 +1109,11 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
 }
 
 /**
- * 父端防线按转义前 UTF-8 上限粗校验：转义后只会更长，因此防线放行的字符串
- * 未必满足转义后预算（由下游精确保留裁决），但被防线拒绝的字符串必然超限。
- * 空字符串无害，允许通过。
+ * 父端防线按类型粗校验活动正文字符串：精确帧预算由桥接长度前缀帧与监督
+ * 通道分块共同保证。空字符串无害，允许通过。
  */
 function isBoundedActivityText(value: unknown): value is string {
-  return typeof value === "string"
-    && new TextEncoder().encode(value).byteLength <= ACTIVITY_MAX_TEXT_BYTES;
+  return typeof value === "string";
 }
 
 function decodeBase64Bytes(value: string): Uint8Array | undefined {

@@ -28,6 +28,12 @@ import {
   type RpcSupervisorStartupResult,
   type RpcSupervisorTerminationResult,
 } from "./rpc-supervisor.ts";
+import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  parseCanonicalAgentActivityEntry,
+  type CanonicalAgentActivityEntry,
+} from "./canonical-activity.ts";
+import { randomUUID } from "node:crypto";
 import { AgentActivityCache } from "./agent-activity-cache.ts";
 import type {
   SafeAgentActivityDisplayEvent,
@@ -216,6 +222,8 @@ export class AgentController {
   private readonly authority: TreeAuthorityPort | undefined;
   private readonly publishUpstreamActivity: AgentControllerOptions["publishUpstreamActivity"];
   private readonly activityCache = new AgentActivityCache();
+  /** 本控制器运行实例身份：跨进程重启或 reload 后不与旧条目串流。 */
+  private readonly activityIncarnationId = randomUUID();
   /** 短暂逐 token 显示事件只通知已打开查看器，不缓存、不上行。 */
   private readonly activityDisplayListeners = new Set<(
     agentId: string,
@@ -779,16 +787,30 @@ export class AgentController {
   }
 
   /**
-   * 子模式运行时记录当前 Pi 节点自身的完整活动。根没有可上行的代理身份；
-   * 合法事件先进入本层缓存，再沿与后代活动相同的端口逐级转发。
+   * 子模式运行时把当前 Pi 节点自身的完整活动封装为规范条目并沿上游端口
+   * 转发；中间运行时不保存历史。根没有可上行的代理身份，返回 false。
    */
   recordOwnActivity(event: SafeAgentActivityEvent): boolean {
     if (this.actor.kind !== "agent") return false;
-    return this.recordActivity(this.actor.agent_id, event);
+    const candidate: CanonicalAgentActivityEntry = Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: this.actor.agent_id,
+      incarnation_id: this.activityIncarnationId,
+      entry_id: randomUUID(),
+      body: event,
+    });
+    const parsed = parseCanonicalAgentActivityEntry(candidate);
+    if (parsed.kind !== "entry") return false;
+    try {
+      this.publishUpstreamActivity?.(Object.freeze({ agent_id: this.actor.agent_id, entry: parsed.entry }));
+    } catch {
+      // 上行转发失败静默缺失，不改变节点生命周期。
+    }
+    return true;
   }
 
   /** 该代理的全量活动流回放（按到达序）；未知代理为空。 */
-  getActivityReplay(agentId: unknown): readonly SafeAgentActivityEvent[] {
+  getActivityReplay(agentId: unknown): readonly CanonicalAgentActivityEntry[] {
     if (!isCanonicalUuid(agentId)) return Object.freeze([]);
     return this.activityCache.replay(agentId);
   }
@@ -1035,7 +1057,7 @@ export class AgentController {
       this.tree.updateActivity(agentId, event.activity);
     }
     if (event.kind === "activity_stream" && agentId !== undefined) {
-      this.recordActivity(event.agent_id ?? agentId, event.event);
+      this.recordActivity(event.agent_id ?? agentId, event.entry);
     }
     if (event.kind === "activity_display" && agentId !== undefined) {
       for (const listener of this.activityDisplayListeners) {
@@ -1093,16 +1115,19 @@ export class AgentController {
     this.resolveAllReadyWaiters();
   }
 
-  private recordActivity(agentId: string, event: SafeAgentActivityEvent): boolean {
-    const revision = this.activityCache.revision(agentId);
-    this.activityCache.append(agentId, event);
-    if (this.activityCache.revision(agentId) === revision) return false;
-    try {
-      this.publishUpstreamActivity?.(Object.freeze({ agent_id: agentId, event }));
-    } catch {
-      // 上行转发失败不回滚本地缓存，也不改变节点生命周期。
+  private recordActivity(agentId: string, entry: CanonicalAgentActivityEntry): boolean {
+    // 中间运行时只逐层尽力转发，不保存历史副本；只有顶层运行时缓存回放。
+    if (this.actor.kind === "agent") {
+      try {
+        this.publishUpstreamActivity?.(Object.freeze({ agent_id: agentId, entry }));
+      } catch {
+        // 上行转发失败不回滚任何状态，也不改变节点生命周期；缺口静默。
+      }
+      return false;
     }
-    return true;
+    const revision = this.activityCache.revision(agentId);
+    this.activityCache.append(agentId, entry);
+    return this.activityCache.revision(agentId) !== revision;
   }
 
   private deliverTerminalNotification(agentId: string): boolean {

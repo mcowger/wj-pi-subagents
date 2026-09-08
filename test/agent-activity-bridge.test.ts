@@ -47,7 +47,7 @@ function startBridge(events: readonly unknown[]): BridgeSession {
   return { process: bridge, client, close };
 }
 
-test("真实桥接进程把加宽的活动事件闭集传给父端，并拒绝超限事件而不中断会话", async () => {
+test("真实桥接进程把加宽的活动事件闭集传给父端，大正文不再被拒绝", async () => {
   const oversized = { text: "x".repeat(64 * 1024) };
   const session = startBridge([
     { type: "agent_start" },
@@ -127,7 +127,8 @@ test("真实桥接进程把加宽的活动事件闭集传给父端，并拒绝�
         type: "message",
         content: [{ type: "thinking", thinking: "跳过的空块" }],
       },
-      // 空块消息被桥接忽略，不产生事件也不中断会话。
+      // 超过桥接帧预算的完整正文不经 RPC 桥路径发送（静默缺失）；
+      // 权威传输由监督通道分块上行。
       { type: "agent_settled" },
     ]);
   } finally {
@@ -356,27 +357,51 @@ test("关闭真实桥接进程前会收束已有 token 草稿", async () => {
   }
 });
 
-test("真实桥接进程在活动事件结构违约时按既有语义关闭传输", async () => {
-  const session = startBridge([
+test("真实桥接进程忽略禁用块与未知块，仅在结构违约时关闭传输", async () => {
+  // 禁用与未知块逐块忽略：不跨进程、也不中断会话。
+  const ignored = startBridge([
     {
       type: "message_end",
       message: {
         role: "assistant",
-        content: [{ type: "future_secret_block", secret: "不得静默丢弃" }],
+        content: [
+          { type: "future_secret_block", secret: "不得静默丢弃" },
+          { type: "image", source: "不得跨进程" },
+          { type: "text", text: "可见正文" },
+        ],
       },
     },
   ]);
+  try {
+    const received: unknown[] = [];
+    const unsubscribe = ignored.client.onEvent((event) => received.push(event));
+    await ignored.client.start(AbortSignal.timeout(2_000));
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    unsubscribe();
+    assert.deepEqual(received, [
+      { type: "message", content: [{ type: "text", text: "可见正文" }] },
+    ]);
+  } finally {
+    await ignored.close();
+  }
+
+  // 真正的结构违约（content 非数组）仍按既有语义关闭传输。
+  const faulted = startBridge([
+    {
+      type: "message_end",
+      message: { role: "assistant", content: "not-an-array" },
+    },
+  ]);
   const faults: unknown[] = [];
-  const unsubscribeFault = session.client.onTransportFault((fault) => faults.push(fault));
+  const unsubscribeFault = faulted.client.onTransportFault((fault) => faults.push(fault));
   try {
     const abort = AbortSignal.timeout(2_000);
-    // 违约事件先于 start 响应到达；传输按既有语义立即关闭并拒绝启动。
-    await session.client.start(abort).catch(() => {});
+    await faulted.client.start(abort).catch(() => {});
     await new Promise<void>((resolve) => setTimeout(resolve, 200));
     assert.deepEqual(faults, ["protocol_fault"]);
   } finally {
     unsubscribeFault();
-    await session.close();
+    await faulted.close();
   }
 });
 

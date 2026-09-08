@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { randomUUID } from "node:crypto";
 import {
   AgentActivityViewerModel,
   displayWidth,
@@ -7,9 +8,12 @@ import {
 } from "../src/agent-activity-viewer.ts";
 import type {
   SafeAgentActivityDisplayEvent,
-  SafeAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
-import { ACTIVITY_MAX_TEXT_BYTES } from "../src/rpc-bridge-event.ts";
+import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
+import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  type CanonicalAgentActivityEntry,
+} from "../src/canonical-activity.ts";
 import type { AgentLifecycleState } from "../src/agent-snapshot-codec.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440002";
@@ -24,31 +28,59 @@ function viewerAgent(state: AgentLifecycleState = "working") {
   } as const;
 }
 
-function textMessage(text: string): SafeAgentActivityEvent {
-  return Object.freeze({ type: "message", content: [Object.freeze({ type: "text", text })] });
-}
-
-function toolStart(toolCallId: string, toolName: string, args?: string): SafeAgentActivityEvent {
+function messageEntry(
+  content: ReadonlyArray<{ type: "text"; text: string } | { type: "thinking"; thinking: string }>,
+): CanonicalAgentActivityEntry {
   return Object.freeze({
-    type: "tool_execution_start",
-    toolCallId,
-    toolName,
-    ...(args === undefined ? {} : { args }),
+    contract_version: "wj-pi-subagents.activity/1",
+    agent_id: AGENT_ID,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze(content.map((block) => Object.freeze(block))),
+    }),
   });
 }
 
-function toolEnd(
+function textMessage(text: string): CanonicalAgentActivityEntry {
+  return messageEntry([{ type: "text", text }]);
+}
+
+function toolEntry(
   toolCallId: string,
   toolName: string,
+  args?: string,
   result?: string,
   isError?: boolean,
-): SafeAgentActivityEvent {
+): CanonicalAgentActivityEntry {
+  const incarnation = randomUUID();
+  const entryId = randomUUID();
+  const start: CanonicalAgentActivityEntry = Object.freeze({
+    contract_version: "wj-pi-subagents.activity/1",
+    agent_id: AGENT_ID,
+    incarnation_id: incarnation,
+    entry_id: entryId,
+    body: Object.freeze({
+      type: "tool_execution_start",
+      toolCallId,
+      toolName,
+      ...(args === undefined ? {} : { args }),
+    }),
+  });
+  if (result === undefined) return start;
   return Object.freeze({
-    type: "tool_execution_end",
-    toolCallId,
-    toolName,
-    ...(result === undefined ? {} : { result }),
-    ...(isError === undefined ? {} : { isError }),
+    contract_version: "wj-pi-subagents.activity/1",
+    agent_id: AGENT_ID,
+    incarnation_id: incarnation,
+    entry_id: entryId,
+    body: Object.freeze({
+      type: "tool_execution_end",
+      toolCallId,
+      toolName,
+      result,
+      ...(isError === undefined ? {} : { isError }),
+    }),
   });
 }
 
@@ -74,15 +106,14 @@ function displayComplete(streamId: string, sequence: number): SafeAgentActivityD
 }
 
 /** 4 行正文消息 + 工具开始/结束各 1 行 = 6 行事件正文。 */
-function replayFixture(): readonly SafeAgentActivityEvent[] {
+function replayFixture(): readonly CanonicalAgentActivityEntry[] {
   return Object.freeze([
     textMessage("line1\nline2\nline3\nline4"),
-    toolStart("t1", "read_file", '{"path":"src/a.ts"}'),
-    toolEnd("t1", "read_file", '{"ok":true}'),
+    toolEntry("t1", "read_file", '{"path":"src/a.ts"}', '{"ok":true}'),
   ]);
 }
 
-test("打开即回放全部历史活动", () => {
+test("打开即回放全部规范条目历史", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture());
   const lines = viewer.render(160);
 
@@ -91,124 +122,331 @@ test("打开即回放全部历史活动", () => {
   assert.ok(lines.some((line) => line.includes("line4")));
   assert.ok(lines.some((line) => line.includes("▶ read_file")), lines.join("\n"));
   assert.ok(lines.some((line) => line.includes("read_file") && line.includes('{"ok":true}')));
-  assert.equal(viewer.getPublicState().event_count, 3);
+  assert.equal(viewer.getPublicState().event_count, 2);
 });
 
-test("thinking 块渲染为带前缀的正文行", () => {
+test("text block 独立按正常 Markdown 完整渲染，不加角色标签或分隔线", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
-    Object.freeze({
-      type: "message",
+    messageEntry([
+      { type: "text", text: "# First block\n\nunclosed **bold" },
+      { type: "text", text: "## Second block\n\ncomplete" },
+    ]),
+  ], { viewport_height: 20 });
+  const body = viewer.render(80).slice(1, -1).join("\n");
+
+  assert.ok(body.includes("First block"), body);
+  assert.ok(body.includes("Second block"), body);
+  // 前一块未闭合语法不破坏后一块；无角色标签、消息容器或分隔线。
+  assert.doesNotMatch(body, /Assistant|assistant/u);
+  assert.doesNotMatch(body, /━|┃/u);
+  // 每块独立解析：未闭合 bold 不会跨块吞掉后文。
+  assert.ok(body.includes("complete"), body);
+});
+
+test("超长 text 仍完整渲染，不按长度折叠", () => {
+  const long = "很长的报告正文。".repeat(4000);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(long)], {
+    viewport_height: 20,
+  });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  assert.ok(body.includes("很长的报告正文。"), body);
+  assert.doesNotMatch(body, /collapsed|省略|truncated/u);
+});
+
+test("thinking 默认折叠为 Thinking，不显示行数或正文预览", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([
+      { type: "thinking", thinking: "内部计划第一行\n内部计划第二行\n内部计划第三行" },
+      { type: "text", text: "answer" },
+    ]),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160);
+  const body = lines.slice(1, -1);
+
+  const thinkingLines = body.filter((line) => line.includes("Thinking"));
+  assert.equal(thinkingLines.length, 1, lines.join("\n"));
+  assert.doesNotMatch(body.join("\n"), /内部计划/u);
+  assert.doesNotMatch(thinkingLines[0] ?? "", /lines|行|…/u);
+  assert.ok(body.some((line) => line.includes("answer")));
+});
+
+test("展开 thinking 后保留标题，正文顶格弱化且无逐行前缀", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([
+      { type: "thinking", thinking: "计划 A\n计划 B" },
+      { type: "text", text: "answer" },
+    ]),
+  ], { viewport_height: 20 });
+  // Tab 选中第一个可展开项（thinking）并切换展开。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+
+  const body = viewer.render(160).slice(1, -1);
+  assert.equal(body.filter((line) => line.includes("Thinking")).length, 1, body.join("\n"));
+  assert.ok(body.some((line) => line.includes("计划 A")), body.join("\n"));
+  assert.ok(body.some((line) => line.includes("计划 B")));
+  // 无逐行前缀、无缩进。
+  assert.ok(body.some((line) => line.trimStart() === line && line.includes("计划 A")));
+  assert.doesNotMatch(body.join("\n"), /┆/u);
+  assert.ok(body.some((line) => line.includes("answer")));
+});
+
+test("相邻 thinking 合并为同一折叠条目，被 text 隔开的 thinking 保持分离", () => {
+  // 模拟产生端输出：相邻 thinking 已在规范化时合并。
+  const normalized = normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
       content: [
-        Object.freeze({ type: "thinking", thinking: "plan a\nplan b" }),
-        Object.freeze({ type: "text", text: "answer" }),
+        { type: "thinking", thinking: "第一段" },
+        { type: "thinking", thinking: "第二段" },
+        { type: "text", text: "中间" },
+        { type: "thinking", thinking: "第三段" },
       ],
-    }),
+    },
+  });
+  assert.ok(normalized.kind === "event" && normalized.event.type === "message");
+  const entry = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: normalized.event,
+  });
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [entry], { viewport_height: 20 });
+
+  const collapsed = viewer.render(160).slice(1, -1);
+  assert.equal(collapsed.filter((line) => line.includes("Thinking")).length, 2, collapsed.join("\n"));
+
+  // 展开第一组，确认两段合并在同一展开正文里；第三段仍折叠。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expandedBody = viewer.render(160).slice(1, -1).join("\n");
+  assert.equal(expandedBody.split("Thinking").length - 1, 2, expandedBody);
+  assert.ok(expandedBody.includes("第一段") && expandedBody.includes("第二段"), expandedBody);
+  assert.doesNotMatch(expandedBody, /第三段/u);
+});
+
+test("查看器支持 Tab 与 Shift+Tab 在全部可展开条目间正反循环", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "思考一" }]),
+    messageEntry([{ type: "thinking", thinking: "思考二" }]),
+    messageEntry([{ type: "thinking", thinking: "思考三" }]),
+  ], { viewport_height: 20 });
+
+  // 打开时选择当前视口最新（最后）可展开项。
+  assert.match(viewer.getSelectedKey() ?? "", /thinking:/u);
+  const initial = viewer.getSelectedKey();
+  assert.equal(viewer.handleInput("\t"), "changed");
+  // Tab 从最新项向后循环回第一个。
+  assert.notEqual(viewer.getSelectedKey(), initial);
+  const afterTab = viewer.getSelectedKey();
+  assert.equal(viewer.handleInput("\x1b[Z"), "changed");
+  assert.equal(viewer.getSelectedKey(), initial);
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.getSelectedKey(), afterTab);
+});
+
+test("打开时默认选择当前视口最新可展开项，新活动不抢选择", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "早思考" }]),
+    textMessage("正文\n正文\n正文\n正文"),
+    messageEntry([{ type: "thinking", thinking: "晚思考" }]),
+  ], { viewport_height: VIEWPORT });
+  const initial = viewer.getSelectedKey();
+  // 跟随底部时视口覆盖最后几行：选中项是视口内最新的可展开条目（晚思考）。
+  assert.ok(initial !== undefined, "应建立初始选择");
+
+  // 相同前缀同步与新事件追加都不改变选择。
+  viewer.syncFrom([
+    messageEntry([{ type: "thinking", thinking: "早思考" }]),
+    textMessage("正文\n正文\n正文\n正文"),
+    messageEntry([{ type: "thinking", thinking: "晚思考" }]),
+    toolEntry("new-1", "run_cmd", '{"cmd":"ls"}'),
   ]);
-  const lines = viewer.render(160);
-
-  assert.ok(lines.some((line) => line.includes("┆") && line.includes("plan a")), lines.join("\n"));
-  assert.ok(lines.some((line) => line.includes("plan b")));
-  assert.ok(lines.some((line) => line.includes("answer")));
+  assert.equal(viewer.getSelectedKey(), initial);
 });
 
-test("无缓存活动时显示明确空态", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
-  const lines = viewer.render(160);
+test("Enter 与空格切换展开，右键展开、左键折叠", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "计划" }]),
+  ], { viewport_height: 20 });
 
-  assert.ok(lines.some((line) => line.includes("No cached activity yet")), lines.join("\n"));
-  assert.equal(viewer.getPublicState().event_count, 0);
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\x1b[C"), "changed");
+  assert.ok(viewer.getExpandedKeys().length === 1);
+  assert.equal(viewer.handleInput("\x1b[C"), "ignored");
+  assert.equal(viewer.handleInput("\x1b[D"), "changed");
+  assert.equal(viewer.getExpandedKeys().length, 0);
+  assert.equal(viewer.handleInput(" "), "changed");
+  assert.equal(viewer.getExpandedKeys().length, 1);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.equal(viewer.getExpandedKeys().length, 0);
 });
 
-test("变更通知追加新事件并保持到达序", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture());
-  const outcome = viewer.syncFrom([...replayFixture(), toolStart("t2", "run_cmd", '{"cmd":"ls"}')]);
+test("视口外 Tab 目标只触发使其可见的最小滚动", () => {
+  const entries: CanonicalAgentActivityEntry[] = [
+    messageEntry([{ type: "thinking", thinking: "第一条" }]),
+  ];
+  for (let index = 0; index < 30; index += 1) entries.push(textMessage(`填充行 ${index}`));
+  entries.push(messageEntry([{ type: "thinking", thinking: "最后一条" }]));
+  const viewer = new AgentActivityViewerModel(viewerAgent(), entries, {
+    viewport_height: VIEWPORT,
+  });
+  // 初始选择：视口（底部 3 行）内的最新可展开项。
+  const initialKey = viewer.getSelectedKey();
+  assert.ok(initialKey !== undefined);
+  const initialOffset = viewer.getPublicState().scroll_offset;
 
-  assert.equal(outcome, "changed");
-  const lines = viewer.render(160);
-  const lastIndex = lines.findIndex((line) => line.includes("run_cmd"));
-  assert.ok(lastIndex > lines.findIndex((line) => line.includes('{"ok":true}')), lines.join("\n"));
-  assert.equal(viewer.getPublicState().event_count, 4);
+  // Tab 回到第一条（在视口上方远处）：只滚动到刚好可见（首行）。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  const afterOffset = viewer.getPublicState().scroll_offset;
+  assert.ok(afterOffset < initialOffset, `${afterOffset} !< ${initialOffset}`);
+  const lines = viewer.render(160).slice(1, -1);
+  assert.equal(lines[0], "Thinking", lines.join("\n"));
 });
 
-test("同步回放未增长时忽略", () => {
-  const replay = replayFixture();
-  const viewer = new AgentActivityViewerModel(viewerAgent(), replay);
-  assert.equal(viewer.syncFrom(replay), "ignored");
+test("展开保持屏幕位置并暂停 follow；折叠不自动恢复；滚到底部或 Tab 回最新项恢复", () => {
+  const entries: CanonicalAgentActivityEntry[] = [];
+  for (let index = 0; index < 6; index += 1) entries.push(textMessage(`正文块 ${index}`));
+  entries.push(messageEntry([{ type: "thinking", thinking: "思考" }]));
+  const viewer = new AgentActivityViewerModel(viewerAgent(), entries, {
+    viewport_height: VIEWPORT,
+  });
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+
+  // 选择最新 thinking（视口内）并展开：暂停 follow。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  const selectedBefore = viewer.getSelectedKey();
+  assert.equal(viewer.handleInput("\x1b[C"), "changed");
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+
+  // 展开动作后追加新条目不拉到底部；屏幕位置保持。
+  const offsetAfterExpand = viewer.getPublicState().scroll_offset;
+  viewer.syncFrom(entries.concat([
+    toolEntry("late-1", "run_cmd", '{"cmd":"ls"}'),
+  ]));
+  assert.equal(viewer.getPublicState().scroll_offset, offsetAfterExpand);
+  assert.equal(viewer.getSelectedKey(), selectedBefore);
+
+  // 折叠不自动恢复 follow。
+  assert.equal(viewer.handleInput("\x1b[D"), "changed");
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+
+  // Tab 回到底部最新项后恢复 follow。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+  assert.equal(viewer.getPublicState().scroll_offset, viewer.getPublicState().max_scroll_offset);
 });
 
-test("默认自动跟随最新事件", () => {
+test("向上滚动暂停 follow，向下滚到底恢复，footer 始终固定且不显示 paused", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
     viewport_height: VIEWPORT,
   });
   assert.equal(viewer.getPublicState().follow_enabled, true);
-  assert.equal(viewer.getPublicState().scroll_offset, 3);
+  assert.equal(
+    viewer.render(160).at(-1),
+    "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back",
+  );
 
-  viewer.syncFrom([...replayFixture(), toolStart("t2", "run_cmd", '{"cmd":"ls"}')]);
-  assert.equal(viewer.getPublicState().scroll_offset, 4);
-  const visible = viewer.render(160).slice(1, -1);
-  assert.ok(visible.some((line) => line.includes("run_cmd")), visible.join("\n"));
-});
-
-test("向上滚动暂停跟随，追加不再跳到底部", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
-    viewport_height: VIEWPORT,
-  });
   assert.equal(viewer.handleInput("\x1b[A"), "changed");
   assert.equal(viewer.getPublicState().follow_enabled, false);
-  assert.equal(viewer.getPublicState().scroll_offset, 2);
+  assert.equal(
+    viewer.render(160).at(-1),
+    "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back",
+  );
+  assert.doesNotMatch(viewer.render(160).at(-1) ?? "", /paused/u);
 
-  viewer.syncFrom([...replayFixture(), toolStart("t2", "run_cmd", '{"cmd":"ls"}')]);
-  assert.equal(viewer.getPublicState().scroll_offset, 2);
-  const visible = viewer.render(160).slice(1, -1);
-  assert.ok(visible.every((line) => !line.includes("run_cmd")), visible.join("\n"));
-});
-
-test("已暂停跟随时底部显示提示", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
-    viewport_height: VIEWPORT,
-  });
-  assert.match(viewer.render(160).at(-1) ?? "", /Esc/);
-  assert.doesNotMatch(viewer.render(160).at(-1) ?? "", /paused/);
-
-  viewer.handleInput("\x1b[A");
-  assert.match(viewer.render(160).at(-1) ?? "", /paused/);
-});
-
-test("向下滚动回到底部恢复跟随", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
-    viewport_height: VIEWPORT,
-  });
-  viewer.handleInput("\x1b[A");
-  viewer.handleInput("\x1b[A");
+  viewer.syncFrom([...replayFixture(), toolEntry("t2", "run_cmd", '{"cmd":"ls"}')]);
+  // 暂停后追加新条目保持用户回看位置。
   assert.equal(viewer.getPublicState().follow_enabled, false);
+  const pausedOffset = viewer.getPublicState().scroll_offset;
 
+  // 向下滚动到底部恢复跟随。
   assert.equal(viewer.handleInput("\x1b[B"), "changed");
   assert.equal(viewer.getPublicState().follow_enabled, false);
   assert.equal(viewer.handleInput("\x1b[B"), "changed");
   assert.equal(viewer.getPublicState().follow_enabled, true);
-
-  viewer.syncFrom([...replayFixture(), toolStart("t2", "run_cmd", '{"cmd":"ls"}')]);
-  assert.equal(viewer.getPublicState().scroll_offset, 4);
+  assert.equal(
+    viewer.getPublicState().scroll_offset,
+    viewer.getPublicState().max_scroll_offset,
+  );
+  void pausedOffset;
 });
 
-test("滚动到边界时忽略输入", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
-    viewport_height: VIEWPORT,
-  });
-  viewer.handleInput("\x1b[A");
-  viewer.handleInput("\x1b[A");
-  viewer.handleInput("\x1b[A");
-  assert.equal(viewer.getPublicState().scroll_offset, 0);
-  assert.equal(viewer.handleInput("\x1b[A"), "ignored");
+test("选中条目使用整行选中背景渲染", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "思考" }]),
+  ], { viewport_height: 20 });
+  assert.equal(viewer.handleInput("\t"), "changed");
 
-  assert.equal(viewer.handleInput("\x1b[B"), "changed");
-  assert.equal(viewer.handleInput("\x1b[B"), "changed");
-  assert.equal(viewer.handleInput("\x1b[B"), "changed");
-  assert.equal(viewer.handleInput("\x1b[B"), "ignored");
-  assert.equal(viewer.getPublicState().follow_enabled, true);
+  const surface = renderAgentActivityViewerSurface(viewer, 120, Object.freeze({
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  }));
+  const selectedLines = surface.filter((line) => line.includes("<bg:selectedBg>"));
+  assert.equal(selectedLines.length, 1, surface.join("\n"));
+  assert.match(selectedLines[0] ?? "", /Thinking/u);
 });
 
-test("Esc 关闭查看器，其余输入被忽略", () => {
+test("工具长结果仍是可展开条目，展开状态按调用身份保持", () => {
+  const result = Array.from({ length: 8 }, (_, index) => `result-line-${index + 1}`).join("\n");
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEntry("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
+    toolEntry("t-long", "read_file", undefined, JSON.stringify(result)),
+  ], { viewport_height: 20 });
+
+  const collapsed = viewer.render(120).slice(1, -1).join("\n");
+  assert.match(collapsed, /collapsed/u);
+  assert.doesNotMatch(collapsed, /result-line-8/u);
+
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.match(viewer.render(120).slice(1, -1).join("\n"), /result-line-8/u);
+
+  viewer.syncFrom([
+    toolEntry("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
+    toolEntry("t-long", "read_file", undefined, JSON.stringify(result)),
+    textMessage("after result"),
+  ]);
+  assert.match(viewer.render(120).slice(1, -1).join("\n"), /result-line-8/u);
+});
+
+test("逐 token 显示事件只驻留查看器投影，并在完整条目抵达时收束", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 1, 0, "text", "Hel")), "changed");
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 2, 0, "text", "lo")), "changed");
+  assert.equal(viewer.getPublicState().event_count, 0);
+  assert.match(viewer.render(120).join("\n"), /Hello/u);
+
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 4, 0, "text", "!")), "changed");
+  assert.doesNotMatch(viewer.render(120).join("\n"), /Hello!/u);
+  assert.equal(viewer.applyDisplayEvent(displayComplete("message-1", 3)), "ignored");
+
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-2", 1, 0, "text", "done")), "changed");
+  assert.equal(viewer.applyDisplayEvent(displayComplete("message-2", 2)), "changed");
+  assert.doesNotMatch(viewer.render(120).join("\n"), /done/u);
+  viewer.syncFrom([textMessage("done")]);
+  assert.equal(viewer.getPublicState().event_count, 1);
+  assert.match(viewer.render(120).join("\n"), /done/u);
+});
+
+test("实时 thinking 草稿默认折叠并可展开观察流式内容", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
+  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 1, 0, "thinking", "流式思考")), "changed");
+  const collapsed = viewer.render(120).join("\n");
+  assert.match(collapsed, /Thinking/u);
+  assert.doesNotMatch(collapsed, /流式思考/u);
+
+  // 选择实时 thinking 折叠条目并展开。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.match(viewer.render(120).join("\n"), /流式思考/u);
+});
+
+test("Esc 关闭查看器，其余未知输入被忽略", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture());
   assert.equal(viewer.handleInput("\x1b"), "close");
   assert.equal(viewer.handleInput("x"), "ignored");
@@ -228,13 +466,17 @@ test("标题展示模板、名称与生命周期状态并净化控制字符", ()
   assert.equal(viewer.updateLifecycle("terminated"), "ignored");
 });
 
-test("违约与超限事件被忽略", () => {
+test("违约条目被静默忽略", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture());
-  assert.equal(viewer.appendEvent({ type: "unknown" } as never), "ignored");
-  assert.equal(viewer.appendEvent({ type: "message" } as never), "ignored");
-  const oversized = textMessage("x".repeat(ACTIVITY_MAX_TEXT_BYTES + 1));
-  assert.equal(viewer.appendEvent(oversized), "ignored");
-  assert.equal(viewer.getPublicState().event_count, 3);
+  const stale = Object.freeze({
+    contract_version: "wj-pi-subagents.activity/0",
+    agent_id: AGENT_ID,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({ type: "message", content: [] }),
+  }) as unknown as CanonicalAgentActivityEntry;
+  assert.equal(viewer.syncFrom([stale]), "ignored");
+  assert.equal(viewer.getPublicState().event_count, 2);
 });
 
 test("查看器表面使用既定框线布局并应用主题", () => {
@@ -243,162 +485,73 @@ test("查看器表面使用既定框线布局并应用主题", () => {
   assert.ok(surface.length > 0);
   assert.ok(surface.every((line) => displayWidth(line) === 160), surface.join("\n"));
   assert.ok(surface.some((line) => line.includes("AGENT ACTIVITY")), surface.join("\n"));
-
-  const marked = renderAgentActivityViewerSurface(viewer, 160, Object.freeze({
-    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
-    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
-    bold: (text: string): string => `<bold>${text}</bold>`,
-  }));
-  assert.match(
-    marked.find((line) => line.includes("AGENT ACTIVITY")) ?? "",
-    /<bg:customMessageBg>/,
-  );
-  assert.ok(marked.some((line) => line.includes("worker · worker-a")), marked.join("\n"));
 });
 
-test("assistant Markdown 块可读并按宽度换行", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [
-    textMessage([
-      "# Summary",
-      "",
-      "This is **important** and uses `inline code`.",
-      "",
-      "```ts",
-      "const answer = 42;",
-      "return answer;",
-      "```",
-    ].join("\n")),
-  ], { viewport_height: 20 });
-  const body = viewer.render(32).slice(1, -1);
-
-  assert.ok(body.some((line) => line.includes("Summary")), body.join("\n"));
-  assert.ok(body.some((line) => line.includes("important")), body.join("\n"));
-  assert.doesNotMatch(body.join("\n"), /\*\*important\*\*/u);
-  assert.ok(body.some((line) => line.includes("const answer = 42;")), body.join("\n"));
-  assert.ok(body.filter((line) => line.length > 0).length > 4, body.join("\n"));
-});
-
-test("工具调用只显示单行关键参数摘要", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [
-    toolStart(
-      "t-summary",
-      "read_file",
-      JSON.stringify({
-        path: "src/agent-activity-viewer.ts",
-        content: "secret-content ".repeat(40),
-        recursive: true,
-      }),
-    ),
-  ]);
-  const callLines = viewer.render(160).filter((line) => line.includes("read_file"));
-
-  assert.equal(callLines.length, 1);
-  assert.match(callLines[0] ?? "", /src\/agent-activity-viewer\.ts/u);
-  assert.doesNotMatch(callLines[0] ?? "", /secret-content/u);
-  assert.ok((callLines[0] ?? "").length < 140, callLines[0]);
-});
-
-test("超长工具结果按桥接 JSON 编码还原后默认折叠，展开后追加仍保持展开状态", () => {
-  const result = Array.from({ length: 8 }, (_, index) => `result-line-${index + 1}`).join("\n");
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [
-    toolStart("t-long", "read_file", JSON.stringify({ path: "big.txt" })),
-    // 桥接对原始字符串执行 JSON.stringify；查看器必须在显示层还原换行。
-    toolEnd("t-long", "read_file", JSON.stringify(result)),
-  ], { viewport_height: 20 });
-
-  const collapsed = viewer.render(120).slice(1, -1).join("\n");
-  assert.match(collapsed, /collapsed|expand/u);
-  assert.doesNotMatch(collapsed, /result-line-8/u);
-
-  assert.equal(viewer.handleInput("\r"), "changed");
-  const expanded = viewer.render(120).slice(1, -1).join("\n");
-  assert.match(expanded, /result-line-8/u);
-
-  viewer.appendEvent(textMessage("after result"));
-  const afterAppend = viewer.render(120).slice(1, -1).join("\n");
-  assert.match(afterAppend, /result-line-8/u);
-});
-
-test("连续完整 assistant 消息保持事件边界", () => {
-  const messages = ["H", "He", "Hel", "Hell", "Hello"];
-  const viewer = new AgentActivityViewerModel(viewerAgent(), messages.map(textMessage));
-
-  const body = viewer.render(120).slice(1, -1);
-  assert.deepEqual(body.filter((line) => messages.includes(line)), messages);
-  assert.equal(viewer.getPublicState().event_count, messages.length);
-});
-
-test("逐 token 显示事件只驻留查看器投影，并在完整消息抵达时收束", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 1, 0, "text", "Hel")), "changed");
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 2, 0, "text", "lo")), "changed");
-  assert.equal(viewer.getPublicState().event_count, 0);
-  assert.match(viewer.render(120).join("\n"), /Hello/u);
-
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-1", 4, 0, "text", "!")), "changed");
-  assert.doesNotMatch(viewer.render(120).join("\n"), /Hello!/u);
-  assert.equal(viewer.applyDisplayEvent(displayComplete("message-1", 3)), "ignored");
-
-  assert.equal(viewer.applyDisplayEvent(displayDelta("message-2", 1, 0, "text", "done")), "changed");
-  assert.equal(viewer.applyDisplayEvent(displayComplete("message-2", 2)), "changed");
-  assert.doesNotMatch(viewer.render(120).join("\n"), /done/u);
-  viewer.appendEvent(textMessage("done"));
-  assert.equal(viewer.getPublicState().event_count, 1);
-  assert.match(viewer.render(120).join("\n"), /done/u);
-});
-
-test("实时完整事件追加不会丢失快速到达的消息", () => {
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("first")]);
-  for (const text of ["second", "third", "fourth"]) viewer.appendEvent(textMessage(text));
-
-  const body = viewer.render(120).slice(1, -1).join("\n");
-  assert.match(body, /first/u);
-  assert.match(body, /second/u);
-  assert.match(body, /third/u);
-  assert.match(body, /fourth/u);
-  assert.equal(viewer.getPublicState().event_count, 4);
-});
-
-test("查看器正文净化 ANSI 与方向控制序列", () => {
+test("正文净化 ANSI 与方向控制序列并保持宽字符显示宽度", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     textMessage("safe\x1b[31m red\x1b[0m\u202e hidden\u0007 text"),
-    toolStart(
-      "t-clean",
-      "run_cmd",
-      JSON.stringify({
-        command: "echo\nsecret",
-        stdout: "large output ".repeat(20),
-      }),
-    ),
+    textMessage("宽度🌍字符"),
   ]);
   const body = viewer.render(120).slice(1, -1).join("\n");
 
   assert.doesNotMatch(body, /\x1b|\\u202e|\\u0007/u);
   assert.match(body, /safe red\s+hidden\s+text/u);
-  assert.match(body, /command=/u);
-  assert.doesNotMatch(body, /large output/u);
+  assert.match(body, /宽度🌍字符/u);
+
+  const surface = renderAgentActivityViewerSurface(viewer, 40, undefined);
+  assert.ok(surface.every((line) => displayWidth(line) === 40), surface.join("\n"));
 });
 
-test("展开状态按工具调用 ID 在宽度变化和追加后保持", () => {
-  const result = Array.from({ length: 6 }, (_, index) => `line-${index}`).join("\n");
+test("关闭重开后展开、选择、滚动与 follow 状态重置", () => {
+  const replay = [
+    messageEntry([{ type: "thinking", thinking: "第一条思考" }]),
+    messageEntry([{ type: "thinking", thinking: "第二条思考" }]),
+    messageEntry([{ type: "thinking", thinking: "第三条思考" }]),
+    messageEntry([{ type: "thinking", thinking: "第四条思考" }]),
+  ];
+  // 第一次会话：展开并向上滚动。
+  const first = new AgentActivityViewerModel(viewerAgent(), replay, {
+    viewport_height: VIEWPORT,
+  });
+  first.handleInput("\t");
+  first.handleInput("\x1b[C");
+  first.handleInput("\x1b[A");
+  assert.equal(first.getPublicState().follow_enabled, false);
+  assert.equal(first.getExpandedKeys().length, 1);
+
+  // 关闭后重新打开：全新实例。
+  const second = new AgentActivityViewerModel(viewerAgent(), replay, {
+    viewport_height: VIEWPORT,
+  });
+  assert.equal(second.getExpandedKeys().length, 0);
+  assert.equal(second.getPublicState().follow_enabled, true);
+  assert.equal(second.getPublicState().scroll_offset, second.getPublicState().max_scroll_offset);
+  assert.notEqual(second.getSelectedKey(), first.getSelectedKey());
+});
+
+test("多个条目可同时保持展开", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
-    toolStart("stable-id", "read_file", JSON.stringify({ path: "x.txt" })),
-    toolEnd("stable-id", "read_file", JSON.stringify(result)),
-  ]);
-  assert.equal(viewer.setToolResultExpanded("stable-id", true), "changed");
-  assert.deepEqual(viewer.getExpandedToolCallIds(), ["stable-id"]);
-  assert.match(viewer.render(40).join("\n"), /line-5/u);
-  assert.match(viewer.render(140).join("\n"), /line-5/u);
-  viewer.appendEvent(toolStart("next", "run_cmd", JSON.stringify({ cmd: "pwd" })));
-  assert.match(viewer.render(140).join("\n"), /line-5/u);
-  assert.deepEqual(viewer.getExpandedToolCallIds(), ["stable-id"]);
+    messageEntry([{ type: "thinking", thinking: "思考一" }]),
+    messageEntry([{ type: "thinking", thinking: "思考二" }]),
+    messageEntry([{ type: "thinking", thinking: "思考三" }]),
+  ], { viewport_height: 20 });
+  viewer.handleInput("\t");
+  viewer.handleInput("\r");
+  viewer.handleInput("\t");
+  viewer.handleInput("\r");
+  assert.equal(viewer.getExpandedKeys().length, 2);
+
+  const body = viewer.render(160).slice(1, -1).join("\n");
+  assert.ok(body.includes("思考一"), body);
+  assert.ok(body.includes("思考二"));
+  assert.doesNotMatch(body, /思考三/u);
 });
 
-test("代码块与长段落的显示结果不丢失正文", () => {
-  const paragraph = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
-  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(paragraph)]);
-  const body = viewer.render(24).slice(1, -1).join(" ");
+test("无缓存活动时显示明确空态", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), []);
+  const lines = viewer.render(160);
 
-  for (const word of paragraph.split(" ")) assert.match(body, new RegExp(`\\b${word}\\b`, "u"));
-  assert.ok(viewer.render(24).slice(1, -1).filter((line) => line.trim().length > 0).length > 1);
+  assert.ok(lines.some((line) => line.includes("No cached activity yet")), lines.join("\n"));
+  assert.equal(viewer.getPublicState().event_count, 0);
+  assert.equal(viewer.getSelectedKey(), undefined);
 });

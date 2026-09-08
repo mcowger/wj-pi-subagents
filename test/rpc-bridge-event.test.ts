@@ -182,10 +182,11 @@ test("显示层 message_update 只提取有序文本与 thinking delta，不进�
   }), { kind: "invalid" });
 });
 
-test("任务桥接忽略非 assistant 的 message_end，assistant 正文进入活动闭集并拒绝未知内容块", () => {
+test("任务桥接忽略非 assistant 的 message_end；活动路径逐块忽略未知内容块，回复路径仍拒绝", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({ type: "message_update", delta: "忽略" }), {
     kind: "ignored",
   });
+  // 活动路径：未知块逐块忽略，无剩余合法块时整体忽略，不中断会话。
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "message_end",
     message: {
@@ -193,8 +194,9 @@ test("任务桥接忽略非 assistant 的 message_end，assistant 正文进入�
       content: [{ type: "future_secret_block", secret: "不得静默丢弃" }],
     },
   }), {
-    kind: "invalid",
+    kind: "ignored",
   });
+  // 最终回复路径（reply 通道）仍拒绝未知内容块。
   assert.deepEqual(normalizeAssistantMessageEnd({
     type: "message_end",
     message: {
@@ -293,59 +295,32 @@ test("桥接闭集加宽：assistant 正文规范化为携带 text 与 thinking 
   });
 });
 
-test("消息活动正文按 JSON 转义后 UTF-8 总长度区分超限，拒绝事件而不中断会话", () => {
-  // 预算按 JSON.stringify 后字节数计（含首尾引号）：非转义字符 1 字节/字。
-  const withinBudget = normalizeRpcBridgeEvent({
+test("消息活动正文聚合不设字节上限，工具正文预算保持不变", () => {
+  // assistant 正文任意长，全部合法（传输分块由监督通道承担）。
+  const large = normalizeRpcBridgeEvent({
     type: "message_end",
     message: {
       role: "assistant",
-      content: [{ type: "text", text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES - 2) }],
+      content: [{ type: "text", text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES + 1024) }],
     },
   });
-  assert.equal(withinBudget.kind, "event");
+  assert.equal(large.kind, "event");
 
-  const boundary = normalizeRpcBridgeEvent({
-    type: "message_end",
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "\n".repeat((ACTIVITY_MAX_TEXT_BYTES - 2) / 2) }],
-    },
-  });
-  // "\n" 转义为 2 字节，恰好抵达上限。
-  assert.equal(boundary.kind, "event");
-
-  assert.deepEqual(normalizeRpcBridgeEvent({
-    type: "message_end",
-    message: {
-      role: "assistant",
-      content: [{ type: "text", text: "x".repeat(ACTIVITY_MAX_TEXT_BYTES - 1) }],
-    },
-  }), {
-    kind: "rejected",
-    reason: "reply_too_large",
-  });
-
-  // thinking 与 text 共享同一条连接预算。
-  assert.deepEqual(normalizeRpcBridgeEvent({
-    type: "message_end",
-    message: {
-      role: "assistant",
-      content: [
-        { type: "thinking", thinking: "y".repeat(ACTIVITY_MAX_TEXT_BYTES - 2) },
-        { type: "text", text: "xyz" },
-      ],
-    },
-  }), {
-    kind: "rejected",
-    reason: "reply_too_large",
-  });
+  // 工具参数/结果仍按单帧预算拒绝。
+  assert.equal(normalizeRpcBridgeEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    args: { path: "a".repeat(ACTIVITY_MAX_TEXT_BYTES) },
+  }).kind, "rejected");
 });
 
 test("消息活动事件仍拒绝结构违约与非字符串正文", () => {
+  // 声明为 text 但结构无效的块逐块忽略，不吞掉整条消息。
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "text", text: 42 }] },
-  }), { kind: "invalid" });
+  }), { kind: "ignored" });
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "message_end",
     message: { role: "assistant", content: "不是数组" },
@@ -515,8 +490,19 @@ test("活动事件闭集校验器接受合法事件并拒绝违约、未知与�
     toolCallId: "",
     toolName: "read",
   }).kind, "invalid");
-  assert.deepEqual(parseAgentActivityEvent({
+  // assistant 消息正文聚合不设字节上限；超长正文仍走合法闭集。
+  const oversized = parseAgentActivityEvent({
     type: "message",
     content: [{ type: "text", text: "z".repeat(ACTIVITY_MAX_TEXT_BYTES + 1) }],
-  }), { kind: "rejected", reason: "reply_too_large" });
+  });
+  assert.equal(oversized.kind, "event");
+  assert.equal(
+    parseAgentActivityEvent({
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "read",
+      args: JSON.stringify({ path: "a".repeat(ACTIVITY_MAX_TEXT_BYTES) }),
+    }).kind,
+    "rejected",
+  );
 });

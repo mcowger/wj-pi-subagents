@@ -1,4 +1,5 @@
 import type { Readable, Writable } from "node:stream";
+import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
   SupervisorChannel,
   SupervisorFrameDecoder,
@@ -182,16 +183,15 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
   }
 
   /**
-   * child 端发布活动流事件；每次提交独立，无确认或屏障。事件被发布端
-   * 拒绝（超限）时静默返回，会话不受影响。
+   * child 端发布规范活动条目；超过单帧预算的条目由协议层分块为多帧逐帧
+   * 发送。发布端拒绝时静默返回，会话不受影响。
    */
   async publishActivity(input: {
     readonly agent_id?: string;
-    readonly event: unknown;
+    readonly entry: CanonicalAgentActivityEntry;
   }): Promise<void> {
-    const frame = this.protocol.publishActivity(input);
-    if (frame === undefined) return;
-    await this.send(frame);
+    const frames = this.protocol.publishActivity(input);
+    for (const frame of frames) await this.send(frame);
   }
 
   /** child 端发布新的完整子树；修订和正文边界仍由协议状态机校验。 */

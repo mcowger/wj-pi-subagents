@@ -1,8 +1,8 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
+import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
   parseAgentActivityDisplayEvent,
   type SafeAgentActivityDisplayEvent,
-  type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
 import {
   ManagedRpcCommandRejectedError,
@@ -304,9 +304,9 @@ export type RpcSupervisorEvent =
     }
   | {
       readonly kind: "activity_stream";
-      /** 后代活动事件经监督通道转发时携带其身份；直接子代理活动省略。 */
+      /** 后代规范活动条目经监督通道转发时携带其身份；直接子代理活动省略。 */
       readonly agent_id?: string;
-      readonly event: SafeAgentActivityEvent;
+      readonly entry: CanonicalAgentActivityEntry;
     }
   | {
       readonly kind: "activity_display";
@@ -1193,7 +1193,7 @@ export class RpcSupervisor {
     this.emitEvent(Object.freeze({
       kind: "activity_stream",
       agent_id: activity.agent_id,
-      event: activity.event,
+      entry: activity.entry,
     }));
   }
 

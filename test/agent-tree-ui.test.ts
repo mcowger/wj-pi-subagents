@@ -11,8 +11,12 @@ import {
 } from "../src/agent-tree-ui.ts";
 import type {
   SafeAgentActivityDisplayEvent,
-  SafeAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
+import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  type CanonicalAgentActivityEntry,
+} from "../src/canonical-activity.ts";
+import { randomUUID } from "node:crypto";
 import type {
   AgentSnapshot,
   ScopedAgentTreeSnapshot,
@@ -389,9 +393,15 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
       return () => { if (treeChange === listener) treeChange = undefined; };
     },
   };
-  const replay: SafeAgentActivityEvent[] = [Object.freeze({
-    type: "message",
-    content: [Object.freeze({ type: "text", text: "孙代理历史" })],
+  const replay: CanonicalAgentActivityEntry[] = [Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: WORKING_CHILD_ID,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text: "孙代理历史" })]),
+    }),
   })];
   const replayReads: string[] = [];
   let activityChange: ((agentId: string) => void) | undefined;
@@ -425,8 +435,14 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   assert.match(viewer?.render(120).join("\n") ?? "", /working-child.*孙代理历史/us);
 
   replay.push(Object.freeze({
-    type: "message",
-    content: [Object.freeze({ type: "text", text: "孙代理实时完整事件" })],
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: WORKING_CHILD_ID,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text: "孙代理实时完整事件" })]),
+    }),
   }));
   activityChange?.(PARENT_ID);
   assert.equal(replayReads.length, 1);

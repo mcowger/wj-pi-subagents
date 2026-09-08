@@ -1,34 +1,36 @@
 import { isCanonicalUuid } from "./tree-controller.ts";
 import {
-  parseAgentActivityEvent,
-  type SafeAgentActivityEvent,
-} from "./rpc-bridge-event.ts";
+  parseCanonicalAgentActivityEntry,
+  type CanonicalAgentActivityEntry,
+} from "./canonical-activity.ts";
 
 interface AgentActivityRecord {
-  readonly events: SafeAgentActivityEvent[];
+  readonly entries: CanonicalAgentActivityEntry[];
   revision: number;
 }
 
 /**
- * 父端活动流缓存：按 agent_id 分组追加、全量回放，并维护每代理修订号与
- * 变更通知。它只存在于父进程内存，不落盘、无上限累积；代理终止后记录
- * 仍然可回放。并行多代理按分组键天然隔离。
+ * 顶层运行时的活动流缓存：按 agent_id 分组追加、全量回放，并维护每代理
+ * 修订号与变更通知。它只存在于顶层运行时进程内存，不落盘、无上限累积；
+ * 代理终止后记录仍然可回放。并行多代理按分组键天然隔离。中间运行时不
+ * 持有此缓存，只逐层尽力转发。
  */
 export class AgentActivityCache {
   private readonly records = new Map<string, AgentActivityRecord>();
   private readonly listeners = new Set<(agentId: string) => void>();
 
-  /** 追加一条活动事件；非法身份或违约事件被静默拒绝，不改变缓存状态。 */
-  append(agentId: string, event: SafeAgentActivityEvent): void {
+  /** 追加一条规范活动条目；非法身份、版本不符或身份不一致被静默拒绝。 */
+  append(agentId: string, entry: CanonicalAgentActivityEntry): void {
     if (!isCanonicalUuid(agentId)) return;
-    const parsed = parseAgentActivityEvent(event);
-    if (parsed.kind !== "event") return;
+    const parsed = parseCanonicalAgentActivityEntry(entry);
+    if (parsed.kind !== "entry") return;
+    if (parsed.entry.agent_id !== agentId) return;
     let record = this.records.get(agentId);
     if (record === undefined) {
-      record = { events: [], revision: 0 };
+      record = { entries: [], revision: 0 };
       this.records.set(agentId, record);
     }
-    record.events.push(parsed.event);
+    record.entries.push(parsed.entry);
     record.revision += 1;
     for (const listener of this.listeners) {
       try {
@@ -39,11 +41,11 @@ export class AgentActivityCache {
     }
   }
 
-  /** 返回该代理的全部活动事件（按到达序）；未知代理返回空数组。 */
-  replay(agentId: string): readonly SafeAgentActivityEvent[] {
+  /** 返回该代理的全部规范条目（按到达序）；未知代理返回空数组。 */
+  replay(agentId: string): readonly CanonicalAgentActivityEntry[] {
     const record = this.records.get(agentId);
     if (record === undefined) return Object.freeze([]);
-    return Object.freeze([...record.events]);
+    return Object.freeze([...record.entries]);
   }
 
   /** 当前修订号；每次成功追加加一。未知代理为 0。 */

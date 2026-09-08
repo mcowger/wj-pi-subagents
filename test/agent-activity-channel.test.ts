@@ -3,6 +3,11 @@ import { PassThrough } from "node:stream";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  chunkCanonicalAgentActivityEntry,
+  type CanonicalAgentActivityEntry,
+} from "../src/canonical-activity.ts";
+import {
   SupervisorChannel,
   SupervisorProtocolError,
   SupervisorRequestIdRegistry,
@@ -50,6 +55,19 @@ function childSnapshotNodes(
   ]);
 }
 
+function canonicalEntry(agentId: string, text = "回复正文"): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text })]),
+    }),
+  });
+}
+
 function readyPair(): Pair {
   const childAgentId = randomUUID();
   const grandchildAgentId = randomUUID();
@@ -87,107 +105,149 @@ function readyPair(): Pair {
   return { parent, child, childAgentId, grandchildAgentId };
 }
 
-function deliver(parent: SupervisorChannel, frame: SupervisorFrame): SupervisorReceiveResult {
-  return parent.receive(frame);
+function deliverAll(
+  parent: SupervisorChannel,
+  frames: readonly SupervisorFrame[],
+  delivered: SupervisorActivityDelivery[],
+): void {
+  for (const frame of frames) {
+    const result = parent.receive(frame);
+    if (result.kind === "accepted" && result.activity !== undefined) {
+      delivered.push(result.activity);
+    }
+  }
 }
 
-test("child 发布活动流帧，parent 校验载荷后按到达序分发", () => {
+test("child 发布规范活动条目，parent 校验载荷后按到达序分发", () => {
   const { parent, child, childAgentId, grandchildAgentId } = readyPair();
   const delivered: SupervisorActivityDelivery[] = [];
 
-  const first = child.publishActivity({
-    event: { type: "message", content: [{ type: "text", text: "回复正文" }] },
-  });
-  assert.ok(first);
-  const firstResult = deliver(parent, first);
-  if (firstResult.kind === "accepted" && firstResult.activity !== undefined) {
-    delivered.push(firstResult.activity);
-  }
+  const first = child.publishActivity({ entry: canonicalEntry(childAgentId, "自身条目") });
+  assert.ok(first.length >= 1);
+  deliverAll(parent, first, delivered);
 
   const second = child.publishActivity({
     agent_id: grandchildAgentId,
-    event: { type: "tool_execution_start", toolCallId: "call_1", toolName: "read", args: "{}" },
+    entry: canonicalEntry(grandchildAgentId),
   });
-  assert.ok(second);
-  const secondResult = deliver(parent, second);
-  if (secondResult.kind === "accepted" && secondResult.activity !== undefined) {
-    delivered.push(secondResult.activity);
-  }
+  deliverAll(parent, second, delivered);
 
-  assert.deepEqual(delivered, [
-    {
-      agent_id: childAgentId,
-      event: { type: "message", content: [{ type: "text", text: "回复正文" }] },
-    },
-    {
-      agent_id: grandchildAgentId,
-      event: { type: "tool_execution_start", toolCallId: "call_1", toolName: "read", args: "{}" },
-    },
-  ]);
+  assert.equal(delivered.length, 2);
+  assert.equal(delivered[0]?.agent_id, childAgentId);
+  assert.deepEqual(delivered[0]?.entry.body, {
+    type: "message",
+    content: [{ type: "text", text: "自身条目" }],
+  });
+  assert.equal(delivered[1]?.agent_id, grandchildAgentId);
+  assert.deepEqual(delivered[1]?.entry.body, {
+    type: "message",
+    content: [{ type: "text", text: "回复正文" }],
+  });
 });
 
-test("活动帧载荷违约触发协议故障，与既有帧语义一致", () => {
+test("超过单帧预算的条目被自动分块，接收端聚合后按完整条目交付", () => {
   const { parent, child, childAgentId } = readyPair();
-  const frame = child.publishActivity({
-    event: { type: "message", content: [{ type: "text", text: "正文" }] },
-  });
+  const delivered: SupervisorActivityDelivery[] = [];
+  const entry = canonicalEntry(childAgentId, "正文".repeat(40_000));
+  const frames = child.publishActivity({ entry });
+  assert.ok(frames.length > 1, `期望分块帧，实际 ${frames.length}`);
+  deliverAll(parent, frames, delivered);
+
+  assert.equal(delivered.length, 1);
+  assert.deepEqual(delivered[0]?.entry, entry);
+  assert.equal(parent.getPublicState().state, "ready");
+});
+
+test("分块帧携带旧契约形状时按协议故障处理，新旧活动契约不混用", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const frame = child.publishActivity({ entry: canonicalEntry(childAgentId) })[0];
   assert.ok(frame);
-  const tampered = Object.freeze({
+  const legacyShape = Object.freeze({
     ...frame,
-    payload: Object.freeze({ ...frame.payload, event: { type: "agent_start" } }),
+    payload: Object.freeze({ agent_id: childAgentId, event: { type: "agent_start" } }),
   });
-  const result = deliver(parent, tampered);
+  const result = parent.receive(legacyShape);
   assert.equal(result.kind, "protocol_fault");
   assert.equal(parent.getPublicState().state, "faulted");
-  void childAgentId;
 });
 
-test("child 拒绝越权身份与未知子树代理的活动帧", () => {
-  const { child } = readyPair();
-  assert.throws(() => child.publishActivity({
-    agent_id: randomUUID(),
-    event: { type: "message", content: [{ type: "text", text: "越权" }] },
-  }), (error: unknown) => error instanceof SupervisorProtocolError);
-  assert.throws(() => child.publishActivity({
-    agent_id: "not-a-uuid",
-    event: { type: "message", content: [{ type: "text", text: "非法" }] },
-  }), (error: unknown) => error instanceof SupervisorProtocolError);
+test("缺块静默等待，不产生部分权威条目；迟到补齐后正常交付", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const delivered: SupervisorActivityDelivery[] = [];
+  const entry = canonicalEntry(childAgentId, "y".repeat(120 * 1024));
+  const frames = child.publishActivity({ entry });
+  assert.ok(frames.length > 2);
+
+  // 只投递除最后一块外的所有帧：缺块不产生 delivery。
+  for (const frame of frames.slice(0, -1)) {
+    const result = parent.receive(frame);
+    assert.equal(result.kind, "accepted");
+    assert.equal(result.activity, undefined);
+  }
+  assert.equal(delivered.length, 0);
+
+  // 通过重组 helper 模拟最后一块补齐后再次投递。
+  const lastFrame = frames.at(-1)!;
+  const result = parent.receive(lastFrame);
+  assert.equal(result.kind, "accepted");
+  if (result.kind === "accepted" && result.activity !== undefined) delivered.push(result.activity);
+  assert.equal(delivered.length, 1);
+  assert.deepEqual(delivered[0]?.entry, entry);
 });
 
-test("超限活动事件在发布端被拒绝而不建立帧，不中断会话", () => {
-  const { parent, child } = readyPair();
-  const rejected = child.publishActivity({
-    event: {
-      type: "message",
-      content: [{ type: "text", text: "x".repeat(64 * 1024) }],
-    },
-  });
-  assert.equal(rejected, undefined);
+test("契约版本不符或身份不一致的条目在发布端被拒绝", () => {
+  const { child, childAgentId } = readyPair();
+  const staleContract = Object.freeze({
+    ...canonicalEntry(childAgentId),
+    contract_version: "wj-pi-subagents.activity/0",
+  }) as unknown as CanonicalAgentActivityEntry;
+  assert.throws(
+    () => child.publishActivity({ entry: staleContract }),
+    (error: unknown) => error instanceof SupervisorProtocolError,
+  );
+  assert.throws(
+    () => child.publishActivity({
+      entry: Object.freeze({
+        ...canonicalEntry(childAgentId),
+        agent_id: randomUUID(),
+      }),
+    }),
+    (error: unknown) => error instanceof SupervisorProtocolError,
+  );
+  assert.throws(
+    () => child.publishActivity({
+      agent_id: randomUUID(),
+      entry: canonicalEntry(childAgentId),
+    }),
+    (error: unknown) => error instanceof SupervisorProtocolError,
+  );
   assert.equal(child.getPublicState().state, "ready");
-  assert.equal(parent.getPublicState().state, "ready");
 });
 
 test("握手完成前发布活动流被拒绝，终止屏障后活动帧被丢弃", () => {
   const registry = new SupervisorRequestIdRegistry();
+  const childAgentId = randomUUID();
   const child = new SupervisorChannel({
     role: "child",
     rootId: ROOT_ID,
-    localAgentId: randomUUID(),
+    localAgentId: childAgentId,
     peerAgentId: "",
     parentAgentId: null,
     depth: 1,
     credential: CREDENTIAL,
     requestIdRegistry: registry,
   });
-  assert.throws(() => child.publishActivity({
-    event: { type: "message", content: [{ type: "text", text: "过早" }] },
-  }), (error: unknown) => error instanceof SupervisorProtocolError);
+  assert.throws(
+    () => child.publishActivity({ entry: canonicalEntry(childAgentId) }),
+    (error: unknown) => error instanceof SupervisorProtocolError,
+  );
 
   const { parent, child: readyChild } = readyPair();
   readyChild.establishTerminationBarrier();
-  assert.throws(() => readyChild.publishActivity({
-    event: { type: "message", content: [{ type: "text", text: "屏障后" }] },
-  }), (error: unknown) => error instanceof SupervisorProtocolError);
+  assert.throws(
+    () => readyChild.publishActivity({ entry: canonicalEntry(childAgentId) }),
+    (error: unknown) => error instanceof SupervisorProtocolError,
+  );
   void parent;
 });
 
@@ -249,35 +309,38 @@ async function readyStreamPair(): Promise<{
   };
 }
 
-test("活动流帧经字节流适配层分发到 parent 观察者，publish 面向调用方返回完成", async () => {
+test("规范条目经字节流适配层分发到 parent 观察者，大正文分块后聚合交付", async () => {
   const channels = await readyStreamPair();
   const delivered: SupervisorActivityDelivery[] = [];
   const unsubscribe = channels.parent.onActivity((activity) => delivered.push(activity));
   try {
-    await channels.child.publishActivity({
-      event: { type: "message", content: [{ type: "text", text: "流式正文" }] },
-    });
+    await channels.child.publishActivity({ entry: canonicalEntry(channels.childAgentId, "流式正文") });
     await channels.child.publishActivity({
       agent_id: channels.grandchildAgentId,
-      event: { type: "tool_execution_end", toolCallId: "call_1", toolName: "read", result: "{}", isError: false },
+      entry: canonicalEntry(channels.grandchildAgentId, "工具后正文"),
     });
-    // 超限事件被发布端拒绝，不产生帧也不中断通道。
-    await channels.child.publishActivity({
-      event: { type: "message", content: [{ type: "text", text: "x".repeat(64 * 1024) }] },
+    // 远超单帧预算的正文自动分块，接收端聚合后按完整条目交付。
+    const large = canonicalEntry(channels.childAgentId, "报告".repeat(60_000));
+    await channels.child.publishActivity({ entry: large });
+
+    assert.equal(delivered.length, 3);
+    assert.equal(delivered[0]?.agent_id, channels.childAgentId);
+    assert.deepEqual(delivered[0]?.entry.body, {
+      type: "message",
+      content: [{ type: "text", text: "流式正文" }],
     });
-    assert.deepEqual(delivered, [
-      {
-        agent_id: channels.childAgentId,
-        event: { type: "message", content: [{ type: "text", text: "流式正文" }] },
-      },
-      {
-        agent_id: channels.grandchildAgentId,
-        event: { type: "tool_execution_end", toolCallId: "call_1", toolName: "read", result: "{}", isError: false },
-      },
-    ]);
+    assert.equal(delivered[1]?.agent_id, channels.grandchildAgentId);
+    assert.deepEqual(delivered[2]?.entry, large);
     assert.equal(channels.parent.getPublicState().state, "ready");
   } finally {
     unsubscribe();
     channels.destroy();
   }
+});
+
+test("分块传输 helper 与通道内联判断一致：小块单帧，大块多帧", () => {
+  const small = canonicalEntry(randomUUID());
+  const inlined = chunkCanonicalAgentActivityEntry(small, 192 * 1024);
+  assert.equal(inlined.length, 1);
+  assert.deepEqual(inlined[0], small);
 });

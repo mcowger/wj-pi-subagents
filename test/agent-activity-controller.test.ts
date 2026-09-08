@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { randomUUID } from "node:crypto";
 import {
   AgentController,
   type AgentSupervisor,
@@ -12,6 +13,10 @@ import type {
   RpcSupervisorStartupResult,
   RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
+import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  type CanonicalAgentActivityEntry,
+} from "../src/canonical-activity.ts";
 import type {
   SafeAgentActivityDisplayEvent,
   SafeAgentActivityEvent,
@@ -76,18 +81,14 @@ class FakeSupervisor implements AgentSupervisor {
     return false;
   }
 
-  emitActivityStream(event: SafeAgentActivityEvent, agentId?: string): void {
+  emitActivityDelivery(delivery: SupervisorActivityDelivery): void {
     for (const listener of this.listeners) {
       listener(Object.freeze({
         kind: "activity_stream",
-        ...(agentId === undefined ? {} : { agent_id: agentId }),
-        event,
+        agent_id: delivery.agent_id,
+        entry: delivery.entry,
       }));
     }
-  }
-
-  emitActivityDelivery(delivery: SupervisorActivityDelivery): void {
-    this.emitActivityStream(delivery.event, delivery.agent_id);
   }
 
   emitActivityDisplay(event: SafeAgentActivityDisplayEvent): void {
@@ -97,8 +98,17 @@ class FakeSupervisor implements AgentSupervisor {
   }
 }
 
-function message(text: string): SafeAgentActivityEvent {
-  return Object.freeze({ type: "message", content: [Object.freeze({ type: "text", text })] });
+function messageEntry(agentId: string, text: string): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text })]),
+    }),
+  });
 }
 
 function makeChildModeController(options: {
@@ -171,7 +181,7 @@ function makeController(fake: FakeSupervisor): {
   return { controller, tree, upstream };
 }
 
-test("活动流事件写入父端缓存，按到达序可回放且修订号递增", async () => {
+test("顶层控制器把活动条目写入缓存，按到达序可回放且修订号递增", async () => {
   const fake = new FakeSupervisor();
   const { controller } = makeController(fake);
   const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
@@ -180,13 +190,12 @@ test("活动流事件写入父端缓存，按到达序可回放且修订号递�
   const notified: string[] = [];
   const unsubscribe = controller.onActivityChange((agentId) => notified.push(agentId));
 
-  fake.emitActivityStream(message("第一条"));
-  fake.emitActivityStream(message("第二条"));
+  const first = messageEntry(AGENT_ID, "第一条");
+  const second = messageEntry(AGENT_ID, "第二条");
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: first });
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: second });
 
-  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [
-    message("第一条"),
-    message("第二条"),
-  ]);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [first, second]);
   assert.equal(controller.getActivityRevision(AGENT_ID), 2);
   assert.deepEqual(notified, [AGENT_ID, AGENT_ID]);
   unsubscribe();
@@ -217,24 +226,24 @@ test("逐 token 显示事件只通知查看器，不写入缓存或上行活动�
   unsubscribe();
 });
 
-test("后代活动事件按其真实身份分组并沿上游转发", async () => {
+test("后代活动条目按其真实身份分组写入顶层缓存", async () => {
   const fake = new FakeSupervisor();
   const { controller, upstream } = makeController(fake);
   const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
   assert.equal(spawned.ok, true, JSON.stringify(spawned));
 
-  fake.emitActivityStream(message("直接子正文"));
-  fake.emitActivityStream(message("孙代理正文"), GRANDCHILD_ID);
+  const direct = messageEntry(AGENT_ID, "直接子正文");
+  const grandchild = messageEntry(GRANDCHILD_ID, "孙代理正文");
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: direct });
+  fake.emitActivityDelivery({ agent_id: GRANDCHILD_ID, entry: grandchild });
 
-  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [message("直接子正文")]);
-  assert.deepEqual(controller.getActivityReplay(GRANDCHILD_ID), [message("孙代理正文")]);
-  assert.deepEqual(upstream, [
-    { agent_id: AGENT_ID, event: message("直接子正文") },
-    { agent_id: GRANDCHILD_ID, event: message("孙代理正文") },
-  ]);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [direct]);
+  assert.deepEqual(controller.getActivityReplay(GRANDCHILD_ID), [grandchild]);
+  // 顶层运行时没有上游：缓存终止于此，不再转发。
+  assert.deepEqual(upstream, []);
 });
 
-test("四层树逐层缓存自身与子树活动，并把曾孙事件按真实身份转发到根且不重复", async () => {
+test("中间运行时只转发不缓存：四层树中仅根保存历史且不重复", async () => {
   const rootSupervisor = new FakeSupervisor(AGENT_ID);
   const { controller: root } = makeController(rootSupervisor);
   const rootSpawned = await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
@@ -272,27 +281,30 @@ test("四层树逐层缓存自身与子树活动，并把曾孙事件按真实�
   const grandchildSpawned = await grandchild.spawnAgent({ template_id: "demo", name: "曾孙代理" });
   assert.equal(grandchildSpawned.ok, true, JSON.stringify(grandchildSpawned));
 
-  assert.equal(child.recordOwnActivity(message("直接子自身事件")), true);
-  assert.equal(grandchild.recordOwnActivity(message("孙代理自身事件")), true);
-  greatGrandchildSupervisor.emitActivityStream(message("曾孙代理自身事件"));
+  // 中间层记录自身活动：只转发，不在本层缓存。
+  const childOwn = messageEntry(AGENT_ID, "直接子自身事件");
+  const grandchildOwn = messageEntry(GRANDCHILD_ID, "孙代理自身事件");
+  assert.equal(child.recordOwnActivity(childOwn.body), true);
+  assert.equal(grandchild.recordOwnActivity(grandchildOwn.body), true);
+  const greatGrandchildOwn = messageEntry(GREAT_GRANDCHILD_ID, "曾孙代理自身事件");
+  greatGrandchildSupervisor.emitActivityDelivery({ agent_id: GREAT_GRANDCHILD_ID, entry: greatGrandchildOwn });
 
-  assert.deepEqual(grandchild.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
-  assert.deepEqual(grandchild.getActivityReplay(GREAT_GRANDCHILD_ID), [message("曾孙代理自身事件")]);
-  assert.deepEqual(child.getActivityReplay(AGENT_ID), [message("直接子自身事件")]);
-  assert.deepEqual(child.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
-  assert.deepEqual(child.getActivityReplay(GREAT_GRANDCHILD_ID), [message("曾孙代理自身事件")]);
-  assert.deepEqual(root.getActivityReplay(AGENT_ID), [message("直接子自身事件")]);
-  assert.deepEqual(root.getActivityReplay(GRANDCHILD_ID), [message("孙代理自身事件")]);
-  assert.deepEqual(root.getActivityReplay(GREAT_GRANDCHILD_ID), [message("曾孙代理自身事件")]);
-  assert.deepEqual(grandchildToChild, [
-    { agent_id: GRANDCHILD_ID, event: message("孙代理自身事件") },
-    { agent_id: GREAT_GRANDCHILD_ID, event: message("曾孙代理自身事件") },
-  ]);
-  assert.deepEqual(childToRoot, [
-    { agent_id: AGENT_ID, event: message("直接子自身事件") },
-    { agent_id: GRANDCHILD_ID, event: message("孙代理自身事件") },
-    { agent_id: GREAT_GRANDCHILD_ID, event: message("曾孙代理自身事件") },
-  ]);
+  // 中间层不保存历史。
+  assert.deepEqual(child.getActivityReplay(AGENT_ID), []);
+  assert.deepEqual(child.getActivityReplay(GRANDCHILD_ID), []);
+  assert.deepEqual(child.getActivityReplay(GREAT_GRANDCHILD_ID), []);
+  assert.deepEqual(grandchild.getActivityReplay(GRANDCHILD_ID), []);
+  assert.deepEqual(grandchild.getActivityReplay(GREAT_GRANDCHILD_ID), []);
+
+  // 只有根保存全树历史；recordOwnActivity 为自身正文生成新规范身份。
+  const rootReplay = root.getActivityReplay(AGENT_ID);
+  assert.equal(rootReplay.length, 1);
+  assert.deepEqual(rootReplay[0]?.body, childOwn.body);
+  assert.equal(rootReplay[0]?.agent_id, AGENT_ID);
+  assert.deepEqual(root.getActivityReplay(GRANDCHILD_ID).map((entry) => entry.body), [grandchildOwn.body]);
+  assert.deepEqual(root.getActivityReplay(GREAT_GRANDCHILD_ID), [greatGrandchildOwn]);
+  assert.deepEqual(grandchildToChild.map((delivery) => delivery.entry.body), [grandchildOwn.body, greatGrandchildOwn.body]);
+  assert.deepEqual(childToRoot.map((delivery) => delivery.entry.body), [childOwn.body, grandchildOwn.body, greatGrandchildOwn.body]);
   assert.equal(root.getActivityRevision(AGENT_ID), 1);
   assert.equal(root.getActivityRevision(GRANDCHILD_ID), 1);
   assert.equal(root.getActivityRevision(GREAT_GRANDCHILD_ID), 1);
@@ -302,21 +314,49 @@ test("根控制器没有可上行的自身代理身份", () => {
   const fake = new FakeSupervisor();
   const { controller } = makeController(fake);
 
-  assert.equal(controller.recordOwnActivity(message("根事件")), false);
+  assert.equal(controller.recordOwnActivity(messageEntry(AGENT_ID, "根事件").body), false);
   assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
 });
 
-test("子代理终止后活动缓存仍可回放", async () => {
+test("子代理终止后顶层活动缓存仍可回放", async () => {
   const fake = new FakeSupervisor();
   const { controller, tree } = makeController(fake);
   const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
   assert.equal(spawned.ok, true, JSON.stringify(spawned));
-  fake.emitActivityStream(message("终止前的正文"));
+  const beforeTermination = messageEntry(AGENT_ID, "终止前的正文");
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: beforeTermination });
 
   const terminated = await controller.terminateAgent(AGENT_ID);
   assert.equal(terminated.ok, true, JSON.stringify(terminated));
   void tree;
 
-  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [message("终止前的正文")]);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [beforeTermination]);
   assert.equal(controller.getActivityRevision(AGENT_ID), 1);
+});
+
+test("中间层 recordOwnActivity 生成规范身份并保持正文不变", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+
+  const body: SafeAgentActivityEvent = Object.freeze({
+    type: "message",
+    content: Object.freeze([Object.freeze({ type: "text", text: "自身正文" })]),
+  });
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: new FakeSupervisor(GRANDCHILD_ID),
+    publishUpstreamActivity: (delivery) => rootSupervisor.emitActivityDelivery(delivery),
+  });
+  assert.equal(child.recordOwnActivity(body), true);
+
+  const replay = root.getActivityReplay(AGENT_ID);
+  assert.equal(replay.length, 1);
+  assert.equal(replay[0]?.agent_id, AGENT_ID);
+  assert.deepEqual(replay[0]?.body, body);
+  assert.match(replay[0]?.incarnation_id ?? "", /^[0-9a-f-]{36}$/u);
+  assert.match(replay[0]?.entry_id ?? "", /^[0-9a-f-]{36}$/u);
 });

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  type CanonicalAgentActivityEntry,
+} from "../src/canonical-activity.ts";
 import { normalizeRpcBridgeEvent } from "../src/rpc-bridge-event.ts";
-import type { SafeAgentActivityEvent } from "../src/rpc-bridge-event.ts";
 import {
   FakeRpcClient,
   RpcSupervisor,
@@ -112,11 +116,24 @@ function emitBridgeEvent(rpc: FakeRpcClient, rawEvent: unknown): void {
   rpc.emitEvent(normalized.event);
 }
 
-function activityEvents(events: readonly RpcSupervisorEvent[]): readonly SafeAgentActivityEvent[] {
+function activityEntries(events: readonly RpcSupervisorEvent[]): readonly CanonicalAgentActivityEntry[] {
   return events
     .filter((event): event is Extract<RpcSupervisorEvent, { kind: "activity_stream" }> =>
       event.kind === "activity_stream")
-    .map((event) => event.event);
+    .map((event) => event.entry);
+}
+
+function messageEntry(agentId: string, text: string): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message",
+      content: Object.freeze([Object.freeze({ type: "text", text })]),
+    }),
+  });
 }
 
 function setup(onGracefulClose?: (rpc: FakeRpcClient) => void): {
@@ -226,7 +243,7 @@ test("RPC 桥完整活动副本不再重复分发，权威活动由子扩展监�
       isError: false,
     });
 
-    assert.deepEqual(activityEvents(events), []);
+    assert.deepEqual(activityEntries(events), []);
   } finally {
     unsubscribe();
     await cleanup();
@@ -265,7 +282,7 @@ test("监督器将合法短暂显示帧仅作为 activity_display 分发", async
         delta: "partial",
       },
     }]);
-    assert.deepEqual(activityEvents(events), []);
+    assert.deepEqual(activityEntries(events), []);
   } finally {
     unsubscribe();
     await cleanup();
@@ -360,7 +377,7 @@ test("活动流上行不影响既有活动阶段与工具配对跟踪", async ()
   }
 });
 
-test("监督通道活动帧经 RpcSupervisor 分发为带 agent_id 的 activity_stream", async () => {
+test("监督通道活动帧经 RpcSupervisor 分发为带 agent_id 的规范条目", async () => {
   const { supervisor, channels, cleanup } = setup();
   const events: RpcSupervisorEvent[] = [];
   const unsubscribe = supervisor.onEvent((event) => events.push(event));
@@ -370,19 +387,15 @@ test("监督通道活动帧经 RpcSupervisor 分发为带 agent_id 的 activity_
     await channels.child.bind(signal);
     assert.equal((await startup).ok, true);
 
-    await channels.child.publishActivity({
-      event: { type: "message", content: [{ type: "text", text: "来自子代理" }] },
-    });
+    const entry = messageEntry(CHILD_ID, "来自子代理");
+    await channels.child.publishActivity({ entry });
 
     const deliveries = events
       .filter((event): event is Extract<RpcSupervisorEvent, { kind: "activity_stream" }> =>
         event.kind === "activity_stream" && event.agent_id !== undefined);
     assert.equal(deliveries.length, 1);
     assert.equal(deliveries[0]?.agent_id, CHILD_ID);
-    assert.deepEqual(deliveries[0]?.event, {
-      type: "message",
-      content: [{ type: "text", text: "来自子代理" }],
-    });
+    assert.deepEqual(deliveries[0]?.entry, entry);
   } finally {
     unsubscribe();
     await cleanup();

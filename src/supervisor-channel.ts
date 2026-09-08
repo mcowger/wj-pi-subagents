@@ -1,9 +1,14 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { parseAgentSnapshot as parseSafeAgentSnapshot } from "./agent-snapshot-codec.ts";
 import {
-  parseAgentActivityEvent,
-  type SafeAgentActivityEvent,
-} from "./rpc-bridge-event.ts";
+  CANONICAL_ACTIVITY_CHUNK_PAYLOAD_BYTES,
+  chunkCanonicalAgentActivityEntry,
+  parseCanonicalAgentActivityChunk,
+  parseCanonicalAgentActivityEntry,
+  reassembleCanonicalAgentActivityChunks,
+  type CanonicalAgentActivityChunk,
+  type CanonicalAgentActivityEntry,
+} from "./canonical-activity.ts";
 import {
   parseChildReplyEnvelope,
   type ChildReplyEnvelope,
@@ -30,7 +35,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/18";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/19";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -185,10 +190,13 @@ export type SupervisorControlResponse =
       readonly error: PublicControlError;
     };
 
-/** parent 端一次性分发的活动流交付：事件所属代理身份与合法闭集事件。 */
+/**
+ * 活动流交付：代理身份加规范活动条目。条目携带契约版本、运行实例身份与
+ * 稳定条目身份；旧契约形状的活动帧在接收端按协议故障处理。
+ */
 export interface SupervisorActivityDelivery {
   readonly agent_id: string;
-  readonly event: SafeAgentActivityEvent;
+  readonly entry: CanonicalAgentActivityEntry;
 }
 
 /** 监督器向直接父/子控制器传播的脱敏生命周期事实。 */
@@ -1104,6 +1112,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+const EMPTY_ACTIVITY_FRAMES: readonly SupervisorFrame[] = Object.freeze([]);
+const MAX_PENDING_ACTIVITY_REASSEMBLIES = 8;
+
 function randomStreamId(): string {
   return `stream_${randomUUID().replaceAll("-", "")}`;
 }
@@ -1163,6 +1174,12 @@ export class SupervisorChannel {
   private capabilityPublished = false;
   private capability: SupervisorCapabilityManifest | undefined;
   private terminationBarrier = false;
+  /** 进行中的活动分块聚合，键为条目身份三元组；只在 parent 端使用。 */
+  private readonly activityReassemblies = new Map<
+    string,
+    { readonly chunk_total: number; readonly received: Map<number, string> }
+  >();
+  private readonly activityReassemblyOrder: string[] = [];
 
   constructor(options: SupervisorChannelOptions) {
     this.limits = mergeLimits(options.limits);
@@ -1275,15 +1292,14 @@ export class SupervisorChannel {
   }
 
   /**
-   * child 沿监督通道上行一条活动流事件。每次提交独立，无确认、无屏障、
-   * 不承诺跨事件顺序；事件所属代理可以是自身或子树内后代（递归汇聚）。
-   * 正文超预算时事件被拒绝（返回 undefined），不中断会话；载荷违约是
-   * 协议错误，抛出 SupervisorProtocolError。
+   * child 沿监督通道上行一条规范活动条目。每次提交独立，无确认、无屏障、
+   * 不承诺跨事件顺序；条目超过单帧预算时自动分块为多个同身份帧。结构
+   * 违约或身份越权抛出 SupervisorProtocolError；条目无法编码时返回空帧列。
    */
   publishActivity(input: {
     readonly agent_id?: string;
-    readonly event: unknown;
-  }): SupervisorFrame | undefined {
+    readonly entry: CanonicalAgentActivityEntry;
+  }): readonly SupervisorFrame[] {
     if (
       this.role !== "child" ||
       this.terminationBarrier ||
@@ -1292,13 +1308,17 @@ export class SupervisorChannel {
     const agentId = input.agent_id ?? this.localAgentId;
     if (!isCanonicalUuid(agentId)) throw new SupervisorProtocolError("identity_mismatch");
     if (!this.eventAgentIsInScope(agentId)) throw new SupervisorProtocolError("identity_mismatch");
-    const parsed = parseAgentActivityEvent(input.event);
+    const parsed = parseCanonicalAgentActivityEntry(input.entry);
     if (parsed.kind === "invalid") throw new SupervisorProtocolError("invalid_frame");
-    if (parsed.kind === "rejected") return undefined;
-    return this.createFrame("activity", Object.freeze({
-      agent_id: agentId,
-      event: parsed.event,
-    }));
+    if (parsed.entry.agent_id !== agentId) throw new SupervisorProtocolError("identity_mismatch");
+    const wire = chunkCanonicalAgentActivityEntry(parsed.entry, CANONICAL_ACTIVITY_CHUNK_PAYLOAD_BYTES);
+    if (wire.length === 0) return EMPTY_ACTIVITY_FRAMES;
+    return Object.freeze(wire.map((item) => this.createFrame(
+      "activity",
+      "chunk_index" in item
+        ? Object.freeze({ agent_id: agentId, chunk: item })
+        : Object.freeze({ agent_id: agentId, entry: item }),
+    )));
   }
 
   /** child 仅在普通 ready 后发布一次固定的内部能力快照。 */
@@ -1754,22 +1774,85 @@ export class SupervisorChannel {
   }
 
   /**
-   * 活动流帧只分发合法闭集事件；正文超预算时该帧被忽略（不中断会话），
+   * 活动流帧只分发规范条目交付；分块帧在通道内按身份聚合，缺块静默等待，
    * 结构违约与越权身份与既有帧语义一致，升级为协议故障。
    */
   private applyActivity(frame: InternalFrame): SupervisorActivityDelivery | undefined {
     if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
     const payload = frame.payload;
-    if (!hasExactObjectKeys(payload, ["agent_id", "event"])) frameError("invalid_frame");
-    if (!isCanonicalUuid(payload.agent_id)) frameError("invalid_frame");
-    if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
-    const parsed = parseAgentActivityEvent(payload.event);
-    if (parsed.kind === "invalid") frameError("invalid_frame");
-    if (parsed.kind === "rejected") return undefined;
-    return Object.freeze({
-      agent_id: payload.agent_id as string,
-      event: parsed.event,
-    });
+    if (!isRecord(payload)) frameError("invalid_frame");
+    if (hasExactObjectKeys(payload, ["agent_id", "entry"])) {
+      if (!isCanonicalUuid(payload.agent_id)) frameError("invalid_frame");
+      if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
+      const parsed = parseCanonicalAgentActivityEntry(payload.entry);
+      if (parsed.kind === "invalid") frameError("invalid_frame");
+      if (parsed.entry.agent_id !== payload.agent_id) frameError("invalid_frame");
+      return Object.freeze({ agent_id: payload.agent_id as string, entry: parsed.entry });
+    }
+    if (hasExactObjectKeys(payload, ["agent_id", "chunk"])) {
+      if (!isCanonicalUuid(payload.agent_id)) frameError("invalid_frame");
+      if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
+      const parsed = parseCanonicalAgentActivityChunk(payload.chunk);
+      if (parsed.kind === "invalid") frameError("invalid_frame");
+      if (parsed.chunk.agent_id !== payload.agent_id) frameError("invalid_frame");
+      return this.receiveActivityChunk(parsed.chunk);
+    }
+    frameError("invalid_frame");
+  }
+
+  /** 同一条目的分块按身份聚合；缺块不产生部分权威正文，静默等待或丢弃。 */
+  private receiveActivityChunk(chunk: CanonicalAgentActivityChunk): SupervisorActivityDelivery | undefined {
+    const key = `${chunk.agent_id}|${chunk.incarnation_id}|${chunk.entry_id}`;
+    let pending = this.activityReassemblies.get(key);
+    if (pending === undefined) {
+      pending = Object.freeze({ chunk_total: chunk.chunk_total, received: new Map<number, string>() });
+      this.activityReassemblies.set(key, pending);
+      this.activityReassemblyOrder.push(key);
+      this.evictStaleActivityReassemblies();
+    }
+    if (pending.chunk_total !== chunk.chunk_total) {
+      this.dropActivityReassembly(key);
+      return undefined;
+    }
+    const existing = pending.received.get(chunk.chunk_index);
+    if (existing === undefined) pending.received.set(chunk.chunk_index, chunk.payload);
+    else if (existing !== chunk.payload) {
+      this.dropActivityReassembly(key);
+      return undefined;
+    }
+    if (pending.received.size !== pending.chunk_total) return undefined;
+    this.dropActivityReassembly(key);
+    const reassembled = reassembleCanonicalAgentActivityChunks(
+      [...pending.received.entries()].map(([index, payloadText]) => Object.freeze({
+        contract_version: chunk.contract_version,
+        agent_id: chunk.agent_id,
+        incarnation_id: chunk.incarnation_id,
+        entry_id: chunk.entry_id,
+        chunk_index: index,
+        chunk_total: pending!.chunk_total,
+        payload: payloadText,
+      })),
+    );
+    if (reassembled === undefined) return undefined;
+    return Object.freeze({ agent_id: chunk.agent_id, entry: reassembled });
+  }
+
+  private dropActivityReassembly(key: string): void {
+    this.activityReassemblies.delete(key);
+    const orderIndex = this.activityReassemblyOrder.indexOf(key);
+    if (orderIndex >= 0) this.activityReassemblyOrder.splice(orderIndex, 1);
+  }
+
+  /**
+   * 进行中的聚合缓冲数量边界。它保护父端免受异常分块帧堆积；丢弃静默
+   * 缺口，不中断会话，也不产生部分权威正文。
+   */
+  private evictStaleActivityReassemblies(): void {
+    while (this.activityReassemblyOrder.length > MAX_PENDING_ACTIVITY_REASSEMBLIES) {
+      const stale = this.activityReassemblyOrder.shift();
+      if (stale === undefined) break;
+      this.activityReassemblies.delete(stale);
+    }
   }
 
   private parseEventPayload(payload: Record<string, unknown>): SupervisorEvent {

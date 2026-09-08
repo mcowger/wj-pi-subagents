@@ -88,7 +88,7 @@ async function waitForCount(values: readonly unknown[], count: number): Promise<
   }
 }
 
-test("子模式扩展把本进程完整活动写入自身缓存并沿监督通道上行", async () => {
+test("子模式扩展把本进程完整活动规范化上行且不在本层缓存", async () => {
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const listener = await transportAdapter.listen({
     agentId: CHILD_ID,
@@ -177,30 +177,34 @@ test("子模式扩展把本进程完整活动写入自身缓存并沿监督通�
     }, context);
     await waitForCount(delivered, 3);
 
-    const expected = [
-      {
-        type: "message",
-        content: [
-          { type: "thinking", thinking: "先检查输入" },
-          { type: "text", text: "开始处理" },
-        ],
-      },
-      {
-        type: "tool_execution_start",
-        toolCallId: "call_1",
-        toolName: "read",
-        args: '{"path":"src/a.ts"}',
-      },
-      {
-        type: "tool_execution_end",
-        toolCallId: "call_1",
-        toolName: "read",
-        result: '{"lines":["const a = 1;"]}',
-        isError: false,
-      },
-    ] as const;
-    assert.deepEqual(delivered, expected.map((event) => ({ agent_id: CHILD_ID, event })));
-    assert.deepEqual(controller?.getActivityReplay(CHILD_ID), expected);
+    // 交付是规范条目：正文闭集保持，但身份由运行实例分配。
+    assert.equal(delivered.length, 3);
+    assert.deepEqual(delivered.map((delivery) => delivery.agent_id), [CHILD_ID, CHILD_ID, CHILD_ID]);
+    assert.deepEqual(delivered[0]?.entry.body, {
+      type: "message",
+      content: [
+        { type: "thinking", thinking: "先检查输入" },
+        { type: "text", text: "开始处理" },
+      ],
+    });
+    assert.equal(delivered[0]?.entry.agent_id, CHILD_ID);
+    assert.match(delivered[0]?.entry.incarnation_id ?? "", /^[0-9a-f-]{36}$/u);
+    assert.deepEqual(delivered[1]?.entry.body, {
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: "read",
+      args: '{"path":"src/a.ts"}',
+    });
+    assert.deepEqual(delivered[2]?.entry.body, {
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: "read",
+      result: '{"lines":["const a = 1;"]}',
+      isError: false,
+    });
+    // 中间运行时不保存历史：本层回放为空。
+    assert.deepEqual(controller?.getActivityReplay(CHILD_ID), []);
+    assert.equal(controller?.getActivityRevision(CHILD_ID), 0);
   } finally {
     await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
     await parentChannel?.release().catch(() => {});

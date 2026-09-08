@@ -1,8 +1,8 @@
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
 
 /**
- * 活动事件正文按 JSON 转义后 UTF-8 字节计算。它保证单条活动事件无论内容
- * 如何都能放入桥接帧与监督帧的安全预算，不依赖调用方重新编码。
+ * 活动事件正文按 JSON 转义后 UTF-8 字节计算。它限制单个工具参数/结果载荷与
+ * 单个实时增量帧的尺寸；assistant 消息正文聚合不设字节上限，由传输分块解决。
  */
 export const ACTIVITY_MAX_TEXT_BYTES = 16 * 1024;
 const MAX_ACTIVITY_CONTENT_BLOCKS = 64;
@@ -257,7 +257,6 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
     case "message": {
       const content = normalizeActivityContent(value.content);
       if (content === undefined || content.length === 0) return INVALID_ACTIVITY_EVENT;
-      if (content === "rejected") return ACTIVITY_REJECTED;
       return Object.freeze({
         kind: "event",
         event: Object.freeze({ type: "message", content }),
@@ -398,13 +397,12 @@ export function normalizeAssistantMessageUpdate(
   });
 }
 
-/** 把 Pi assistant message_end 收窄为活动消息事件；预算覆盖整条连接后正文。 */
+/** 把 Pi assistant message_end 收窄为活动消息事件。 */
 function normalizeActivityMessageEnd(
   message: Record<string, unknown>,
 ): AgentActivityEventNormalization {
   const content = normalizeActivityContent(message.content);
   if (content === undefined) return INVALID_ACTIVITY_EVENT;
-  if (content === "rejected") return ACTIVITY_REJECTED;
   return Object.freeze({
     kind: "event",
     event: Object.freeze({ type: "message", content }),
@@ -413,50 +411,39 @@ function normalizeActivityMessageEnd(
 
 function normalizeActivityContent(
   value: unknown,
-): readonly SafeAgentActivityContentBlock[] | "rejected" | undefined {
+): readonly SafeAgentActivityContentBlock[] | undefined {
   // 空数组属于“结构合法但无正文”，由调用方决定忽略（桥接端）或判违约
   // （监督层防御，合法桥接永不发送）；只有非数组或超块数才在这里判违约。
   if (!Array.isArray(value) || value.length > MAX_ACTIVITY_CONTENT_BLOCKS) {
     return undefined;
   }
   const content: SafeAgentActivityContentBlock[] = [];
-  let encodedBytes = 0;
   for (const item of value) {
-    if (!isRecord(item) || typeof item.type !== "string") return undefined;
-    if (item.type === "toolCall" || item.type === "image") continue;
+    if (!isRecord(item) || typeof item.type !== "string") continue;
+    // 图片、原生工具调用、未来未知块与结构无效块逐块忽略；
+    // 只有合法 text 与 thinking 块可以进入活动闭集。
     if (item.type === "text") {
-      if (typeof item.text !== "string") return undefined;
-      // 空正文块对查看器无意义；跳过而不是判违约，避免合法空回复中断会话。
-      if (item.text.length === 0) continue;
-      const nextBytes = budgetedTextLength(item.text, encodedBytes, content.length);
-      if (nextBytes === "rejected") return "rejected";
-      encodedBytes = nextBytes;
+      if (typeof item.text !== "string" || item.text.length === 0) continue;
       content.push(Object.freeze({ type: "text", text: item.text }));
       continue;
     }
     if (item.type === "thinking") {
-      if (typeof item.thinking !== "string") return undefined;
-      if (item.thinking.length === 0) continue;
-      const nextBytes = budgetedTextLength(item.thinking, encodedBytes, content.length);
-      if (nextBytes === "rejected") return "rejected";
-      encodedBytes = nextBytes;
+      if (typeof item.thinking !== "string" || item.thinking.length === 0) continue;
+      const previous = content.at(-1);
+      if (previous?.type === "thinking") {
+        // 相邻 thinking 块合并为同一 thinking 组；被 text 隔开的块保持分离。
+        const merged = Object.freeze({
+          type: "thinking" as const,
+          thinking: `${previous.thinking}\n\n${item.thinking}`,
+        });
+        content[content.length - 1] = merged;
+        continue;
+      }
       content.push(Object.freeze({ type: "thinking", thinking: item.thinking }));
       continue;
     }
-    return undefined;
   }
   return Object.freeze(content);
-}
-
-function budgetedTextLength(
-  text: string,
-  currentBytes: number,
-  blockCount: number,
-): number | "rejected" {
-  const encoded = encodedJsonLength(text);
-  const nextBytes = currentBytes + (blockCount === 0 ? 0 : 1) + encoded;
-  if (nextBytes > ACTIVITY_MAX_TEXT_BYTES) return "rejected";
-  return nextBytes;
 }
 
 /** 把工具参数/结果 JSON 值编码为有界字符串；不可序列化值属于结构违约。 */

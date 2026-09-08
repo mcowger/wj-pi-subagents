@@ -1250,10 +1250,13 @@ export function createWjPiSubagentsRuntimeActivator(
         authority,
         ...(upstream === undefined ? {} : { flushUpstreamLifecycle: () => upstream.publisher.flush() }),
         ...(upstream === undefined ? {} : {
-          // 子模式运行时把后代活动流沿唯一祖先方向转发上行；fire-and-forget，
-          // 失败不回滚本地缓存也不阻塞监督事件处理。
+          // 子模式运行时把后代规范活动条目沿唯一祖先方向转发上行；fire-and-forget，
+          // 失败不回滚任何状态也不阻塞监督事件处理。
           publishUpstreamActivity: (delivery) => {
-            void state.upstream?.channel.publishActivity(delivery).catch(() => {});
+            void state.upstream?.channel.publishActivity({
+              agent_id: delivery.agent_id,
+              entry: delivery.entry,
+            }).catch(() => {});
           },
         }),
       });

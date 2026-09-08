@@ -3,11 +3,10 @@ import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
 import {
   ACTIVITY_MAX_TEXT_BYTES,
   parseAgentActivityDisplayEvent,
-  parseAgentActivityEvent,
   type SafeAgentActivityContentBlock,
   type SafeAgentActivityDisplayEvent,
-  type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
+import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
   displayWidth,
   renderFramedPanelLine,
@@ -27,11 +26,10 @@ const DEFAULT_TOOL_RESULT_COLLAPSE_CHARS = 240;
 const MAX_TOOL_SUMMARY_KEYS = 3;
 const MAX_TOOL_SUMMARY_VALUE_CHARS = 96;
 const MAX_TOOL_SUMMARY_WIDTH = 160;
-const THINKING_LINE_PREFIX = "┆ ";
+const THINKING_COLLAPSED_TEXT = "Thinking";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
-const FOLLOWING_FOOTER_TEXT = "↑↓ scroll · Enter expand · Esc back";
-const PAUSED_FOOTER_TEXT = "paused · ↓ resume · Enter expand · Esc back";
+const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back";
 const RENDER_VIEWER_LINES = Symbol("renderViewerLines");
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const ANSI_ESCAPE_PATTERN = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~]|[()][0-2])/gu;
@@ -77,19 +75,17 @@ export type AgentActivityViewerUpdateOutcome = "changed" | "ignored";
 export interface AgentActivityViewerPublicState {
   readonly event_count: number;
   readonly scroll_offset: number;
+  readonly max_scroll_offset: number;
   readonly follow_enabled: boolean;
   readonly lifecycle_state: AgentLifecycleState;
+  readonly selected_key: string | undefined;
 }
 
 interface ViewerSemanticLine {
   readonly text: string;
   readonly style: UiPanelLineStyle;
-  readonly expandable_tool_call_id?: string;
-}
-
-interface MessageDisplayEntry {
-  readonly kind: "message";
-  content: readonly SafeAgentActivityContentBlock[];
+  /** 可展开条目身份：thinking 组或长工具结果；选中背景只作用于该行。 */
+  readonly selectable_key?: string;
 }
 
 interface ToolDisplayEntry {
@@ -112,25 +108,41 @@ interface LiveMessageEntry {
   readonly blocks: Map<number, LiveMessageBlock>;
 }
 
-type DisplayEntry = MessageDisplayEntry | ToolDisplayEntry;
+/**
+ * 可展开条目身份：规范条目内的 thinking 组使用条目身份加块序号；长工具
+ * 结果使用工具调用身份；实时草稿使用 live 前缀。身份跨重绘稳定。
+ */
+function thinkingKey(entryId: string, blockIndex: number): string {
+  return `thinking:${entryId}:${blockIndex}`;
+}
+
+function liveThinkingKey(streamId: string, contentIndex: number): string {
+  return `thinking:live:${streamId}:${contentIndex}`;
+}
+
+function toolResultKey(toolCallId: string): string {
+  return `tool:${toolCallId}`;
+}
 
 /**
- * 活动查看器的纯交互投影：打开即消费一次全量回放，随后接受追加通知；
- * 自动跟随最新事件、向上滚动暂停、回到底部恢复。它只渲染到显示层，
- * 不向父会话发送消息或追加条目。
+ * 活动查看器的纯交互投影：打开即消费一次全量回放，随后接受追加通知。
+ * text 块独立完整渲染；thinking 默认折叠；Tab/Shift+Tab 在全部可展开
+ * 条目间循环选择；展开暂停自动跟随。它只渲染到显示层，不向父会话发送
+ * 消息或追加条目。
  */
 export class AgentActivityViewerModel {
   private readonly agentId: string;
   private readonly templateId: string;
   private readonly name: string;
   private lifecycleState: AgentLifecycleState;
-  private readonly events: SafeAgentActivityEvent[] = [];
+  private readonly entries: CanonicalAgentActivityEntry[] = [];
   /** 从 bridge 短暂转发的 token 增量；不进入回放、事件数或父端缓存。 */
   private readonly liveMessages = new Map<string, LiveMessageEntry>();
   private readonly viewportHeight: number;
   private readonly collapseLines: number;
   private readonly collapseChars: number;
-  private readonly expandedToolCallIds = new Set<string>();
+  private readonly expandedKeys = new Set<string>();
+  private selectedKey: string | undefined;
   private replayCursor = 0;
   private layoutWidth = DEFAULT_LAYOUT_WIDTH;
   private scrollOffset = 0;
@@ -145,7 +157,7 @@ export class AgentActivityViewerModel {
 
   constructor(
     agent: AgentActivityViewerAgent,
-    replay: readonly SafeAgentActivityEvent[],
+    replay: readonly CanonicalAgentActivityEntry[],
     options: AgentActivityViewerOptions = {},
   ) {
     this.agentId = agent.agent_id;
@@ -162,6 +174,7 @@ export class AgentActivityViewerModel {
       DEFAULT_TOOL_RESULT_COLLAPSE_CHARS,
     );
     this.syncFrom(replay);
+    this.initializeSelection();
   }
 
   get agent_id(): string {
@@ -175,12 +188,9 @@ export class AgentActivityViewerModel {
     return "changed";
   }
 
-  /** 追加一条完整活动事件；违约或超限事件被静默拒绝。 */
-  appendEvent(event: SafeAgentActivityEvent): AgentActivityViewerUpdateOutcome {
-    const parsed = parseAgentActivityEvent(event);
-    if (parsed.kind !== "event") return "ignored";
-    this.events.push(parsed.event);
-    if (parsed.event.type === "message") this.liveMessages.clear();
+  /** 追加一条规范活动条目；违约条目被静默拒绝。 */
+  appendEntry(entry: CanonicalAgentActivityEntry): AgentActivityViewerUpdateOutcome {
+    this.entries.push(entry);
     this.projectionRevision += 1;
     this.cachedProjection = undefined;
     if (!this.batching) this.settleFollow();
@@ -188,19 +198,19 @@ export class AgentActivityViewerModel {
   }
 
   /**
-   * 以缓存全量回放对齐本地事件；只追加尚未落地的新到达部分。
-   * 回放游标独立于事件数，因此被拒绝的输入不会跳过后续合法事件。
+   * 以缓存全量回放对齐本地条目；只追加尚未落地的新到达部分。
+   * 回放游标独立于条目数，因此被拒绝的输入不会跳过后续合法条目。
    */
-  syncFrom(replay: readonly SafeAgentActivityEvent[]): AgentActivityViewerUpdateOutcome {
+  syncFrom(replay: readonly CanonicalAgentActivityEntry[]): AgentActivityViewerUpdateOutcome {
     if (replay.length < this.replayCursor) return "ignored";
     let start = this.replayCursor;
-    if (this.events.length > start && this.replayPrefixMatches(replay)) start = this.events.length;
+    if (this.entries.length > start && this.replayPrefixMatches(replay)) start = this.entries.length;
     let outcome: AgentActivityViewerUpdateOutcome = "ignored";
     this.batching = true;
     try {
       for (let index = start; index < replay.length; index += 1) {
-        const event = replay[index];
-        if (event !== undefined && this.appendEvent(event) === "changed") outcome = "changed";
+        const entry = replay[index];
+        if (entry !== undefined && this.appendEntry(entry) === "changed") outcome = "changed";
       }
     } finally {
       this.batching = false;
@@ -216,7 +226,7 @@ export class AgentActivityViewerModel {
 
   /**
    * 接收仅显示层的有序 token 增量。乱序、重复、超预算或结构违约帧不会进入
-   * 完整活动历史；检测到序号缺口时丢弃该草稿，等待权威 message_end 收束。
+   * 完整活动历史；检测到序号缺口时丢弃该草稿，等待权威条目收束。
    */
   applyDisplayEvent(event: SafeAgentActivityDisplayEvent): AgentActivityViewerUpdateOutcome {
     const parsed = parseAgentActivityDisplayEvent(event);
@@ -272,32 +282,14 @@ export class AgentActivityViewerModel {
     return "changed";
   }
 
-  /** 当前已展开的工具调用 ID；状态不随追加事件丢失。 */
-  getExpandedToolCallIds(): readonly string[] {
-    return Object.freeze([...this.expandedToolCallIds]);
+  /** 当前选中的可展开条目身份；打开时由视口最新可展开项初始化。 */
+  getSelectedKey(): string | undefined {
+    return this.selectedKey;
   }
 
-  /** 按工具调用 ID切换长结果展开状态。 */
-  toggleToolResult(toolCallId: string): AgentActivityViewerUpdateOutcome {
-    if (!this.hasExpandableToolResult(toolCallId)) return "ignored";
-    const expanded = !this.expandedToolCallIds.has(toolCallId);
-    return this.setToolResultExpanded(toolCallId, expanded);
-  }
-
-  /** 显式设置长结果展开状态，便于键盘之外的薄壳接线。 */
-  setToolResultExpanded(
-    toolCallId: string,
-    expanded: boolean,
-  ): AgentActivityViewerUpdateOutcome {
-    if (!this.hasExpandableToolResult(toolCallId)) return "ignored";
-    const alreadyExpanded = this.expandedToolCallIds.has(toolCallId);
-    if (alreadyExpanded === expanded) return "ignored";
-    if (expanded) this.expandedToolCallIds.add(toolCallId);
-    else this.expandedToolCallIds.delete(toolCallId);
-    this.projectionRevision += 1;
-    this.cachedProjection = undefined;
-    this.settleFollow();
-    return "changed";
+  /** 当前处于展开状态的可展开条目身份集合。 */
+  getExpandedKeys(): readonly string[] {
+    return Object.freeze([...this.expandedKeys]);
   }
 
   [RENDER_VIEWER_LINES](width: number): readonly ViewerSemanticLine[] {
@@ -316,33 +308,26 @@ export class AgentActivityViewerModel {
       .map((line) => Object.freeze({
         text: truncateToDisplayWidth(line.text, contentWidth),
         style: line.style,
-        ...(line.expandable_tool_call_id === undefined
-          ? {}
-          : { expandable_tool_call_id: line.expandable_tool_call_id }),
+        selected: line.selectable_key !== undefined && line.selectable_key === this.selectedKey,
       }));
     while (visible.length < this.viewportHeight) {
-      visible.push(Object.freeze({ text: "", style: "body" as const }));
+      visible.push(Object.freeze({ text: "", style: "body" as const, selected: false }));
     }
-    const footer = truncateToDisplayWidth(
-      this.followEnabled ? FOLLOWING_FOOTER_TEXT : PAUSED_FOOTER_TEXT,
-      contentWidth,
-    );
+    const footer = truncateToDisplayWidth(VIEWER_FOOTER_TEXT, contentWidth);
     return Object.freeze([
-      Object.freeze({ text: identity, style: "header" as const }),
+      Object.freeze({ text: identity, style: "header" as const, selected: false }),
       ...visible,
-      Object.freeze({ text: footer, style: "footer" as const }),
+      Object.freeze({ text: footer, style: "footer" as const, selected: false }),
     ]);
   }
 
   handleInput(data: string): AgentActivityViewerInputOutcome {
     if (data === "\x1b") return "close";
-    if (data === "\r" || data === "\n" || data === " " || data === "\x1b[C" || data === "\x1b[D") {
-      const target = this.findExpandableToolCall();
-      if (target === undefined) return "ignored";
-      if (data === "\x1b[C") return this.setToolResultExpanded(target, true);
-      if (data === "\x1b[D") return this.setToolResultExpanded(target, false);
-      return this.toggleToolResult(target);
-    }
+    if (data === "\t") return this.moveSelection(1);
+    if (data === "\x1b[Z") return this.moveSelection(-1);
+    if (data === "\r" || data === "\n" || data === " ") return this.toggleSelectedKey();
+    if (data === "\x1b[C") return this.setSelectedExpansion(true);
+    if (data === "\x1b[D") return this.setSelectedExpansion(false);
 
     const maxOffset = this.maxScrollOffset();
     if (this.followEnabled) this.scrollOffset = maxOffset;
@@ -370,14 +355,16 @@ export class AgentActivityViewerModel {
     this.settleFollow(maxOffset);
     this.scrollOffset = clamp(this.scrollOffset, 0, maxOffset);
     return Object.freeze({
-      event_count: this.events.length,
+      event_count: this.entries.length,
       scroll_offset: this.scrollOffset,
+      max_scroll_offset: maxOffset,
       follow_enabled: this.followEnabled,
       lifecycle_state: this.lifecycleState,
+      selected_key: this.selectedKey,
     });
   }
 
-  /** 跟随时视口始终对齐最新事件；暂停时保持用户当前回看位置。 */
+  /** 跟随时视口始终对齐最新条目；暂停时保持用户当前回看位置。 */
   private settleFollow(maxOffset = this.maxScrollOffset()): void {
     if (this.followEnabled) this.scrollOffset = Math.max(0, maxOffset);
   }
@@ -391,35 +378,104 @@ export class AgentActivityViewerModel {
     this.cachedProjection = undefined;
   }
 
-  private replayPrefixMatches(replay: readonly SafeAgentActivityEvent[]): boolean {
-    if (this.events.length > replay.length) return false;
-    for (let index = 0; index < this.events.length; index += 1) {
-      const left = this.events[index];
-      const right = replay[index];
-      if (left === undefined || right === undefined || !sameEvent(left, right)) return false;
-    }
-    return true;
-  }
-
-  private findExpandableToolCall(): string | undefined {
+  /** 打开时选择当前视口中最新的可展开项；没有可展开项时不建立虚假选择。 */
+  private initializeSelection(): void {
     const lines = this.eventLines(this.layoutWidth);
-    const visibleStart = this.scrollOffset;
-    const visibleEnd = visibleStart + this.viewportHeight;
-    const visible = lines.slice(visibleStart, visibleEnd).find((line) =>
-      line.expandable_tool_call_id !== undefined
-    );
-    if (visible?.expandable_tool_call_id !== undefined) return visible.expandable_tool_call_id;
-    const next = lines.slice(visibleEnd).find((line) => line.expandable_tool_call_id !== undefined);
-    if (next?.expandable_tool_call_id !== undefined) return next.expandable_tool_call_id;
-    let previous: ViewerSemanticLine | undefined;
-    for (let index = Math.min(visibleStart, lines.length) - 1; index >= 0; index -= 1) {
-      const candidate = lines[index];
-      if (candidate?.expandable_tool_call_id !== undefined) {
-        previous = candidate;
-        break;
+    const viewportStart = Math.max(0, lines.length - this.viewportHeight);
+    for (let index = lines.length - 1; index >= viewportStart; index -= 1) {
+      const key = lines[index]?.selectable_key;
+      if (key !== undefined) {
+        this.selectedKey = key;
+        return;
       }
     }
-    return previous?.expandable_tool_call_id;
+    this.selectedKey = undefined;
+  }
+
+  /** Tab/Shift+Tab 循环选择；Tab 回到最新条目时恢复自动跟随。 */
+  private moveSelection(direction: 1 | -1): AgentActivityViewerInputOutcome {
+    const keys = this.selectableKeys();
+    if (keys.length === 0) return "ignored";
+    const latest = keys.at(-1);
+    let next: string | undefined;
+    if (this.selectedKey === undefined || !keys.includes(this.selectedKey)) {
+      next = direction === 1 ? keys[0] : latest;
+    } else {
+      const index = keys.indexOf(this.selectedKey);
+      next = keys[(index + direction + keys.length) % keys.length];
+    }
+    if (next === undefined) return "ignored";
+    this.selectedKey = next;
+    this.followEnabled = next === latest;
+    this.ensureLineVisible(next);
+    return "changed";
+  }
+
+  private selectableKeys(): readonly string[] {
+    const lines = this.eventLines(this.layoutWidth);
+    const keys: string[] = [];
+    for (const line of lines) {
+      if (line.selectable_key !== undefined && !keys.includes(line.selectable_key)) {
+        keys.push(line.selectable_key);
+      }
+    }
+    return keys;
+  }
+
+  /** 视口外目标只触发使其刚好可见的最小滚动。 */
+  private ensureLineVisible(key: string): void {
+    const lines = this.eventLines(this.layoutWidth);
+    const index = lines.findIndex((line) => line.selectable_key === key);
+    if (index < 0) return;
+    if (index < this.scrollOffset) {
+      this.scrollOffset = index;
+      return;
+    }
+    if (index >= this.scrollOffset + this.viewportHeight) {
+      this.scrollOffset = index - this.viewportHeight + 1;
+    }
+  }
+
+  private toggleSelectedKey(): AgentActivityViewerInputOutcome {
+    if (this.selectedKey === undefined) return "ignored";
+    return this.setKeyExpanded(this.selectedKey, !this.expandedKeys.has(this.selectedKey));
+  }
+
+  private setSelectedExpansion(expanded: boolean): AgentActivityViewerInputOutcome {
+    if (this.selectedKey === undefined) return "ignored";
+    if (this.expandedKeys.has(this.selectedKey) === expanded) return "ignored";
+    return this.setKeyExpanded(this.selectedKey, expanded);
+  }
+
+  private setKeyExpanded(key: string, expanded: boolean): AgentActivityViewerInputOutcome {
+    if (!this.isExpandableKey(key)) return "ignored";
+    if (expanded) {
+      this.expandedKeys.add(key);
+      // 展开保持当前屏幕位置并暂停自动跟随；折叠不自动恢复。
+      this.followEnabled = false;
+    } else {
+      this.expandedKeys.delete(key);
+    }
+    this.touchProjection();
+    this.settleFollow();
+    return "changed";
+  }
+
+  private isExpandableKey(key: string): boolean {
+    if (typeof key !== "string" || key.length === 0) return false;
+    if (key.startsWith("thinking:")) return true;
+    if (key.startsWith("tool:")) return this.hasExpandableToolResult(key.slice("tool:".length));
+    return false;
+  }
+
+  private replayPrefixMatches(replay: readonly CanonicalAgentActivityEntry[]): boolean {
+    if (this.entries.length > replay.length) return false;
+    for (let index = 0; index < this.entries.length; index += 1) {
+      const left = this.entries[index];
+      const right = replay[index];
+      if (left === undefined || right === undefined || !sameEntry(left, right)) return false;
+    }
+    return true;
   }
 
   private hasExpandableToolResult(toolCallId: string): boolean {
@@ -437,64 +493,68 @@ export class AgentActivityViewerModel {
     return safe.split("\n").length > this.collapseLines || displayWidth(safe) > this.collapseChars;
   }
 
-  /** 将完整活动事件投影成消息与工具行，保留每条 message 的权威边界。 */
+  /** 将规范条目投影成消息与工具行，保留每条 message 的权威边界。 */
   private projectEntries(): DisplayEntry[] {
     const entries: DisplayEntry[] = [];
     const activeTools = new Map<string, ToolDisplayEntry>();
 
-    for (const event of this.events) {
-      if (event.type === "message") {
-        entries.push({ kind: "message", content: event.content });
+    for (const entry of this.entries) {
+      const body = entry.body;
+      if (body.type === "message") {
+        entries.push({ kind: "message", entryId: entry.entry_id, content: body.content });
         continue;
       }
 
-      if (event.type === "tool_execution_start") {
-        const entry: ToolDisplayEntry = {
+      if (body.type === "tool_execution_start") {
+        const tool: ToolDisplayEntry = {
           kind: "tool",
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          args: event.args,
+          toolCallId: body.toolCallId,
+          toolName: body.toolName,
+          args: body.args,
           result: undefined,
           isError: false,
           hasResult: false,
         };
-        entries.push(entry);
-        activeTools.set(event.toolCallId, entry);
+        entries.push(tool);
+        activeTools.set(body.toolCallId, tool);
         continue;
       }
 
-      const existing = activeTools.get(event.toolCallId);
+      const existing = activeTools.get(body.toolCallId);
       if (existing === undefined) {
-        const entry: ToolDisplayEntry = {
+        const tool: ToolDisplayEntry = {
           kind: "tool",
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
+          toolCallId: body.toolCallId,
+          toolName: body.toolName,
           args: undefined,
-          result: event.result,
-          isError: event.isError === true,
+          result: body.result,
+          isError: body.isError === true,
           hasResult: true,
         };
-        entries.push(entry);
-        activeTools.set(event.toolCallId, entry);
+        entries.push(tool);
+        activeTools.set(body.toolCallId, tool);
       } else {
-        existing.toolName = event.toolName;
-        existing.result = event.result;
-        existing.isError = event.isError === true;
+        existing.toolName = body.toolName;
+        existing.result = body.result;
+        existing.isError = body.isError === true;
         existing.hasResult = true;
       }
     }
-    for (const live of this.liveMessages.values()) {
+    for (const [streamId, live] of this.liveMessages) {
       const content = [...live.blocks.entries()]
         .sort(([left], [right]) => left - right)
-        .map(([, block]) => block.contentType === "text"
-          ? Object.freeze({ type: "text" as const, text: block.value })
-          : Object.freeze({ type: "thinking" as const, thinking: block.value }));
-      if (content.length > 0) entries.push({ kind: "message", content });
+        .map(([contentIndex, block]) => Object.freeze({
+          key: liveThinkingKey(streamId, contentIndex),
+          block: (block.contentType === "text"
+            ? Object.freeze({ type: "text" as const, text: block.value })
+            : Object.freeze({ type: "thinking" as const, thinking: block.value })),
+        }));
+      if (content.length > 0) entries.push({ kind: "live", content });
     }
     return entries;
   }
 
-  /** 把活动事件闭集渲染为语义行；事件数为零时给出明确空态。 */
+  /** 把规范条目闭集渲染为语义行；条目数为零时给出明确空态。 */
   private eventLines(width: number): readonly ViewerSemanticLine[] {
     const contentWidth = validRenderWidth(width);
     if (
@@ -503,7 +563,7 @@ export class AgentActivityViewerModel {
       && this.cachedProjection.revision === this.projectionRevision
     ) return this.cachedProjection.lines;
 
-    if (this.events.length === 0 && this.liveMessages.size === 0) {
+    if (this.entries.length === 0 && this.liveMessages.size === 0) {
       const empty = Object.freeze([{ text: EMPTY_ACTIVITY_TEXT, style: "body" as const }]);
       this.cachedProjection = { width: contentWidth, revision: this.projectionRevision, lines: empty };
       return empty;
@@ -512,15 +572,35 @@ export class AgentActivityViewerModel {
     const lines: ViewerSemanticLine[] = [];
     for (const entry of this.projectEntries()) {
       if (entry.kind === "message") {
+        let blockIndex = 0;
         for (const block of entry.content) {
-          const raw = block.type === "text" ? block.text : block.thinking;
-          const prefix = block.type === "thinking" ? THINKING_LINE_PREFIX : "";
-          lines.push(...renderMarkdownBlock(
-            raw,
-            contentWidth,
-            prefix,
-            block.type === "thinking" ? "terminal" : "body",
-          ));
+          if (block.type === "text") {
+            lines.push(...renderMarkdownBlock(block.text, contentWidth, "body"));
+          } else {
+            lines.push(...renderThinkingBlock(
+              block.thinking,
+              contentWidth,
+              thinkingKey(entry.entryId, blockIndex),
+              this.expandedKeys.has(thinkingKey(entry.entryId, blockIndex)),
+            ));
+          }
+          blockIndex += 1;
+        }
+        continue;
+      }
+
+      if (entry.kind === "live") {
+        for (const item of entry.content) {
+          if (item.block.type === "text") {
+            lines.push(...renderMarkdownBlock(item.block.text, contentWidth, "body"));
+          } else {
+            lines.push(...renderThinkingBlock(
+              item.block.thinking,
+              contentWidth,
+              item.key,
+              this.expandedKeys.has(item.key),
+            ));
+          }
         }
         continue;
       }
@@ -534,12 +614,13 @@ export class AgentActivityViewerModel {
 
       const result = decodeToolResult(entry.result);
       const long = this.isLongResult(result);
-      if (long && !this.expandedToolCallIds.has(entry.toolCallId)) {
+      const key = toolResultKey(entry.toolCallId);
+      if (long && !this.expandedKeys.has(key)) {
         const count = result.split("\n").length;
         lines.push(Object.freeze({
           text: `${entry.isError ? "×" : "✓"} ${safeUiFact(entry.toolName)} · result collapsed (${count} lines; Enter to expand)`,
           style: entry.isError ? "error" : "footer",
-          expandable_tool_call_id: entry.toolCallId,
+          selectable_key: key,
         }));
         continue;
       }
@@ -548,7 +629,7 @@ export class AgentActivityViewerModel {
         entry,
         result,
         contentWidth,
-        long ? entry.toolCallId : undefined,
+        long ? key : undefined,
       ));
     }
 
@@ -557,6 +638,21 @@ export class AgentActivityViewerModel {
     return frozen;
   }
 }
+
+type DisplayEntry =
+  | {
+      readonly kind: "message";
+      readonly entryId: string;
+      readonly content: readonly SafeAgentActivityContentBlock[];
+    }
+  | {
+      readonly kind: "live";
+      readonly content: readonly {
+        readonly key: string;
+        readonly block: SafeAgentActivityContentBlock;
+      }[];
+    }
+  | ToolDisplayEntry;
 
 /** 将纯查看器投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
 export function renderAgentActivityViewerSurface(
@@ -582,7 +678,7 @@ export function renderAgentActivityViewerSurface(
         line.text,
         panelWidth,
         line.style,
-        false,
+        (line as { readonly selected?: boolean }).selected === true,
         theme,
       )),
       renderNarrowPanelLine(footer, panelWidth, "footer", false, theme),
@@ -597,7 +693,7 @@ export function renderAgentActivityViewerSurface(
       line.text,
       contentWidth,
       line.style,
-      false,
+      (line as { readonly selected?: boolean }).selected === true,
       theme,
     )),
     renderPanelRule(panelWidth, "divider", theme),
@@ -615,50 +711,73 @@ function unavailableViewerLines(width: number): readonly ViewerSemanticLine[] {
   return Object.freeze(lines.map((line) => Object.freeze(line)));
 }
 
+/** text 块按正常 Markdown 完整渲染；不增加角色标签、容器或分隔线。 */
 function renderMarkdownBlock(
   raw: string,
   width: number,
-  prefix: string,
   style: UiPanelLineStyle,
 ): readonly ViewerSemanticLine[] {
   const safe = sanitizeViewerMarkup(raw);
   if (safe.length === 0) return Object.freeze([]);
-  const availableWidth = Math.max(1, width - displayWidth(prefix));
   let rendered: readonly string[];
   try {
-    rendered = new Markdown(safe, 0, 0, PLAIN_MARKDOWN_THEME).render(availableWidth);
+    rendered = new Markdown(safe, 0, 0, PLAIN_MARKDOWN_THEME).render(width);
   } catch {
-    rendered = wrapPlainText(safe, availableWidth);
+    rendered = wrapPlainText(safe, width);
   }
   const lines = rendered.map((line) => {
     const clean = sanitizeViewerMarkup(line).replace(/[ \t]+$/u, "");
-    return Object.freeze({ text: `${prefix}${clean}`, style });
+    return Object.freeze({ text: clean, style });
   });
   return Object.freeze(lines);
+}
+
+/**
+ * thinking 块默认折叠为不含行数与预览的 `Thinking`；展开后保留标题并以
+ * 顶格、弱化、无逐行前缀、无独立背景的 Markdown 显示。
+ */
+function renderThinkingBlock(
+  raw: string,
+  width: number,
+  key: string,
+  expanded: boolean,
+): readonly ViewerSemanticLine[] {
+  const title: ViewerSemanticLine = Object.freeze({
+    text: THINKING_COLLAPSED_TEXT,
+    style: "terminal" as const,
+    selectable_key: key,
+  });
+  if (!expanded) return Object.freeze([title]);
+  const body = renderMarkdownBlock(raw, width, "terminal");
+  return Object.freeze([title, ...body]);
 }
 
 function renderToolResult(
   entry: ToolDisplayEntry,
   result: string,
   width: number,
-  expandableToolCallId?: string,
+  selectableKey?: string,
 ): readonly ViewerSemanticLine[] {
   const marker = entry.isError ? "×" : "✓";
   const style: UiPanelLineStyle = entry.isError ? "error" : "terminal";
   if (result.length === 0) {
-    return Object.freeze([{ text: `${marker} ${safeUiFact(entry.toolName)}`, style }]);
+    return Object.freeze([Object.freeze({
+      text: `${marker} ${safeUiFact(entry.toolName)}`,
+      style,
+      ...(selectableKey === undefined ? {} : { selectable_key: selectableKey }),
+    })]);
   }
   const wrapped = result
     .split("\n")
     .flatMap((line) => wrapPlainLine(line, Math.max(1, width - 2)));
   const first = wrapped[0] ?? "";
-  const lines: ViewerSemanticLine[] = [{
+  const lines: ViewerSemanticLine[] = [Object.freeze({
     text: `${marker} ${safeUiFact(entry.toolName)}${first.length === 0 ? "" : ` · ${first}`}`,
     style,
-    ...(expandableToolCallId === undefined ? {} : { expandable_tool_call_id: expandableToolCallId }),
-  }];
-  for (const line of wrapped.slice(1)) lines.push({ text: `  ${line}`, style });
-  return Object.freeze(lines.map((line) => Object.freeze(line)));
+    ...(selectableKey === undefined ? {} : { selectable_key: selectableKey }),
+  })];
+  for (const line of wrapped.slice(1)) lines.push(Object.freeze({ text: `  ${line}`, style }));
+  return Object.freeze(lines);
 }
 
 function summarizeToolArguments(raw: string | undefined): string {
@@ -791,7 +910,7 @@ function sanitizeViewerMarkup(value: string): string {
     .replace(UNSAFE_CONTROL_PATTERN, " ");
 }
 
-function sameEvent(left: SafeAgentActivityEvent, right: SafeAgentActivityEvent): boolean {
+function sameEntry(left: CanonicalAgentActivityEntry, right: CanonicalAgentActivityEntry): boolean {
   try {
     return JSON.stringify(left) === JSON.stringify(right);
   } catch {

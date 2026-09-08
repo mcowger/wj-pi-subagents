@@ -11,9 +11,9 @@ import {
   AgentActivityViewerModel,
   renderAgentActivityViewerSurface,
 } from "./agent-activity-viewer.ts";
+import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import type {
   SafeAgentActivityDisplayEvent,
-  SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
 import {
   displayWidth,
@@ -79,7 +79,7 @@ export interface AgentTreeSnapshotSource {
 
 /** 活动流缓存来源 seam：查看器 overlay 只通过它读取回放与变更通知。 */
 export interface AgentActivityStreamSource {
-  readReplay(agentId: string): readonly SafeAgentActivityEvent[];
+  readReplay(agentId: string): readonly CanonicalAgentActivityEntry[];
   onChange(listener: (agentId: string) => void): () => void;
   /** 可选的 display-only token delta；无回放、无缓存、不向父层汇聚。 */
   onDisplayChange?(
@@ -387,7 +387,7 @@ export function bindAgentTreeUi(
     try {
       invocation = custom.call(context.ui, (tui, theme, _keybindings, done) => {
         let closed = false;
-        let replay: readonly SafeAgentActivityEvent[] = [];
+        let replay: readonly CanonicalAgentActivityEntry[] = [];
         try {
           replay = activity.readReplay(node.agent_id);
         } catch {

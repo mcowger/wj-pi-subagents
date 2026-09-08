@@ -367,6 +367,15 @@ function failAndExit(faultCode: "protocol_fault" | "process_exit"): void {
 
 function emitEvent(event: unknown): void {
   if (stopping) return;
+  // 超出桥接外层帧预算的活动事件静默跳过：完整正文的权威传输由监督通道
+  // 分块上行，RPC 桥路径的缺失是静默缺口，不中断会话。
+  try {
+    const body = JSON.stringify({ protocol: PROTOCOL, kind: "event", event });
+    if (new TextEncoder().encode(body).byteLength > MAX_FRAME_BYTES) return;
+  } catch {
+    failAndExit("protocol_fault");
+    return;
+  }
   try {
     writeFrame({ protocol: PROTOCOL, kind: "event", event });
   } catch {
