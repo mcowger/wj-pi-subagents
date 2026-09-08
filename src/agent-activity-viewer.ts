@@ -678,11 +678,16 @@ export class AgentActivityViewerModel {
           - displayWidth(suffix);
         lines.push(Object.freeze({
           text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${
-            formatFileToolSummary(entry.summary, summaryWidth)
+            formatPiToolSummary(entry.summary, summaryWidth)
           }${suffix}`,
           style: visual.style,
           ...(expandable ? { selectable_key: toolErrorKey(entry.entryId) } : {}),
         }));
+        // Shell 工具的完整 command 始终在摘要行下方的独立代码区域显示：
+        // 状态变化只更新摘要行，命令区域不重排。
+        if (entry.summary.tool === "bash" || entry.summary.tool === "powershell") {
+          lines.push(...renderShellCommandBody(entry.summary.command, contentWidth));
+        }
         if (expanded && entry.errorText !== undefined) {
           lines.push(...renderToolErrorBody(entry.errorText, contentWidth));
         }
@@ -850,6 +855,23 @@ function renderToolErrorBody(
 }
 
 /**
+ * Shell 工具的完整命令：独立代码区域。统一工具正文背景，顶格、不折叠、
+ * 不缩进、不做内容截断；单行与多行命令采用同一种结构（软换行不丢失字符）。
+ * 该区域始终显示，不需要展开操作，也不随状态变化重排。
+ */
+function renderShellCommandBody(
+  command: string,
+  width: number,
+): readonly ViewerSemanticLine[] {
+  const safe = sanitizeViewerMarkup(command);
+  if (safe.length === 0) return Object.freeze([]);
+  return Object.freeze(wrapPlainText(safe, width).map((line) => Object.freeze({
+    text: line,
+    style: "body" as const,
+  })));
+}
+
+/**
  * 超宽路径中间省略：保留首尾两端，中间以单个省略号连接；在字素簇边界
  * 切分，不切断组合字符或宽字符。
  */
@@ -943,6 +965,17 @@ function summaryFragments(summary: SafePiToolSummary): SummaryFragments {
       ];
       return { head: ["ls"], path: summary.path, tail };
     }
+    case "write":
+    case "edit": {
+      // 成功与失败摘要都只有 path：写入/编辑统计不属于展示闭集。
+      return { head: [summary.tool], path: summary.path, tail: [] };
+    }
+    case "bash":
+    case "powershell": {
+      // 状态摘要只显示工具名和可选 timeout；完整 command 在独立代码区域。
+      const tail = summary.timeout === undefined ? [] : [`timeout ${summary.timeout}`];
+      return { head: [summary.tool], path: "", tail };
+    }
   }
 }
 
@@ -960,7 +993,7 @@ function readTruncationFacts(
  * 专用摘要单行格式：状态图标与折叠标记之外的全部内容。长路径中间省略
  * 保留两端；其余超宽内容依赖整行右侧省略兜底。
  */
-function formatFileToolSummary(summary: SafePiToolSummary, contentWidth: number): string {
+function formatPiToolSummary(summary: SafePiToolSummary, contentWidth: number): string {
   const fragments = summaryFragments(summary);
   const head = fragments.head.join(SUMMARY_SEPARATOR);
   const tail = fragments.tail.join(SUMMARY_SEPARATOR);

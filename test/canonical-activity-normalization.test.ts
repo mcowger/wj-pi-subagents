@@ -809,3 +809,338 @@ test("活动事件闭集只允许专用工具携带摘要与错误正文，结�
     errorText: "Path not found",
   }).kind, "event");
 });
+
+/** Pi 原生 write/edit/bash 事件的原始形状（参数在 start，结果在 end）。 */
+function mutationStart(toolName: string, args: unknown): unknown {
+  return {
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName,
+    args,
+  };
+}
+
+function mutationEnd(toolName: string, result: unknown, isError = false): unknown {
+  return {
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName,
+    result,
+    isError,
+  };
+}
+
+test("write 开始事实只保留 path，写入正文与未来字段永不跨进程", () => {
+  const normalized = normalizeOwnToolActivityEvent(mutationStart("write", {
+    path: "out/result.md",
+    content: "机密正文不得跨进程",
+    futureField: { nested: [1, 2, 3] },
+  }), "pi_native");
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(normalized.event), { tool: "write", path: "out/result.md" });
+  const serialized = JSON.stringify(normalized.event);
+  assert.equal(serialized.includes("机密正文"), false);
+  assert.equal(serialized.includes("futureField"), false);
+});
+
+test("write 成功与失败摘要都只显示 path，写入统计不进入闭集", () => {
+  const startArgs = { path: "out/result.md", content: "line1\nline2\nline3" };
+  // 成功：行数、UTF-8 字节大小等任何写入统计都不携带；成功结果正文不跨进程。
+  const success = normalizeOwnToolActivityEvent(mutationEnd("write", {
+    content: [{ type: "text", text: "Successfully wrote to out/result.md" }],
+    details: undefined,
+  }), "pi_native", startArgs);
+  assert.equal(success.kind, "event");
+  if (success.kind !== "event" || success.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(success.event), { tool: "write", path: "out/result.md" });
+  const serialized = JSON.stringify(success.event);
+  assert.equal(serialized.includes("Successfully wrote"), false);
+  assert.equal(serialized.includes("line1"), false);
+  assert.equal(serialized.includes("lines"), false);
+  assert.equal(serialized.includes("bytes"), false);
+
+  // 失败：同样只显示 path，不显示未发生写入的统计；错误正文可携带。
+  const failure = normalizeOwnToolActivityEvent(mutationEnd("write", {
+    content: [{ type: "text", text: "Error: EACCES: permission denied, open '/etc/hosts'" }],
+  }, true), "pi_native", { path: "/etc/hosts", content: "irrelevant" });
+  assert.equal(failure.kind, "event");
+  if (failure.kind !== "event" || failure.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(failure.event), { tool: "write", path: "/etc/hosts" });
+  assert.equal(
+    failure.event.errorText,
+    "Error: EACCES: permission denied, open '/etc/hosts'",
+  );
+  assert.equal(JSON.stringify(failure.event).includes("lines"), false);
+});
+
+test("edit 成功与失败摘要都只显示 path，替换正文与 diff/patch 不跨进程", () => {
+  const startArgs = {
+    path: "src/a.ts",
+    edits: [
+      { oldText: "机密旧文本不得跨进程", newText: "新文本也不得跨进程" },
+      { oldText: "second", newText: "second-new" },
+    ],
+  };
+  // 成功：edits 数量、diff、patch、首个修改行都不携带；成功结果正文不跨进程。
+  const success = normalizeOwnToolActivityEvent(mutationEnd("edit", {
+    content: [{ type: "text", text: "Successfully replaced 2 block(s) in src/a.ts." }],
+    details: {
+      diff: "diff 正文不得跨进程",
+      patch: "patch 不得跨进程",
+      firstChangedLine: "首修改行不得跨进程",
+    },
+  }), "pi_native", startArgs);
+  assert.equal(success.kind, "event");
+  if (success.kind !== "event" || success.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(success.event), { tool: "edit", path: "src/a.ts" });
+  const serialized = JSON.stringify(success.event);
+  assert.equal(serialized.includes("机密旧文本"), false);
+  assert.equal(serialized.includes("新文本也不得"), false);
+  assert.equal(serialized.includes("diff"), false);
+  assert.equal(serialized.includes("patch"), false);
+  assert.equal(serialized.includes("firstChangedLine"), false);
+  assert.equal(serialized.includes("edits"), false);
+
+  // 失败：只显示 path，不显示编辑块数；错误正文可携带。
+  const failure = normalizeOwnToolActivityEvent(mutationEnd("edit", {
+    content: [{ type: "text", text: "Could not find unique text to replace in src/a.ts." }],
+  }, true), "pi_native", startArgs);
+  assert.equal(failure.kind, "event");
+  if (failure.kind !== "event" || failure.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(failure.event), { tool: "edit", path: "src/a.ts" });
+  assert.equal(
+    failure.event.errorText,
+    "Could not find unique text to replace in src/a.ts.",
+  );
+  assert.equal(JSON.stringify(failure.event).includes("edits"), false);
+});
+
+test("bash 与 powershell 摘要保留完整 command 与非默认 timeout，输出与错误正文不进闭集", () => {
+  for (const toolName of ["bash", "powershell"] as const) {
+    const start = normalizeOwnToolActivityEvent(mutationStart(toolName, {
+      command: "echo hello",
+      timeout: 5,
+    }), "pi_native");
+    assert.equal(start.kind, "event", toolName);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.deepEqual(
+      summaryOf(start.event),
+      { tool: toolName, command: "echo hello", timeout: 5 },
+      toolName,
+    );
+
+    // 成功：stdout、truncation 详情与临时输出路径全部不跨进程；无 errorText。
+    const success = normalizeOwnToolActivityEvent(mutationEnd(toolName, {
+      content: [{ type: "text", text: "hello\n命令输出不得跨进程" }],
+      details: {
+        truncation: { truncated: true, truncatedBy: "lines" },
+        fullOutputPath: "/tmp/pi-bash-temp",
+      },
+    }), "pi_native", { command: "echo hello", timeout: 5 });
+    assert.equal(success.kind, "event", toolName);
+    if (success.kind !== "event" || success.event.type !== "tool_execution_end") continue;
+    assert.deepEqual(
+      summaryOf(success.event),
+      { tool: toolName, command: "echo hello", timeout: 5 },
+      toolName,
+    );
+    assert.equal(success.event.errorText, undefined, toolName);
+    const serialized = JSON.stringify(success.event);
+    assert.equal(serialized.includes("命令输出"), false, toolName);
+    assert.equal(serialized.includes("/tmp/pi-bash-temp"), false, toolName);
+
+    // 失败（退出码、超时或取消）：摘要不变，异常正文不进入事件。
+    const failure = normalizeOwnToolActivityEvent(mutationEnd(toolName, {
+      content: [{ type: "text", text: "hello\n\nCommand exited with code 1" }],
+    }, true), "pi_native", { command: "echo hello", timeout: 5 });
+    assert.equal(failure.kind, "event", toolName);
+    if (failure.kind !== "event" || failure.event.type !== "tool_execution_end") continue;
+    assert.deepEqual(
+      summaryOf(failure.event),
+      { tool: toolName, command: "echo hello", timeout: 5 },
+      toolName,
+    );
+    assert.equal(failure.event.errorText, undefined, toolName);
+    assert.equal(JSON.stringify(failure.event).includes("exited with code"), false, toolName);
+  }
+
+  // 未提供 timeout 时不携带该字段。
+  const noTimeout = normalizeOwnToolActivityEvent(mutationStart("bash", { command: "ls" }), "pi_native");
+  assert.equal(noTimeout.kind, "event");
+  if (noTimeout.kind !== "event" || noTimeout.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(noTimeout.event), { tool: "bash", command: "ls" });
+});
+
+test("bash timeout 值域偏离只导致字段不携带，不降级为兜底", () => {
+  const start = normalizeOwnToolActivityEvent(
+    mutationStart("bash", { command: "ls", timeout: -5 }),
+    "pi_native",
+  );
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(start.event), { tool: "bash", command: "ls" });
+});
+
+test("命令正文的控制字符在产生端净化且保留多行结构", () => {
+  const normalized = normalizeOwnToolActivityEvent(mutationStart("bash", {
+    command: "echo \u001b[31m-red\u001b[0m\nsecond\u0007 bell\r\nthird\u202e override",
+  }), "pi_native");
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(normalized.event), {
+    tool: "bash",
+    command: "echo -red\nsecond  bell\nthird  override",
+  });
+});
+
+test("write/edit/bash/powershell 必需字段缺失或类型错误时完整降级为安全兜底", () => {
+  const cases: readonly {
+    readonly toolName: string;
+    readonly startArgs: unknown;
+  }[] = [
+    { toolName: "write", startArgs: { content: "x" } },
+    { toolName: "write", startArgs: { path: "a.txt" } },
+    { toolName: "write", startArgs: { path: 42, content: "x" } },
+    { toolName: "write", startArgs: { path: "a.txt", content: 42 } },
+    { toolName: "edit", startArgs: { path: "a.ts" } },
+    { toolName: "edit", startArgs: { path: "a.ts", edits: "not-array" } },
+    { toolName: "edit", startArgs: { path: "a.ts", edits: [{ oldText: "x" }] } },
+    { toolName: "edit", startArgs: { path: "a.ts", edits: [{ oldText: "x", newText: "y" }, "junk"] } },
+    { toolName: "bash", startArgs: { timeout: 5 } },
+    { toolName: "bash", startArgs: { command: 42 } },
+    { toolName: "bash", startArgs: { command: "ls", timeout: "5" } },
+    { toolName: "powershell", startArgs: {} },
+  ];
+  for (const item of cases) {
+    const start = normalizeOwnToolActivityEvent({
+      type: "tool_execution_start",
+      toolCallId: "call_1",
+      toolName: item.toolName,
+      args: item.startArgs,
+    }, "pi_native");
+    assert.equal(start.kind, "event", item.toolName);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.equal(start.event.summary, undefined, item.toolName);
+
+    const end = normalizeOwnToolActivityEvent({
+      type: "tool_execution_end",
+      toolCallId: "call_1",
+      toolName: item.toolName,
+      result: { content: [{ type: "text", text: "anything" }] },
+      isError: false,
+    }, "pi_native", item.startArgs);
+    assert.equal(end.kind, "event", item.toolName);
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    assert.equal(end.event.summary, undefined, item.toolName);
+    assert.equal(end.event.errorText, undefined, item.toolName);
+  }
+});
+
+test("同名覆盖的 write/edit/bash 不产生专用摘要，错误正文随降级丢弃", () => {
+  const writeEnd = normalizeOwnToolActivityEvent(mutationEnd("write", {
+    content: [{ type: "text", text: "覆盖实现错误正文不得跨进程" }],
+  }, true), "unknown", { path: "a.txt", content: "x" });
+  assert.equal(writeEnd.kind, "event");
+  if (writeEnd.kind !== "event" || writeEnd.event.type !== "tool_execution_end") return;
+  assert.equal(writeEnd.event.summary, undefined);
+  assert.equal(writeEnd.event.errorText, undefined);
+
+  const bashEnd = normalizeOwnToolActivityEvent(mutationEnd("bash", {
+    content: [{ type: "text", text: "覆盖实现输出不得跨进程" }],
+  }, true), "unknown", { command: "ls" });
+  assert.equal(bashEnd.kind, "event");
+  if (bashEnd.kind !== "event" || bashEnd.event.type !== "tool_execution_end") return;
+  assert.equal(bashEnd.event.summary, undefined);
+  assert.equal(bashEnd.event.errorText, undefined);
+});
+
+test("write/bash 结束事实缺少缓存的开始参数时降级为无摘要兜底", () => {
+  const writeEnd = normalizeOwnToolActivityEvent(mutationEnd("write", {
+    content: [{ type: "text", text: "ok" }],
+  }), "pi_native");
+  assert.equal(writeEnd.kind, "event");
+  if (writeEnd.kind !== "event" || writeEnd.event.type !== "tool_execution_end") return;
+  assert.equal(writeEnd.event.summary, undefined);
+
+  const bashEnd = normalizeOwnToolActivityEvent(mutationEnd("bash", {
+    content: [{ type: "text", text: "out" }],
+  }), "pi_native");
+  assert.equal(bashEnd.kind, "event");
+  if (bashEnd.kind !== "event" || bashEnd.event.type !== "tool_execution_end") return;
+  assert.equal(bashEnd.event.summary, undefined);
+});
+
+test("活动事件闭集对 Shell 工具拒绝错误正文，write/edit 可携带且键集合严格闭合", () => {
+  // Shell 工具失败不携带错误正文：携带即协议违约。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "bash",
+    origin: "pi_native",
+    isError: true,
+    summary: { tool: "bash", command: "ls" },
+    errorText: "Shell 异常正文不得进入闭集",
+  }).kind, "invalid");
+  // write/edit 失败携带 errorText 合法。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "write",
+    origin: "pi_native",
+    isError: true,
+    summary: { tool: "write", path: "a.txt" },
+    errorText: "permission denied",
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "edit",
+    origin: "pi_native",
+    isError: true,
+    summary: { tool: "edit", path: "a.ts" },
+    errorText: "not found",
+  }).kind, "event");
+  // Shell 摘要缺 command 判 invalid。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "bash",
+    origin: "pi_native",
+    summary: { tool: "bash", timeout: 5 },
+  }).kind, "invalid");
+  // Shell 摘要未知键（stdout）判 invalid。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "bash",
+    origin: "pi_native",
+    summary: { tool: "bash", command: "ls", stdout: "x" },
+  }).kind, "invalid");
+  // write 摘要未知键（lines 统计）判 invalid。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "write",
+    origin: "pi_native",
+    isError: false,
+    summary: { tool: "write", path: "a.txt", lines: 3 },
+  }).kind, "invalid");
+  // edit 摘要未知键（edits 统计）判 invalid。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "edit",
+    origin: "pi_native",
+    isError: false,
+    summary: { tool: "edit", path: "a.ts", edits: 2 },
+  }).kind, "invalid");
+  // plugin 来源的 write 摘要判 invalid。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "write",
+    origin: "plugin",
+    summary: { tool: "write", path: "a.txt" },
+  }).kind, "invalid");
+});

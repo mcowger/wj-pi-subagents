@@ -27,10 +27,21 @@ export function isSafeToolOrigin(value: unknown): value is SafeToolOrigin {
 }
 
 /**
- * 允许专用摘要规则的 Pi 原生工具名闭集（工单 03：文件读取与检索）。
- * 只有来源验证为 pi_native 的同名实现才能携带专用摘要。
+ * 允许专用摘要规则的 Pi 原生工具名闭集（工单 03：文件读取与检索；工单 04：
+ * 文件修改与 Shell）。只有来源验证为 pi_native 的同名实现才能携带专用摘要。
  */
-export const FILE_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set(["read", "grep", "find", "ls"]);
+export const PI_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
+  "read", "grep", "find", "ls", "write", "edit", "bash", "powershell",
+]);
+
+/**
+ * 允许失败事实携带完整原始错误正文的 Pi 原生工具闭集。Shell 工具（bash/
+ * powershell）除外：其失败只表达成功或失败，stdout、stderr、退出码、超时
+ * 正文与异常正文都不进入规范条目。
+ */
+export const PI_TOOL_ERROR_TEXT_NAMES: ReadonlySet<string> = new Set([
+  "read", "grep", "find", "ls", "write", "edit",
+]);
 
 /** Pi 各检索工具的默认 limit；非默认值才进入摘要。 */
 const GREP_DEFAULT_LIMIT = 100;
@@ -38,9 +49,10 @@ const FIND_DEFAULT_LIMIT = 1000;
 const LS_DEFAULT_LIMIT = 500;
 
 /**
- * Pi 原生文件读取与检索工具的专用摘要闭集。字段是硬编码白名单：原始参数
- * 中的未来新增字段、文件正文、图片数据、匹配正文、路径列表与目录条目都
- * 不在这里出现。专用解析宽容原始输入变化；摘要自身的键集合是严格闭集。
+ * Pi 原生工具的专用摘要闭集。字段是硬编码白名单：原始参数中的未来新增
+ * 字段、文件正文、图片数据、匹配正文、路径列表、目录条目、写入/编辑统计
+ * 与命令输出都不在这里出现。专用解析宽容原始输入变化；摘要自身的键集合
+ * 是严格闭集。
  */
 export type SafePiToolSummary =
   | {
@@ -86,11 +98,31 @@ export type SafePiToolSummary =
       readonly entryLimitReached?: number;
       readonly truncated?: boolean;
       readonly truncatedBy?: "lines" | "bytes";
+    }
+  | {
+      readonly tool: "write";
+      readonly path: string;
+    }
+  | {
+      readonly tool: "edit";
+      readonly path: string;
+    }
+  | {
+      readonly tool: "bash";
+      readonly command: string;
+      readonly timeout?: number;
+    }
+  | {
+      readonly tool: "powershell";
+      readonly command: string;
+      readonly timeout?: number;
     };
 
 const READ_SUMMARY_KEYS = Object.freeze([
   "tool", "path", "offset", "limit", "truncated", "truncatedBy", "firstLineExceedsLimit", "hasMoreLines",
 ] as const);
+const PATH_ONLY_SUMMARY_KEYS = Object.freeze(["tool", "path"] as const);
+const SHELL_SUMMARY_KEYS = Object.freeze(["tool", "command", "timeout"] as const);
 const GREP_SUMMARY_KEYS = Object.freeze([
   "tool", "pattern", "path", "glob", "ignoreCase", "literal", "context", "limit",
   "noMatches", "matchLimitReached", "truncated", "truncatedBy", "linesTruncated",
@@ -372,7 +404,7 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
-        if (parseFileToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+        if (parsePiToolSummary(value.toolName, value.origin, value.summary) === undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
       }
@@ -399,16 +431,17 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
-        if (parseFileToolSummary(value.toolName, value.origin, value.summary) === undefined) {
+        if (parsePiToolSummary(value.toolName, value.origin, value.summary) === undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
       }
       if (value.errorText !== undefined) {
-        // 错误正文只允许 Pi 原生专用工具在失败事实中携带；空正文无意义。
+        // 错误正文只允许 Pi 原生专用工具在失败事实中携带；Shell 工具除外；
+        // 空正文无意义。
         if (
           value.isError !== true
           || value.origin !== "pi_native"
-          || !FILE_TOOL_SUMMARY_NAMES.has(value.toolName)
+          || !PI_TOOL_ERROR_TEXT_NAMES.has(value.toolName)
           || typeof value.errorText !== "string"
           || value.errorText.length === 0
         ) return INVALID_ACTIVITY_EVENT;
@@ -518,12 +551,13 @@ export function normalizeAssistantMessageUpdate(
 /**
  * 产生端规范化：把子代理自身观察到的原始 Pi 工具执行事实缩减为安全闭集。
  * 原始结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方验证后随
- * 规范化输入传递。来源验证通过的 Pi 原生文件读取与检索工具（read/grep/
- * find/ls）改用专用摘要规则：只保留白名单参数与结果事实，失败时自包含
- * 输入参数与净化后的完整错误正文。专用解析宽容未来新增字段并忽略它们；
- * 必需字段缺失或类型错误、开始参数缺失或来源验证失败时完整降级为无载荷
- * 安全兜底。允许未来新增字段并忽略它们；关联身份缺失或来源闭集之外属于
- * 结构违约，由调用方决定是否升级，不在本函数内降级。
+ * 规范化输入传递。来源验证通过的 Pi 原生专用工具（read/grep/find/ls/write/
+ * edit/bash/powershell）改用专用摘要规则：只保留白名单参数与结果事实，
+ * Shell 外工具失败时自包含净化后的完整错误正文（Shell 工具失败只表达
+ * 成功或失败）。专用解析宽容未来新增字段并忽略它们；必需字段缺失或类型
+ * 错误、开始参数缺失或来源验证失败时完整降级为无载荷安全兜底。允许未来
+ * 新增字段并忽略它们；关联身份缺失或来源闭集之外属于结构违约，由调用方
+ * 决定是否升级，不在本函数内降级。
  */
 export function normalizeOwnToolActivityEvent(
   event: unknown,
@@ -532,11 +566,11 @@ export function normalizeOwnToolActivityEvent(
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
   if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
-  // 专用摘要只作用于来源验证通过的原生文件读取与检索工具；其余来源与
-  // 工具都是无载荷安全兜底。
-  const dedicatedFileTool = origin === "pi_native"
+  // 专用摘要只作用于来源验证通过的原生专用工具；其余来源与工具都是无载荷
+  // 安全兜底。
+  const dedicatedPiTool = origin === "pi_native"
     && typeof event.toolName === "string"
-    && FILE_TOOL_SUMMARY_NAMES.has(event.toolName);
+    && PI_TOOL_SUMMARY_NAMES.has(event.toolName);
   if (event.type === "tool_execution_start") {
     if (
       !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
@@ -544,7 +578,7 @@ export function normalizeOwnToolActivityEvent(
     ) return INVALID_ACTIVITY_EVENT;
     // 专用摘要只在 Pi 原生来源下提取；同名覆盖/未知来源与降级场景都是
     // 无载荷安全兜底。
-    const summary = dedicatedFileTool ? extractFileToolSummary(event.toolName, event.args) : undefined;
+    const summary = dedicatedPiTool ? extractPiToolSummary(event.toolName, event.args) : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_start",
       toolCallId: event.toolCallId,
@@ -561,10 +595,12 @@ export function normalizeOwnToolActivityEvent(
     ) return INVALID_ACTIVITY_EVENT;
     // Pi 的结束事件不携带参数；只有产生端缓存的开始参数齐全时，结束事实
     // 才能自包含输入参数，否则整体降级为无摘要兜底。
-    const summary = dedicatedFileTool && isRecord(startArgs)
-      ? extractFileToolSummary(event.toolName, startArgs, event.result, event.isError)
+    const summary = dedicatedPiTool && isRecord(startArgs)
+      ? extractPiToolSummary(event.toolName, startArgs, event.result, event.isError)
       : undefined;
+    // 错误正文只属于允许展开错误的工具；Shell 工具失败只表达成功或失败。
     const errorText = summary !== undefined && event.isError
+      && PI_TOOL_ERROR_TEXT_NAMES.has(event.toolName)
       ? extractErrorText(event.result)
       : undefined;
     return parseAgentActivityEvent({
@@ -672,11 +708,12 @@ function readHasMoreLinesNotice(result: unknown): boolean {
 }
 
 /**
- * 从原始 Pi 工具事实提取专用摘要：输入参数部分始终提取；只有成功结束
- * 才从 result.details 提取结果事实。必需字段缺失、任何已知字段存在但
- * 类型错误时返回 undefined（完整降级）；值域偏离只导致对应事实不携带。
+ * 从原始 Pi 工具事实提取专用摘要：输入参数部分始终提取；write 与 edit
+ * 的成功与失败摘要相同（只有 path），Shell 摘要在任何状态下都含 command。
+ * 必需字段缺失、任何已知字段存在但类型错误时返回 undefined（完整降级）；
+ * 值域偏离只导致对应字段不携带。
  */
-function extractFileToolSummary(
+function extractPiToolSummary(
   toolName: string,
   args: unknown,
   result?: unknown,
@@ -770,6 +807,41 @@ function extractFileToolSummary(
           ...truncationFacts(truncation),
         };
       }
+      case "write": {
+        // path 与 content 都是 Pi schema 必需字段；content 只用于形状验证，
+        // 正文永不进入摘要。
+        const path = args.path;
+        if (typeof path !== "string") return undefined;
+        if (typeof args.content !== "string") return undefined;
+        // 成功与失败摘要都只显示 path：不显示行数、字节数或任何写入统计。
+        return { tool: "write", path };
+      }
+      case "edit": {
+        // path 与 edits 都是 Pi schema 必需字段；edits 只用于形状验证，
+        // oldText/newText 永不进入摘要。
+        const path = args.path;
+        if (typeof path !== "string") return undefined;
+        const edits = args.edits;
+        if (
+          !Array.isArray(edits)
+          || !edits.every((item) => isRecord(item)
+            && typeof item.oldText === "string" && typeof item.newText === "string")
+        ) return undefined;
+        // 成功与失败摘要都只显示 path：不显示编辑块数或任何编辑统计。
+        return { tool: "edit", path };
+      }
+      case "bash":
+      case "powershell": {
+        // command 是必需字段；摘要与状态无关，始终自包含完整命令。
+        const command = args.command;
+        if (typeof command !== "string") return undefined;
+        typedField(args, "timeout", (value) => typeof value === "number");
+        return {
+          tool: toolName,
+          command: sanitizeSafeActivityText(command),
+          ...optionalShellTimeout(args),
+        };
+      }
       default:
         return undefined;
     }
@@ -824,6 +896,17 @@ function readOptionalPathInput(args: Record<string, unknown>): string {
   return typeof value === "string" && value.length > 0 ? value : ".";
 }
 
+/**
+ * Shell 工具的可选 timeout（秒）：只有有限正数才携带；值域偏离不降级，
+ * 只导致该字段不进入摘要（避免展示未生效的调用约束）。
+ */
+function optionalShellTimeout(args: Record<string, unknown>): { readonly timeout?: number } | {} {
+  const value = args.timeout;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? { timeout: value }
+    : {};
+}
+
 function optionalCount(
   args: Record<string, unknown>,
   key: string,
@@ -846,12 +929,12 @@ function optionalInput(
 }
 
 /** wire 闭集校验：摘要只允许 Pi 原生专用工具携带，且键集合与类型严格闭合。 */
-function parseFileToolSummary(
+function parsePiToolSummary(
   toolName: string,
   origin: SafeToolOrigin,
   value: unknown,
 ): SafePiToolSummary | undefined {
-  if (origin !== "pi_native" || !FILE_TOOL_SUMMARY_NAMES.has(toolName)) return undefined;
+  if (origin !== "pi_native" || !PI_TOOL_SUMMARY_NAMES.has(toolName)) return undefined;
   if (!isRecord(value) || value.tool !== toolName) return undefined;
   switch (toolName) {
     case "read": {
@@ -899,6 +982,24 @@ function parseFileToolSummary(
       const entryLimitReached = positiveCountField(value, "entryLimitReached");
       if (value.entryLimitReached !== undefined && entryLimitReached === undefined) return undefined;
       if (!validTruncationFacts(value)) return undefined;
+      return value as unknown as SafePiToolSummary;
+    }
+    case "write":
+    case "edit": {
+      // 摘要只有 path：行数、字节大小、编辑块数等写入/编辑统计不属于闭集。
+      if (!hasOnlySummaryKeys(value, PATH_ONLY_SUMMARY_KEYS)) return undefined;
+      if (typeof value.path !== "string") return undefined;
+      return value as unknown as SafePiToolSummary;
+    }
+    case "bash":
+    case "powershell": {
+      if (!hasOnlySummaryKeys(value, SHELL_SUMMARY_KEYS)) return undefined;
+      if (typeof value.command !== "string" || value.command.length === 0) return undefined;
+      // 与产生端提取一致：只有有限正数 timeout 属于闭集。
+      if (
+        value.timeout !== undefined
+        && !(typeof value.timeout === "number" && Number.isFinite(value.timeout) && value.timeout > 0)
+      ) return undefined;
       return value as unknown as SafePiToolSummary;
     }
     default:

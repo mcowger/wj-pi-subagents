@@ -996,3 +996,177 @@ test("成功专用工具无展开入口，不参与选择循环", () => {
   viewer.handleInput("\t");
   assert.equal(viewer.getSelectedKey(), first);
 });
+
+test("write 运行中与成功摘要都只显示 path，不显示写入统计", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "write", "pi_native", INCARNATION_ID, { tool: "write", path: "out/result.md" }),
+  ], { viewport_height: 20 });
+  const running = dedicatedToolLine(viewer, "write");
+  assert.match(running ?? "", /▶ write · out\/result\.md$/u);
+
+  viewer.syncFrom([
+    toolStart("t1", "write", "pi_native", INCARNATION_ID, { tool: "write", path: "out/result.md" }),
+    toolEnd("t1", "write", false, "pi_native", INCARNATION_ID, { tool: "write", path: "out/result.md" }),
+  ]);
+  const done = dedicatedToolLine(viewer, "write");
+  // 成功摘要仍只有 path：行数、字节数等写入统计不出现。
+  assert.match(done ?? "", /✓ write · out\/result\.md$/u);
+  assert.doesNotMatch(done ?? "", /lines|bytes/u);
+  // 成功摘要不可展开，无折叠标记。
+  assert.doesNotMatch(done ?? "", /▸|▾/u);
+});
+
+test("edit 成功摘要只显示 path，不显示编辑统计", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "edit", false, "pi_native", INCARNATION_ID, { tool: "edit", path: "src/a.ts" }),
+  ], { viewport_height: 20 });
+  const line = dedicatedToolLine(viewer, "edit");
+  assert.match(line ?? "", /✓ edit · src\/a\.ts$/u);
+  assert.doesNotMatch(line ?? "", /edits|edits count/u);
+  assert.doesNotMatch(line ?? "", /▸|▾/u);
+});
+
+test("write/edit 失败摘要只显示 path，展开错误为顶格红色纯文本", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const errorText = "Error: EACCES: permission denied, open '/etc/hosts'\nsecond *literal* line";
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "write", "pi_native", INCARNATION_ID, { tool: "write", path: "/etc/hosts" }),
+    toolEnd("t1", "write", true, "pi_native", INCARNATION_ID, { tool: "write", path: "/etc/hosts" }, errorText),
+    toolEnd("t2", "edit", true, "pi_native", INCARNATION_ID, { tool: "edit", path: "src/a.ts" }, "not found"),
+  ], { viewport_height: 20 });
+  const collapsed = viewer.render(160).slice(1, -1);
+  // 失败摘要只显示 path：无写入统计、无编辑统计。
+  const writeLine = collapsed.find((line) => line.includes("write"));
+  assert.match(writeLine ?? "", /× ▸ write · \/etc\/hosts$/u);
+  assert.doesNotMatch(writeLine ?? "", /lines|bytes|edits/u);
+  assert.match(writeLine ?? "", /▸/u);
+  const editLine = collapsed.find((line) => line.includes("edit"));
+  assert.match(editLine ?? "", /× ▸ edit · src\/a\.ts$/u);
+  assert.doesNotMatch(editLine ?? "", /edits/u);
+  // 错误正文默认不展开。
+  assert.doesNotMatch(collapsed.join("\n"), /permission denied/u);
+
+  // 展开后：红色预格式化纯文本、保留换行、不解析 Markdown。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.match(viewer.getSelectedKey() ?? "", /tool-error:/u);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expanded = viewer.render(160).slice(1, -1);
+  const errorLines = expanded.filter((line) => line.includes("permission denied") || line.includes("second"));
+  assert.equal(errorLines.length, 2, expanded.join("\n"));
+  assert.ok(expanded.some((line) => line.trim().startsWith("Error: EACCES")), expanded.join("\n"));
+  assert.ok(expanded.some((line) => line.includes("*literal*")), expanded.join("\n"));
+  const surface = renderAgentActivityViewerSurface(viewer, 160, theme).join("\n");
+  assert.match(surface, /<fg:error>[^]*permission denied/u);
+});
+
+test("bash 状态摘要与命令代码区分离，状态原地更新不重排命令区域", () => {
+  const command = 'echo "hello world"';
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "bash", "pi_native", INCARNATION_ID, { tool: "bash", command, timeout: 5 }),
+  ], { viewport_height: 20 });
+  const runningLines = viewer.render(160).slice(1, -1);
+  const summaryIndex = runningLines.findIndex((line) => line.includes("bash"));
+  assert.match(runningLines[summaryIndex] ?? "", /▶ bash · timeout 5$/u);
+  // 命令区在摘要行正下方完整显示。
+  assert.equal(runningLines[summaryIndex + 1], command);
+
+  // 结束原地更新：摘要行变化，命令区内容与相对位置不变。
+  viewer.syncFrom([
+    toolStart("t1", "bash", "pi_native", INCARNATION_ID, { tool: "bash", command, timeout: 5 }),
+    toolEnd("t1", "bash", false, "pi_native", INCARNATION_ID, { tool: "bash", command, timeout: 5 }),
+  ]);
+  const doneLines = viewer.render(160).slice(1, -1);
+  const doneSummaryIndex = doneLines.findIndex((line) => line.includes("bash"));
+  assert.match(doneLines[doneSummaryIndex] ?? "", /✓ bash · timeout 5$/u);
+  assert.equal(doneLines[doneSummaryIndex + 1], command);
+  // 状态变化不重排命令区域：条目仍只占摘要行 + 命令行两行。
+  assert.equal(
+    doneLines.filter((line) => line.includes(command)).length,
+    1,
+    doneLines.join("\n"),
+  );
+});
+
+test("多行命令完整显示，与单行命令同构且无折叠标记", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "bash", false, "pi_native", INCARNATION_ID, {
+      tool: "bash", command: "npm run build\nnpm test -- --watch=false\nnpm run typecheck",
+    }),
+    toolEnd("t2", "powershell", false, "pi_native", INCARNATION_ID, {
+      tool: "powershell", command: "Get-ChildItem src",
+    }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  const body = lines.join("\n");
+  assert.ok(lines.some((line) => line === "✓ bash"), body);
+  assert.ok(lines.some((line) => line === "npm run build"), body);
+  assert.ok(lines.some((line) => line === "npm test -- --watch=false"), body);
+  assert.ok(lines.some((line) => line === "npm run typecheck"), body);
+  assert.ok(lines.some((line) => line === "✓ powershell"), body);
+  assert.ok(lines.some((line) => line === "Get-ChildItem src"), body);
+  // Shell 命令始终展开：摘要行不带折叠标记。
+  const bashSummary = lines.find((line) => line.includes("bash"));
+  assert.doesNotMatch(bashSummary ?? "", /▸|▾/u);
+  // 命令行顶格无缩进。
+  const cmdLine = lines.find((line) => line.includes("npm run build"));
+  assert.equal(cmdLine, cmdLine?.trimStart());
+});
+
+test("bash 失败按普通失败整行红色，命令仍完整保留且无结果展开入口", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "bash", "pi_native", INCARNATION_ID, { tool: "bash", command: "exit 1", timeout: 5 }),
+    toolEnd("t1", "bash", true, "pi_native", INCARNATION_ID, { tool: "bash", command: "exit 1", timeout: 5 }),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  // 失败摘要整行红色，但命令参数仍完整保留。
+  assert.ok(lines.some((line) => line === "× bash · timeout 5"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "exit 1"), lines.join("\n"));
+  // 没有结果展开入口：无任何可展开项。
+  assert.equal(viewer.getSelectedKey(), undefined);
+  const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
+  assert.match(surface, /<fg:error>[^]*× bash/u);
+});
+
+test("命令正文按面板宽度软换行且不截断字符", () => {
+  const command = "C".repeat(150);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "bash", false, "pi_native", INCARNATION_ID, { tool: "bash", command }),
+  ], { viewport_height: 20 });
+  const width = 60;
+  const lines = viewer.render(width).slice(1, -1);
+  const commandLines = lines.filter((line) => line.includes("C"));
+  assert.ok(commandLines.length > 1, lines.join("\n"));
+  assert.ok(commandLines.every((line) => displayWidth(line) <= width), lines.join("\n"));
+  // 软换行不丢失字符。
+  assert.equal(commandLines.join("").split("C").length - 1, 150);
+});
+
+test("未知来源 bash 走安全兜底，不显示命令代码区", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "bash", false, "unknown"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.ok(lines.some((line) => line === "✓ bash"), lines.join("\n"));
+  assert.equal(lines.filter((line) => line.includes("bash")).length, 1);
+});
+
+test("命令正文的控制字符在查看器渲染中不可见", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "bash", false, "pi_native", INCARNATION_ID, {
+      tool: "bash",
+      command: "echo safe\u001b[31m-red\u001b[0m\n\u202etail",
+    }),
+  ], { viewport_height: 20 });
+  const body = viewer.render(120).slice(1, -1).join("\n");
+  assert.doesNotMatch(body, /\u001b|\u202e/u);
+  assert.match(body, /echo safe-red/u);
+});
