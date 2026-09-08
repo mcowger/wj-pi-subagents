@@ -1,14 +1,14 @@
 # 04 — 文件修改与 Shell 工具轨迹
 
-**What to build:** 为来源已确认的 Pi 原生 `write`、`edit`、`bash` 和 `powershell` 提供专用活动轨迹。用户能审计写入或修改的目标和规模，并完整看到多行 Shell 命令，但写入正文、替换正文、diff、patch 和命令输出不会进入活动历史。
+**What to build:** 为来源已确认的 Pi 原生 `write`、`edit`、`bash` 和 `powershell` 提供专用活动轨迹。用户能审计写入或修改的目标，并完整看到多行 Shell 命令，但写入正文、替换正文、diff、patch、写入/编辑统计和命令输出不会进入活动历史。
 
 **Blocked by:** 02 — 工具活动状态机与安全兜底.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
-- [ ] `write` 成功摘要显示 path、根据输入计算的行数和 UTF-8 字节大小；content 和原始成功结果在产生端删除。
+- [ ] `write` 成功摘要只显示 path，不显示根据输入计算的行数、UTF-8 字节大小或任何写入统计；content 和原始成功结果在产生端删除。
 - [ ] `write` 失败摘要只显示 path，不显示未发生写入的行数或大小；完整 Pi 原生错误默认折叠并可展开。
-- [ ] `edit` 成功摘要显示 path 和 edits 数量；oldText、newText、diff、patch、首个修改行和原始成功结果在产生端删除。
+- [ ] `edit` 成功摘要只显示 path，不显示 edits 数量或任何编辑统计；oldText、newText、diff、patch、首个修改行和原始成功结果在产生端删除。
 - [ ] `edit` 失败摘要只显示 path，不显示编辑块数；完整 Pi 原生错误默认折叠并可展开。
 - [ ] `write` 与 `edit` 的展开错误使用统一背景、顶格红色预格式化纯文本，不解析 Markdown、不做语义摘要或字符截断，并过滤 ANSI 与危险终端控制字符。
 - [ ] `bash` 与 `powershell` 状态摘要只显示工具名和可选 timeout；完整 command 始终在独立代码区域显示。
