@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createOwnToolActivityNormalizer,
   normalizeOwnToolActivityEvent,
   normalizeRpcBridgeEvent,
   parseAgentActivityEvent,
+  type SafeToolOrigin,
 } from "../src/rpc-bridge-event.ts";
 
 function assistantMessage(content: readonly unknown[]): unknown {
@@ -533,6 +535,35 @@ test("grep/find/ls 失败时保留全部输入参数与错误正文，不附带�
   }
 });
 
+test("read 用户 limit 提前停止但文件尚有更多行时保留不完整事实", () => {
+  // Pi 在该场景不写 details，不完整事实只出现在结果正文的已知 continuation 文案中。
+  const startArgs = { path: "big.log", limit: 100 };
+  const normalized = normalizeOwnToolActivityEvent(readEnd({
+    content: [{ type: "text", text: "正文\n\n[100 more lines in file. Use offset=101 to continue.]" }],
+    details: undefined,
+  }), "pi_native", startArgs);
+  assert.equal(normalized.kind, "event");
+  if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(normalized.event), {
+    tool: "read",
+    path: "big.log",
+    limit: 100,
+    hasMoreLines: true,
+  });
+  // 正文与 continuation 文案本身都不跨进程。
+  const serialized = JSON.stringify(normalized.event);
+  assert.equal(serialized.includes("正文"), false);
+  assert.equal(serialized.includes("more lines in file"), false);
+
+  // 完整读取与被截断读取不携带该事实。
+  const complete = normalizeOwnToolActivityEvent(readEnd({
+    content: [{ type: "text", text: "正文" }],
+  }), "pi_native", startArgs);
+  assert.equal(complete.kind, "event");
+  if (complete.kind !== "event" || complete.event.type !== "tool_execution_end") return;
+  assert.equal((summaryOf(complete.event) as { hasMoreLines?: boolean }).hasMoreLines, undefined);
+});
+
 test("错误正文在产生端过滤 ANSI 与危险终端控制字符并保留换行", () => {
   const normalized = normalizeOwnToolActivityEvent(readEnd({
     content: [{ type: "text", text: "first\x1b[31m-red\x1b[0m\nsecond\u0007 bell\r\nthird\u202e override" }],
@@ -614,6 +645,114 @@ test("结束事实缺少缓存的开始参数时降级为无摘要兜底", () =>
   if (normalized.kind !== "event" || normalized.event.type !== "tool_execution_end") return;
   assert.equal(normalized.event.summary, undefined);
   assert.equal(normalized.event.errorText, undefined);
+});
+
+test("运行时规范化器缓存开始参数供结束事实自包含，并保持有界与幂等", () => {
+  const resolveOrigin = (toolName: string): SafeToolOrigin =>
+    ["read", "grep", "find", "ls"].includes(toolName) ? "pi_native" : "unknown";
+  const normalize = createOwnToolActivityNormalizer(resolveOrigin);
+
+  const start = normalize({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    args: { path: "a.txt", offset: 2 },
+  });
+  assert.equal(start.kind, "event");
+  if (start.kind !== "event" || start.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(start.event), { tool: "read", path: "a.txt", offset: 2 });
+
+  // 同 ID 结束事实自包含开始参数；缓存随即清空。
+  const end = normalize({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    result: { content: [{ type: "text", text: "正文" }] },
+    isError: false,
+  });
+  assert.equal(end.kind, "event");
+  if (end.kind !== "event" || end.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(end.event), { tool: "read", path: "a.txt", offset: 2 });
+
+  // 缓存已清空：同 ID 二次结束降级为无摘要兜底。
+  const repeated = normalize({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "read",
+    result: { content: [{ type: "text", text: "正文" }] },
+    isError: false,
+  });
+  assert.equal(repeated.kind, "event");
+  if (repeated.kind !== "event" || repeated.event.type !== "tool_execution_end") return;
+  assert.equal(repeated.event.summary, undefined);
+
+  // 重复开始覆盖旧参数：新参数进入后续结束事实。
+  normalize({
+    type: "tool_execution_start",
+    toolCallId: "call_2",
+    toolName: "ls",
+    args: { path: "old-dir" },
+  });
+  normalize({
+    type: "tool_execution_start",
+    toolCallId: "call_2",
+    toolName: "ls",
+    args: { path: "new-dir" },
+  });
+  const overwritten = normalize({
+    type: "tool_execution_end",
+    toolCallId: "call_2",
+    toolName: "ls",
+    result: { content: [{ type: "text", text: "(empty directory)" }] },
+    isError: false,
+  });
+  assert.equal(overwritten.kind, "event");
+  if (overwritten.kind !== "event" || overwritten.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(overwritten.event), {
+    tool: "ls",
+    path: "new-dir",
+    emptyDirectory: true,
+  });
+
+  // 容量上限：256 个待决条目，溢出时插入第 257 个淘汰最早；被淘汰的
+  // 开始参数降级。
+  for (let index = 0; index < 256; index += 1) {
+    normalize({
+      type: "tool_execution_start",
+      toolCallId: `bulk_${index}`,
+      toolName: "read",
+      args: { path: `bulk_${index}.txt` },
+    });
+  }
+  // 溢出时插入的新开始淘汰最早的 bulk_0。
+  normalize({
+    type: "tool_execution_start",
+    toolCallId: "bulk_new",
+    toolName: "read",
+    args: { path: "new.txt" },
+  });
+  const evicted = normalize({
+    type: "tool_execution_end",
+    toolCallId: "bulk_0",
+    toolName: "read",
+    result: { content: [{ type: "text", text: "正文" }] },
+    isError: false,
+  });
+  assert.equal(evicted.kind, "event");
+  if (evicted.kind !== "event" || evicted.event.type !== "tool_execution_end") return;
+  assert.equal(evicted.event.summary, undefined);
+
+  // 溢出时插入的新开始仍然可用。
+  const kept = normalize({
+    type: "tool_execution_end",
+    toolCallId: "bulk_new",
+    toolName: "read",
+    result: { content: [{ type: "text", text: "正文" }] },
+    isError: false,
+  });
+  assert.equal(kept.kind, "event");
+  if (kept.kind !== "event" || kept.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(kept.event), { tool: "read", path: "new.txt" });
 });
 
 test("活动事件闭集只允许专用工具携带摘要与错误正文，结构违约判 invalid", () => {

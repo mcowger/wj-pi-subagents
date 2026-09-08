@@ -51,6 +51,7 @@ export type SafePiToolSummary =
       readonly truncated?: boolean;
       readonly truncatedBy?: "lines" | "bytes";
       readonly firstLineExceedsLimit?: boolean;
+      readonly hasMoreLines?: boolean;
     }
   | {
       readonly tool: "grep";
@@ -88,7 +89,7 @@ export type SafePiToolSummary =
     };
 
 const READ_SUMMARY_KEYS = Object.freeze([
-  "tool", "path", "offset", "limit", "truncated", "truncatedBy", "firstLineExceedsLimit",
+  "tool", "path", "offset", "limit", "truncated", "truncatedBy", "firstLineExceedsLimit", "hasMoreLines",
 ] as const);
 const GREP_SUMMARY_KEYS = Object.freeze([
   "tool", "pattern", "path", "glob", "ignoreCase", "literal", "context", "limit",
@@ -531,6 +532,11 @@ export function normalizeOwnToolActivityEvent(
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
   if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
+  // 专用摘要只作用于来源验证通过的原生文件读取与检索工具；其余来源与
+  // 工具都是无载荷安全兜底。
+  const dedicatedFileTool = origin === "pi_native"
+    && typeof event.toolName === "string"
+    && FILE_TOOL_SUMMARY_NAMES.has(event.toolName);
   if (event.type === "tool_execution_start") {
     if (
       !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
@@ -538,9 +544,7 @@ export function normalizeOwnToolActivityEvent(
     ) return INVALID_ACTIVITY_EVENT;
     // 专用摘要只在 Pi 原生来源下提取；同名覆盖/未知来源与降级场景都是
     // 无载荷安全兜底。
-    const summary = origin === "pi_native" && FILE_TOOL_SUMMARY_NAMES.has(event.toolName)
-      ? extractFileToolSummary(event.toolName, event.args)
-      : undefined;
+    const summary = dedicatedFileTool ? extractFileToolSummary(event.toolName, event.args) : undefined;
     return parseAgentActivityEvent({
       type: "tool_execution_start",
       toolCallId: event.toolCallId,
@@ -557,10 +561,7 @@ export function normalizeOwnToolActivityEvent(
     ) return INVALID_ACTIVITY_EVENT;
     // Pi 的结束事件不携带参数；只有产生端缓存的开始参数齐全时，结束事实
     // 才能自包含输入参数，否则整体降级为无摘要兜底。
-    const dedicated = origin === "pi_native"
-      && FILE_TOOL_SUMMARY_NAMES.has(event.toolName)
-      && isRecord(startArgs);
-    const summary = dedicated
+    const summary = dedicatedFileTool && isRecord(startArgs)
       ? extractFileToolSummary(event.toolName, startArgs, event.result, event.isError)
       : undefined;
     const errorText = summary !== undefined && event.isError
@@ -629,6 +630,48 @@ function isCount(value: unknown): boolean {
 }
 
 /**
+ * 截断事实块：Pi 各检索工具 details.truncation 的共享读取规则。只有
+ * truncated 为真才携带事实；truncatedBy 值域外的变体静默忽略。
+ */
+function truncationFacts(
+  truncation: Record<string, unknown> | undefined,
+  includeFirstLine = false,
+): {
+  readonly truncated?: true;
+  readonly truncatedBy?: "lines" | "bytes";
+  readonly firstLineExceedsLimit?: true;
+} | {} {
+  if (truncation?.truncated !== true) return {};
+  const by = truncation.truncatedBy === "lines" || truncation.truncatedBy === "bytes"
+    ? truncation.truncatedBy
+    : undefined;
+  return {
+    truncated: true,
+    ...(by === undefined ? {} : { truncatedBy: by }),
+    ...(includeFirstLine && truncation.firstLineExceedsLimit === true
+      ? { firstLineExceedsLimit: true }
+      : {}),
+  };
+}
+
+/**
+ * read 的不完整事实：用户 limit 提前停止但文件尚有更多行时，Pi 不写
+ * details，事实只出现在结果正文的已知 continuation 文案中。
+ */
+const READ_MORE_LINES_PATTERN = /\[\d+ more lines in file\. Use offset=\d+ to continue\.\]$/u;
+
+function readHasMoreLinesNotice(result: unknown): boolean {
+  if (!isRecord(result) || !Array.isArray(result.content)) return false;
+  const parts: string[] = [];
+  for (const item of result.content) {
+    if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") return false;
+    parts.push(item.text);
+  }
+  const lastLine = parts.join("\n").split("\n").at(-1) ?? "";
+  return READ_MORE_LINES_PATTERN.test(lastLine);
+}
+
+/**
  * 从原始 Pi 工具事实提取专用摘要：输入参数部分始终提取；只有成功结束
  * 才从 result.details 提取结果事实。必需字段缺失、任何已知字段存在但
  * 类型错误时返回 undefined（完整降级）；值域偏离只导致对应事实不携带。
@@ -644,7 +687,6 @@ function extractFileToolSummary(
     ? readRecord(result.details)
     : undefined;
   const truncation = success === undefined ? undefined : readRecord(success.truncation);
-  const truncated = truncation?.truncated === true;
   try {
     switch (toolName) {
       case "read": {
@@ -657,13 +699,12 @@ function extractFileToolSummary(
           path,
           ...optionalCount(args, "offset"),
           ...optionalCount(args, "limit"),
-          ...(truncated ? {
-            truncated: true,
-            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
-              ? { truncatedBy: truncation.truncatedBy }
-              : {}),
-            ...(truncation?.firstLineExceedsLimit === true ? { firstLineExceedsLimit: true } : {}),
-          } : {}),
+          ...truncationFacts(truncation, true),
+          ...(isError === false
+            && truncation?.truncated !== true
+            && readHasMoreLinesNotice(result)
+            ? { hasMoreLines: true }
+            : {}),
         };
       }
       case "grep": {
@@ -690,12 +731,7 @@ function extractFileToolSummary(
           ...(positiveCountField(success, "matchLimitReached") === undefined
             ? {}
             : { matchLimitReached: positiveCountField(success, "matchLimitReached")! }),
-          ...(truncated ? {
-            truncated: true,
-            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
-              ? { truncatedBy: truncation.truncatedBy }
-              : {}),
-          } : {}),
+          ...truncationFacts(truncation),
           ...(success?.linesTruncated === true ? { linesTruncated: true } : {}),
         };
       }
@@ -715,12 +751,7 @@ function extractFileToolSummary(
           ...(positiveCountField(success, "resultLimitReached") === undefined
             ? {}
             : { resultLimitReached: positiveCountField(success, "resultLimitReached")! }),
-          ...(truncated ? {
-            truncated: true,
-            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
-              ? { truncatedBy: truncation.truncatedBy }
-              : {}),
-          } : {}),
+          ...truncationFacts(truncation),
         };
       }
       case "ls": {
@@ -736,12 +767,7 @@ function extractFileToolSummary(
           ...(positiveCountField(success, "entryLimitReached") === undefined
             ? {}
             : { entryLimitReached: positiveCountField(success, "entryLimitReached")! }),
-          ...(truncated ? {
-            truncated: true,
-            ...(truncation?.truncatedBy === "lines" || truncation?.truncatedBy === "bytes"
-              ? { truncatedBy: truncation.truncatedBy }
-              : {}),
-          } : {}),
+          ...truncationFacts(truncation),
         };
       }
       default:
@@ -829,77 +855,50 @@ function parseFileToolSummary(
   if (!isRecord(value) || value.tool !== toolName) return undefined;
   switch (toolName) {
     case "read": {
-      if (!hasExactSummaryKeys(value, READ_SUMMARY_KEYS)) return undefined;
+      if (!hasOnlySummaryKeys(value, READ_SUMMARY_KEYS)) return undefined;
       const path = value.path;
       if (typeof path !== "string") return undefined;
       if (!validSummaryCount(value, "offset") || !validSummaryCount(value, "limit")) return undefined;
-      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
-      if (
-        value.truncatedBy !== undefined
-        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
-      ) return undefined;
+      if (!validTruncationFacts(value)) return undefined;
       if (
         value.firstLineExceedsLimit !== undefined
         && typeof value.firstLineExceedsLimit !== "boolean"
       ) return undefined;
+      if (value.hasMoreLines !== undefined && typeof value.hasMoreLines !== "boolean") return undefined;
       return value as unknown as SafePiToolSummary;
     }
     case "grep": {
-      if (!hasExactSummaryKeys(value, GREP_SUMMARY_KEYS)) return undefined;
+      if (!hasOnlySummaryKeys(value, GREP_SUMMARY_KEYS)) return undefined;
       if (typeof value.pattern !== "string" || typeof value.path !== "string") return undefined;
       if (value.glob !== undefined && typeof value.glob !== "string") return undefined;
       if (value.ignoreCase !== undefined && typeof value.ignoreCase !== "boolean") return undefined;
       if (value.literal !== undefined && typeof value.literal !== "boolean") return undefined;
       if (!validSummaryCount(value, "context") || !validSummaryCount(value, "limit")) return undefined;
       if (value.noMatches !== undefined && typeof value.noMatches !== "boolean") return undefined;
-      if (
-        value.matchLimitReached !== undefined
-        && (typeof value.matchLimitReached !== "number"
-          || !Number.isSafeInteger(value.matchLimitReached)
-          || value.matchLimitReached <= 0)
-      ) return undefined;
-      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
-      if (
-        value.truncatedBy !== undefined
-        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
-      ) return undefined;
+      const matchLimitReached = positiveCountField(value, "matchLimitReached");
+      if (value.matchLimitReached !== undefined && matchLimitReached === undefined) return undefined;
+      if (!validTruncationFacts(value)) return undefined;
       if (value.linesTruncated !== undefined && typeof value.linesTruncated !== "boolean") return undefined;
       return value as unknown as SafePiToolSummary;
     }
     case "find": {
-      if (!hasExactSummaryKeys(value, FIND_SUMMARY_KEYS)) return undefined;
+      if (!hasOnlySummaryKeys(value, FIND_SUMMARY_KEYS)) return undefined;
       if (typeof value.pattern !== "string" || typeof value.path !== "string") return undefined;
       if (!validSummaryCount(value, "limit")) return undefined;
       if (value.noFiles !== undefined && typeof value.noFiles !== "boolean") return undefined;
-      if (
-        value.resultLimitReached !== undefined
-        && (typeof value.resultLimitReached !== "number"
-          || !Number.isSafeInteger(value.resultLimitReached)
-          || value.resultLimitReached <= 0)
-      ) return undefined;
-      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
-      if (
-        value.truncatedBy !== undefined
-        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
-      ) return undefined;
+      const resultLimitReached = positiveCountField(value, "resultLimitReached");
+      if (value.resultLimitReached !== undefined && resultLimitReached === undefined) return undefined;
+      if (!validTruncationFacts(value)) return undefined;
       return value as unknown as SafePiToolSummary;
     }
     case "ls": {
-      if (!hasExactSummaryKeys(value, LS_SUMMARY_KEYS)) return undefined;
+      if (!hasOnlySummaryKeys(value, LS_SUMMARY_KEYS)) return undefined;
       if (typeof value.path !== "string") return undefined;
       if (!validSummaryCount(value, "limit")) return undefined;
       if (value.emptyDirectory !== undefined && typeof value.emptyDirectory !== "boolean") return undefined;
-      if (
-        value.entryLimitReached !== undefined
-        && (typeof value.entryLimitReached !== "number"
-          || !Number.isSafeInteger(value.entryLimitReached)
-          || value.entryLimitReached <= 0)
-      ) return undefined;
-      if (value.truncated !== undefined && typeof value.truncated !== "boolean") return undefined;
-      if (
-        value.truncatedBy !== undefined
-        && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
-      ) return undefined;
+      const entryLimitReached = positiveCountField(value, "entryLimitReached");
+      if (value.entryLimitReached !== undefined && entryLimitReached === undefined) return undefined;
+      if (!validTruncationFacts(value)) return undefined;
       return value as unknown as SafePiToolSummary;
     }
     default:
@@ -907,8 +906,18 @@ function parseFileToolSummary(
   }
 }
 
-function hasExactSummaryKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+function hasOnlySummaryKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key));
+}
+
+/** truncated/truncatedBy 的共享 wire 校验；值域外的 truncatedBy 判违约。 */
+function validTruncationFacts(value: Record<string, unknown>): boolean {
+  if (value.truncated !== undefined && typeof value.truncated !== "boolean") return false;
+  if (
+    value.truncatedBy !== undefined
+    && value.truncatedBy !== "lines" && value.truncatedBy !== "bytes"
+  ) return false;
+  return true;
 }
 
 function validSummaryCount(value: Record<string, unknown>, key: string): boolean {

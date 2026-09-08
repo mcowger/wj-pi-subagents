@@ -805,10 +805,14 @@ test("read 首行超限与字节截断使用对应事实文本，图片结果不
     toolEnd("t2", "read", false, "pi_native", INCARNATION_ID, {
       tool: "read", path: "img.png",
     }),
+    toolEnd("t3", "read", false, "pi_native", INCARNATION_ID, {
+      tool: "read", path: "limited.txt", limit: 100, hasMoreLines: true,
+    }),
   ], { viewport_height: 20 });
   const body = viewer.render(160).slice(1, -1).join("\n");
   assert.match(body, /read · big\.log · truncated \(first line\)/u);
   assert.match(body, /read · img\.png/u);
+  assert.match(body, /read · limited\.txt · limit 100 · more lines/u);
   assert.doesNotMatch(body, /Read image file/u);
 });
 
@@ -975,7 +979,7 @@ test("未知来源与同名覆盖工具仍走安全兜底，不显示专用摘�
     toolEnd("t2", "grep", true, "plugin"),
   ], { viewport_height: 20 });
   const lines = viewer.render(160).slice(1, -1);
-  // 兑底条目只显示工具名与状态，无分隔符或摘要字段。
+  // 兜底条目只显示工具名与状态，无分隔符或摘要字段。
   assert.ok(lines.some((line) => line === "✓ read"), lines.join("\n"));
   assert.ok(lines.some((line) => line === "× grep"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /·|glob|truncated/u);

@@ -901,6 +901,7 @@ function summaryFragments(summary: SafePiToolSummary): SummaryFragments {
         ...(summary.offset === undefined ? [] : [`offset ${summary.offset}`]),
         ...(summary.limit === undefined ? [] : [`limit ${summary.limit}`]),
         ...readTruncationFacts(summary.truncated, summary.truncatedBy, summary.firstLineExceedsLimit),
+        ...(summary.hasMoreLines === true ? ["more lines"] : []),
       ];
       return { head: ["read"], path: summary.path, tail };
     }
@@ -957,7 +958,7 @@ function readTruncationFacts(
 
 /**
  * 专用摘要单行格式：状态图标与折叠标记之外的全部内容。长路径中间省略
- * 保留两端；其余超宽内容依赖整行右侧省略兑底。
+ * 保留两端；其余超宽内容依赖整行右侧省略兜底。
  */
 function formatFileToolSummary(summary: SafePiToolSummary, contentWidth: number): string {
   const fragments = summaryFragments(summary);
