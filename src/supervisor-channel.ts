@@ -1782,22 +1782,27 @@ export class SupervisorChannel {
     const payload = frame.payload;
     if (!isRecord(payload)) frameError("invalid_frame");
     if (hasExactObjectKeys(payload, ["agent_id", "entry"])) {
-      if (!isCanonicalUuid(payload.agent_id)) frameError("invalid_frame");
-      if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
+      const agentId = this.resolveInScopeActivityAgentId(payload.agent_id);
       const parsed = parseCanonicalAgentActivityEntry(payload.entry);
       if (parsed.kind === "invalid") frameError("invalid_frame");
-      if (parsed.entry.agent_id !== payload.agent_id) frameError("invalid_frame");
-      return Object.freeze({ agent_id: payload.agent_id as string, entry: parsed.entry });
+      if (parsed.entry.agent_id !== agentId) frameError("invalid_frame");
+      return Object.freeze({ agent_id: agentId, entry: parsed.entry });
     }
     if (hasExactObjectKeys(payload, ["agent_id", "chunk"])) {
-      if (!isCanonicalUuid(payload.agent_id)) frameError("invalid_frame");
-      if (!this.eventAgentIsInScope(payload.agent_id as string)) frameError("identity_mismatch");
+      const agentId = this.resolveInScopeActivityAgentId(payload.agent_id);
       const parsed = parseCanonicalAgentActivityChunk(payload.chunk);
       if (parsed.kind === "invalid") frameError("invalid_frame");
-      if (parsed.chunk.agent_id !== payload.agent_id) frameError("invalid_frame");
+      if (parsed.chunk.agent_id !== agentId) frameError("invalid_frame");
       return this.receiveActivityChunk(parsed.chunk);
     }
     frameError("invalid_frame");
+  }
+
+  /** 活动帧外层代理身份必须是规范 UUID 且在本地可见范围内，否则升级协议故障。 */
+  private resolveInScopeActivityAgentId(value: unknown): string {
+    if (!isCanonicalUuid(value)) frameError("invalid_frame");
+    if (!this.eventAgentIsInScope(value as string)) frameError("identity_mismatch");
+    return value as string;
   }
 
   /** 同一条目的分块按身份聚合；缺块不产生部分权威正文，静默等待或丢弃。 */
@@ -1822,6 +1827,7 @@ export class SupervisorChannel {
     }
     if (pending.received.size !== pending.chunk_total) return undefined;
     this.dropActivityReassembly(key);
+    const chunkTotal = pending.chunk_total;
     const reassembled = reassembleCanonicalAgentActivityChunks(
       [...pending.received.entries()].map(([index, payloadText]) => Object.freeze({
         contract_version: chunk.contract_version,
@@ -1829,7 +1835,7 @@ export class SupervisorChannel {
         incarnation_id: chunk.incarnation_id,
         entry_id: chunk.entry_id,
         chunk_index: index,
-        chunk_total: pending!.chunk_total,
+        chunk_total: chunkTotal,
         payload: payloadText,
       })),
     );

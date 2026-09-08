@@ -152,7 +152,7 @@ export function chunkCanonicalAgentActivityEntry(
   const serialized = JSON.stringify(parsed.entry);
   const bytes = new TextEncoder().encode(serialized);
   if (bytes.byteLength <= maxChunkPayloadBytes) return Object.freeze([parsed.entry]);
-  const chunks: CanonicalAgentActivityChunk[] = [];
+  const payloads: string[] = [];
   let offset = 0;
   while (offset < bytes.byteLength) {
     let end = Math.min(offset + maxChunkPayloadBytes, bytes.byteLength);
@@ -162,20 +162,19 @@ export function chunkCanonicalAgentActivityEntry(
     }
     const payload = Buffer.from(bytes.subarray(offset, end)).toString("utf8");
     if (payload.length === 0) return Object.freeze([]);
-    chunks.push(asChunk({
-      agent_id: parsed.entry.agent_id,
-      incarnation_id: parsed.entry.incarnation_id,
-      entry_id: parsed.entry.entry_id,
-      chunk_index: chunks.length,
-      chunk_total: 0,
-      payload,
-    }));
+    payloads.push(payload);
     offset = end;
   }
-  if (chunks.length > CANONICAL_ACTIVITY_CHUNK_TOTAL_LIMIT) return Object.freeze([]);
-  return Object.freeze(
-    chunks.map((chunk) => Object.freeze({ ...chunk, chunk_total: chunks.length })),
-  );
+  if (payloads.length > CANONICAL_ACTIVITY_CHUNK_TOTAL_LIMIT) return Object.freeze([]);
+  const chunkTotal = payloads.length;
+  return Object.freeze(payloads.map((payload, chunkIndex) => asChunk({
+    agent_id: parsed.entry.agent_id,
+    incarnation_id: parsed.entry.incarnation_id,
+    entry_id: parsed.entry.entry_id,
+    chunk_index: chunkIndex,
+    chunk_total: chunkTotal,
+    payload,
+  })));
 }
 
 /**

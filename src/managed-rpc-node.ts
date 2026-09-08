@@ -1078,11 +1078,12 @@ function isSafeActivityMessageEvent(value: Record<string, unknown>): boolean {
   for (const item of value.content) {
     if (!isRecord(item) || typeof item.type !== "string") return false;
     if (item.type === "text") {
-      if (!isBoundedActivityText(item.text)) return false;
+      // assistant 正文聚合无字节上限；帧边界由长度前缀帧保证。
+      if (!isActivityTextShape(item.text)) return false;
       continue;
     }
     if (item.type === "thinking") {
-      if (!isBoundedActivityText(item.thinking)) return false;
+      if (!isActivityTextShape(item.thinking)) return false;
       continue;
     }
     return false;
@@ -1109,11 +1110,21 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
 }
 
 /**
- * 父端防线按类型粗校验活动正文字符串：精确帧预算由桥接长度前缀帧与监督
- * 通道分块共同保证。空字符串无害，允许通过。
+ * assistant 消息正文按类型粗校验：正文聚合无字节上限，精确帧预算由桥接
+ * 长度前缀帧与监督通道分块共同保证。
+ */
+function isActivityTextShape(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+/**
+ * 工具参数/结果按转义前 UTF-8 上限粗校验：转义后只会更长，因此防线放行
+ * 的字符串未必满足转义后预算（由下游精确保留裁决），但被防线拒绝的字符
+ * 串必然超限。空字符串无害，允许通过。
  */
 function isBoundedActivityText(value: unknown): value is string {
-  return typeof value === "string";
+  return typeof value === "string"
+    && new TextEncoder().encode(value).byteLength <= ACTIVITY_MAX_TEXT_BYTES;
 }
 
 function decodeBase64Bytes(value: string): Uint8Array | undefined {

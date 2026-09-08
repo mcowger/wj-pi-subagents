@@ -245,12 +245,23 @@ function piCommandDisposition(
   });
 }
 
-function writeFrame(value: unknown): void {
+/** 序列化并封装为长度前缀帧；超预算返回 undefined，序列化失败抛错。 */
+function encodeFrame(value: unknown): Uint8Array | undefined {
   const body = new TextEncoder().encode(JSON.stringify(value));
-  if (body.byteLength > MAX_FRAME_BYTES) throw new Error("桥接帧超限");
+  if (body.byteLength > MAX_FRAME_BYTES) return undefined;
   const frame = new Uint8Array(body.byteLength + 4);
   new DataView(frame.buffer).setUint32(0, body.byteLength, false);
   frame.set(body, 4);
+  return frame;
+}
+
+function writeFrame(value: unknown): void {
+  const frame = encodeFrame(value);
+  if (frame === undefined) throw new Error("桥接帧超限");
+  writeOutputQueued(frame);
+}
+
+function writeOutputQueued(frame: Uint8Array): void {
   const write = outputQueue.then(
     () => writeOutput(frame),
     () => writeOutput(frame),
@@ -369,15 +380,16 @@ function emitEvent(event: unknown): void {
   if (stopping) return;
   // 超出桥接外层帧预算的活动事件静默跳过：完整正文的权威传输由监督通道
   // 分块上行，RPC 桥路径的缺失是静默缺口，不中断会话。
+  let frame: Uint8Array;
   try {
-    const body = JSON.stringify({ protocol: PROTOCOL, kind: "event", event });
-    if (new TextEncoder().encode(body).byteLength > MAX_FRAME_BYTES) return;
+    frame = encodeFrame({ protocol: PROTOCOL, kind: "event", event }) ?? new Uint8Array(0);
   } catch {
     failAndExit("protocol_fault");
     return;
   }
+  if (frame.byteLength === 0) return;
   try {
-    writeFrame({ protocol: PROTOCOL, kind: "event", event });
+    writeOutputQueued(frame);
   } catch {
     failAndExit("protocol_fault");
   }

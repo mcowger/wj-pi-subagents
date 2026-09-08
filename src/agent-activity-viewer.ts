@@ -86,6 +86,8 @@ interface ViewerSemanticLine {
   readonly style: UiPanelLineStyle;
   /** 可展开条目身份：thinking 组或长工具结果；选中背景只作用于该行。 */
   readonly selectable_key?: string;
+  /** 该行是否为当前选中条目；仅渲染层消费。 */
+  readonly selected?: boolean;
 }
 
 interface ToolDisplayEntry {
@@ -188,7 +190,7 @@ export class AgentActivityViewerModel {
     return "changed";
   }
 
-  /** 追加一条规范活动条目；违约条目被静默拒绝。 */
+  /** 追加一条规范活动条目；条目身份与正文闭集由上游 seam 保证。 */
   appendEntry(entry: CanonicalAgentActivityEntry): AgentActivityViewerUpdateOutcome {
     this.entries.push(entry);
     this.projectionRevision += 1;
@@ -320,7 +322,6 @@ export class AgentActivityViewerModel {
       Object.freeze({ text: footer, style: "footer" as const, selected: false }),
     ]);
   }
-
   handleInput(data: string): AgentActivityViewerInputOutcome {
     if (data === "\x1b") return "close";
     if (data === "\t") return this.moveSelection(1);
@@ -413,9 +414,11 @@ export class AgentActivityViewerModel {
 
   private selectableKeys(): readonly string[] {
     const lines = this.eventLines(this.layoutWidth);
+    const seen = new Set<string>();
     const keys: string[] = [];
     for (const line of lines) {
-      if (line.selectable_key !== undefined && !keys.includes(line.selectable_key)) {
+      if (line.selectable_key !== undefined && !seen.has(line.selectable_key)) {
+        seen.add(line.selectable_key);
         keys.push(line.selectable_key);
       }
     }
@@ -678,7 +681,7 @@ export function renderAgentActivityViewerSurface(
         line.text,
         panelWidth,
         line.style,
-        (line as { readonly selected?: boolean }).selected === true,
+        line.selected === true,
         theme,
       )),
       renderNarrowPanelLine(footer, panelWidth, "footer", false, theme),
@@ -693,7 +696,7 @@ export function renderAgentActivityViewerSurface(
       line.text,
       contentWidth,
       line.style,
-      (line as { readonly selected?: boolean }).selected === true,
+      line.selected === true,
       theme,
     )),
     renderPanelRule(panelWidth, "divider", theme),
