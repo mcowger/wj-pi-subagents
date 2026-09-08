@@ -79,6 +79,8 @@ interface ViewerSemanticLine {
   readonly selectable_key?: string;
   /** 该行是否为当前选中条目；仅渲染层消费。 */
   readonly selected?: boolean;
+  /** 行尾局部错误片段：仅该片段使用错误色，其余保持行样式。 */
+  readonly error_tail?: string;
 }
 
 /**
@@ -135,6 +137,31 @@ const TOOL_STATE_VISUALS: Readonly<Record<ToolRunState["phase"], {
     suffix: "terminated before result",
   }),
 });
+
+/** terminate_agent 强制回收成功：警告而非失败，成功结果与风险事实同时保留。 */
+const TOOL_FORCED_VISUAL = Object.freeze({ icon: "⚠", style: "warning" as const });
+
+/**
+ * 工具条目的显示视觉。运行状态机语义不变；只有来源验证通过的专用摘要在
+ * 成功事实携带特殊控制事实时覆盖显示：wait_agent 观察到目标 state failed
+ * 的成功调用显示红色失败，terminate_agent 强制回收成功显示警告。
+ */
+function toolDisplayVisual(entry: ToolDisplayEntry): {
+  readonly icon: string;
+  readonly style: UiPanelLineStyle;
+  readonly suffix?: string;
+} {
+  const base = TOOL_STATE_VISUALS[entry.state.phase];
+  const summary = entry.summary;
+  if (entry.state.phase !== "success" || summary === undefined) return base;
+  if (summary.tool === "wait_agent" && summary.state === "failed") {
+    return TOOL_STATE_VISUALS.failure;
+  }
+  if (summary.tool === "terminate_agent" && summary.forced === true) {
+    return TOOL_FORCED_VISUAL;
+  }
+  return base;
+}
 
 interface LiveMessageBlock {
   readonly contentType: "text" | "thinking";
@@ -356,6 +383,7 @@ export class AgentActivityViewerModel {
         text: truncateToDisplayWidth(line.text, contentWidth),
         style: line.style,
         selected: line.selectable_key !== undefined && line.selectable_key === this.selectedKey,
+        ...(line.error_tail === undefined ? {} : { error_tail: line.error_tail }),
       }));
     while (visible.length < this.viewportHeight) {
       visible.push(Object.freeze({ text: "", style: "body" as const, selected: false }));
@@ -695,7 +723,7 @@ export class AgentActivityViewerModel {
         continue;
       }
 
-      const visual = TOOL_STATE_VISUALS[entry.state.phase];
+      const visual = toolDisplayVisual(entry);
       // 行首顺序固定为状态图标、折叠标记、摘要。专用摘要展示白名单参数
       // 与结果事实；错误正文与消息正文默认折叠，展开后顶格显示。
       if (entry.summary !== undefined) {
@@ -717,12 +745,14 @@ export class AgentActivityViewerModel {
           - displayWidth(visual.icon) - 1
           - (marker === "" ? 0 : displayWidth(marker) + 1)
           - displayWidth(suffix);
+        // get_agent_status 目标 failed 时只将 failed 与错误码片段标红。
+        const failureTail = statusFailureTail(entry.summary);
+        const summaryText = formatStatusSummary(entry.summary, summaryWidth, failureTail);
         lines.push(Object.freeze({
-          text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${
-            formatToolSummary(entry.summary, summaryWidth)
-          }${suffix}`,
+          text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${summaryText}${suffix}`,
           style: visual.style,
           ...(expandable ? { selectable_key: expandKey } : {}),
+          ...(failureTail === undefined ? {} : { error_tail: failureTail }),
         }));
         // Shell 工具的完整 command 始终在摘要行下方的独立代码区域显示：
         // 状态变化只更新摘要行，命令区域不重排。
@@ -804,6 +834,7 @@ export function renderAgentActivityViewerSurface(
         line.style,
         line.selected === true,
         theme,
+        line.error_tail,
       )),
       renderNarrowPanelLine(footer, panelWidth, "footer", false, theme),
     ]);
@@ -819,6 +850,7 @@ export function renderAgentActivityViewerSurface(
       line.style,
       line.selected === true,
       theme,
+      line.error_tail,
     )),
     renderPanelRule(panelWidth, "divider", theme),
     renderFramedPanelLine(footer, contentWidth, "footer", false, theme),
@@ -1090,6 +1122,69 @@ function summaryFragments(summary: SafeToolSummary): SummaryFragments {
       // 摘要只显示工具名；完整 message 在独立可展开正文区域。
       return { head: [summary.tool], path: "", tail: [] };
     }
+    case "wait_agent": {
+      // 单目标显示名称与固定八位短 ID，多目标只显示数量；实际 outcome、
+      // batch release 的释放者与释放 outcome、目标 failed 的安全错误码并列。
+      const head: string[] = ["wait_agent"];
+      if (summary.agent_id !== undefined) {
+        if (summary.name !== undefined) head.push(summary.name);
+        head.push(shortAgentId(summary.agent_id));
+      } else if (summary.target_count !== undefined) {
+        head.push(`${summary.target_count} targets`);
+      }
+      const tail: string[] = [];
+      if (summary.outcome !== undefined) tail.push(summary.outcome);
+      if (summary.released_by !== undefined) {
+        if (summary.released_by_name !== undefined) tail.push(summary.released_by_name);
+        tail.push(shortAgentId(summary.released_by));
+      }
+      if (summary.released_outcome !== undefined) tail.push(summary.released_outcome);
+      if (summary.state === "failed") {
+        tail.push("failed");
+        if (summary.error_code !== undefined) tail.push(summary.error_code);
+      }
+      return { head, path: "", tail };
+    }
+    case "interrupt_agent": {
+      // 显示目标与真实控制结果：unchanged 与压缩阻塞为中性事实。
+      const head: string[] = ["interrupt_agent"];
+      if (summary.name !== undefined) head.push(summary.name);
+      head.push(shortAgentId(summary.agent_id));
+      const tail = summary.changed === false
+        ? [summary.blocked_reason === undefined ? "unchanged" : summary.blocked_reason]
+        : [];
+      return { head, path: "", tail };
+    }
+    case "terminate_agent": {
+      // 显示目标、回收数量、幂等与强制回收事实。
+      const head: string[] = ["terminate_agent"];
+      if (summary.name !== undefined) head.push(summary.name);
+      head.push(shortAgentId(summary.agent_id));
+      const tail: string[] = [];
+      if (summary.changed === false) tail.push("already terminated");
+      else if (summary.terminated_count !== undefined) {
+        tail.push(`${summary.terminated_count} reclaimed`);
+      }
+      if (summary.forced === true) tail.push("forced");
+      return { head, path: "", tail };
+    }
+    case "get_agent_status": {
+      // 显示目标、生命周期状态与条件性 phase、错误码、终止结果；revision、
+      // 时间与上下文占用不进入显示。
+      const head: string[] = ["get_agent_status"];
+      if (summary.name !== undefined) head.push(summary.name);
+      head.push(shortAgentId(summary.agent_id));
+      const tail: string[] = [];
+      if (summary.state !== undefined) tail.push(summary.state);
+      if (summary.phase !== undefined) tail.push(summary.phase);
+      if (summary.termination_result !== undefined) tail.push(summary.termination_result);
+      if (summary.error_code !== undefined) tail.push(summary.error_code);
+      return { head, path: "", tail };
+    }
+    case "get_agent_tree": {
+      // 成功只显示工具名与成功状态；不保存 revision、scope、节点列表或统计。
+      return { head: ["get_agent_tree"], path: "", tail: [] };
+    }
   }
 }
 
@@ -1135,6 +1230,34 @@ function formatToolSummary(summary: SafeToolSummary, contentWidth: number): stri
     - (fixed.length > 0 ? SUMMARY_SEPARATOR.length : 0) - 1;
   const middlePath = truncateMiddleToDisplayWidth(fragments.path, Math.max(1, budget));
   return join(middlePath);
+}
+
+/** get_agent_status 目标 failed 时的行尾红色片段：failed 状态与安全错误码。 */
+function statusFailureTail(summary: SafeToolSummary): string | undefined {
+  if (summary.tool !== "get_agent_status" || summary.state !== "failed") return undefined;
+  return summary.error_code === undefined
+    ? "failed"
+    : `failed${SUMMARY_SEPARATOR}${summary.error_code}`;
+}
+
+/**
+ * get_agent_status 摘要格式：查询成功时整行保持成功视觉，只把行尾的
+ * failed 与错误码片段留给错误色；前段超宽时先于红色片段右侧省略。
+ */
+function formatStatusSummary(
+  summary: SafeToolSummary,
+  contentWidth: number,
+  failureTail: string | undefined,
+): string {
+  const full = formatToolSummary(summary, contentWidth);
+  if (failureTail === undefined) return full;
+  const redPart = `${SUMMARY_SEPARATOR}${failureTail}`;
+  if (!full.endsWith(redPart)) return full;
+  const dim = truncateToDisplayWidth(
+    full.slice(0, full.length - redPart.length),
+    Math.max(1, contentWidth - displayWidth(redPart)),
+  );
+  return `${dim}${redPart}`;
 }
 
 function wrapPlainLine(value: string, width: number): string[] {

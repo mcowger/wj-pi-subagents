@@ -109,34 +109,34 @@ test("活动事件闭集对 message 正文不再按字节拒绝，旧工具字�
 });
 
 test("产生端规范化把非专用工具事实缩减为无载荷状态事实，来源身份随输入传递", () => {
-  // 专用摘要只属于 Pi 原生专用工具与本插件的五个创建/消息工具；闭集外的
-  // 本插件工具（wait_agent 等）仍是无载荷状态事实，参数不跨进程。
+  // 专用摘要只属于 Pi 原生专用工具与本插件的十个创建/消息/等待/控制工具；
+  // 闭集外的本插件工具名仍是无载荷状态事实，参数不跨进程。
   assert.deepEqual(normalizeOwnToolActivityEvent({
     type: "tool_execution_start",
     toolCallId: "call_1",
-    toolName: "wait_agent",
+    toolName: "future_plugin_tool",
     args: { agent_ids: ["550e8400-e29b-41d4-a716-446655440002"], timeout_ms: 1000 },
   }, "plugin"), {
     kind: "event",
     event: {
       type: "tool_execution_start",
       toolCallId: "call_1",
-      toolName: "wait_agent",
+      toolName: "future_plugin_tool",
       origin: "plugin",
     },
   });
   assert.deepEqual(normalizeOwnToolActivityEvent({
     type: "tool_execution_end",
     toolCallId: "call_1",
-    toolName: "wait_agent",
-    result: { content: [{ type: "text", text: "等待结果不得跨进程" }] },
+    toolName: "future_plugin_tool",
+    result: { content: [{ type: "text", text: "结果正文不得跨进程" }] },
     isError: false,
   }, "plugin"), {
     kind: "event",
     event: {
       type: "tool_execution_end",
       toolCallId: "call_1",
-      toolName: "wait_agent",
+      toolName: "future_plugin_tool",
       origin: "plugin",
       isError: false,
     },
@@ -1471,4 +1471,504 @@ test("插件摘要的 wire 闭集：未知键、非法 UUID 与负数量判违�
     summary: { tool: "normal_reply", message: "正文" },
     errorCode: "message_delivery_failed",
   }).kind, "event");
+});
+
+const WAIT_RELEASED_BY_ID = "22c4d1e8-3a5b-4c6d-8e9f-0a1b2c3d4e5f";
+
+/** 等待与控制工具的结束事件（结果 details 在 end）。 */
+function controlEnd(
+  toolName: string,
+  details: unknown,
+  isError = false,
+): unknown {
+  return isError
+    ? pluginEnd(toolName, pluginErrorShell("agent_not_found"), true)
+    : pluginEnd(toolName, { details }, false);
+}
+
+test("等待与控制工具的开始事实自包含白名单目标事实并忽略未来新增字段", () => {
+  // wait_agent 单目标：完整 UUID 加解析名称；timeout_ms 等其余参数忽略。
+  const waitResolved = normalizeOwnToolActivityEvent(
+    pluginStart("wait_agent", { agent_ids: [PLUGIN_CHILD_ID], timeout_ms: 300_000, priority: 1 }),
+    "plugin",
+    undefined,
+    (agentId) => (agentId === PLUGIN_CHILD_ID ? "worker-a" : undefined),
+  );
+  assert.equal(waitResolved.kind, "event");
+  if (waitResolved.kind !== "event" || waitResolved.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(waitResolved.event), {
+    tool: "wait_agent",
+    agent_id: PLUGIN_CHILD_ID,
+    name: "worker-a",
+  });
+
+  const waitUnresolved = normalizeOwnToolActivityEvent(
+    pluginStart("wait_agent", { agent_ids: [PLUGIN_CHILD_ID] }),
+    "plugin",
+  );
+  assert.equal(waitUnresolved.kind, "event");
+  if (waitUnresolved.kind !== "event" || waitUnresolved.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(waitUnresolved.event), { tool: "wait_agent", agent_id: PLUGIN_CHILD_ID });
+
+  // 多目标只显示数量；部分非法 UUID 完整降级。
+  const waitMulti = normalizeOwnToolActivityEvent(
+    pluginStart("wait_agent", { agent_ids: [PLUGIN_CHILD_ID, WAIT_RELEASED_BY_ID, PLUGIN_CHILD_ID] }),
+    "plugin",
+  );
+  assert.equal(waitMulti.kind, "event");
+  if (waitMulti.kind !== "event" || waitMulti.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(waitMulti.event), { tool: "wait_agent", target_count: 3 });
+
+  // interrupt/terminate/get_agent_status 只保留目标事实。
+  for (const toolName of ["interrupt_agent", "terminate_agent", "get_agent_status"] as const) {
+    const started = normalizeOwnToolActivityEvent(
+      pluginStart(toolName, { agent_id: PLUGIN_CHILD_ID, future_field: { secret: true } }),
+      "plugin",
+      undefined,
+      (agentId) => (agentId === PLUGIN_CHILD_ID ? "worker-a" : undefined),
+    );
+    assert.equal(started.kind, "event", toolName);
+    if (started.kind !== "event" || started.event.type !== "tool_execution_start") return;
+    assert.deepEqual(summaryOf(started.event), {
+      tool: toolName,
+      agent_id: PLUGIN_CHILD_ID,
+      name: "worker-a",
+    }, toolName);
+  }
+
+  // get_agent_tree 无输入参数：无载荷工具名摘要。
+  const tree = normalizeOwnToolActivityEvent(pluginStart("get_agent_tree", {}), "plugin");
+  assert.equal(tree.kind, "event");
+  if (tree.kind !== "event" || tree.event.type !== "tool_execution_start") return;
+  assert.deepEqual(summaryOf(tree.event), { tool: "get_agent_tree" });
+});
+
+test("wait_agent 成功事实显示实际 outcome 与 batch release 事实，不保存原始结果", () => {
+  const startArgs = { agent_ids: [PLUGIN_CHILD_ID] };
+  for (const outcome of ["reply", "final_report", "idle", "terminal", "timeout"] as const) {
+    const ended = normalizeOwnToolActivityEvent(
+      pluginEnd("wait_agent", {
+        details: {
+          agent_id: PLUGIN_CHILD_ID,
+          outcome,
+          state: outcome === "terminal" ? "terminated" : "working",
+          revision: 41,
+          report_body: "报告正文不得进入摘要",
+          task_result: { secret: true },
+        },
+      }, false),
+      "plugin",
+      startArgs,
+    );
+    assert.equal(ended.kind, "event", outcome);
+    if (ended.kind !== "event" || ended.event.type !== "tool_execution_end") return;
+    assert.deepEqual(summaryOf(ended.event), {
+      tool: "wait_agent",
+      agent_id: PLUGIN_CHILD_ID,
+      outcome,
+    }, outcome);
+  }
+
+  // 多目标 timeout：数量加 outcome。
+  const multiTimeout = normalizeOwnToolActivityEvent(
+    pluginEnd("wait_agent", { details: { agent_ids: [PLUGIN_CHILD_ID], outcome: "timeout" } }, false),
+    "plugin",
+    { agent_ids: [PLUGIN_CHILD_ID, WAIT_RELEASED_BY_ID, PLUGIN_CHILD_ID] },
+  );
+  assert.equal(multiTimeout.kind, "event");
+  if (multiTimeout.kind !== "event" || multiTimeout.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(multiTimeout.event), { tool: "wait_agent", target_count: 3, outcome: "timeout" });
+
+  // batch release：释放者名称（解析命中时）与释放 outcome。
+  const batch = normalizeOwnToolActivityEvent(
+    pluginEnd("wait_agent", {
+      details: {
+        agent_ids: [PLUGIN_CHILD_ID, WAIT_RELEASED_BY_ID],
+        outcome: "batch_released",
+        released_by_agent_id: WAIT_RELEASED_BY_ID,
+        released_by_outcome: "final_report",
+      },
+    }, false),
+    "plugin",
+    { agent_ids: [PLUGIN_CHILD_ID, WAIT_RELEASED_BY_ID] },
+    (agentId) => (agentId === WAIT_RELEASED_BY_ID ? "worker-b" : undefined),
+  );
+  assert.equal(batch.kind, "event");
+  if (batch.kind !== "event" || batch.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(batch.event), {
+    tool: "wait_agent",
+    target_count: 2,
+    outcome: "batch_released",
+    released_by: WAIT_RELEASED_BY_ID,
+    released_by_name: "worker-b",
+    released_outcome: "final_report",
+  });
+
+  // 目标 state failed：红色失败事实与白名单内安全错误码。
+  const targetFailed = normalizeOwnToolActivityEvent(
+    pluginEnd("wait_agent", {
+      details: {
+        agent_id: PLUGIN_CHILD_ID,
+        outcome: "terminal",
+        state: "failed",
+        revision: 42,
+        error: { code: "model_unavailable", message: "底层异常正文", retryable: false },
+      },
+    }, false),
+    "plugin",
+    startArgs,
+  );
+  assert.equal(targetFailed.kind, "event");
+  if (targetFailed.kind !== "event" || targetFailed.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(targetFailed.event), {
+    tool: "wait_agent",
+    agent_id: PLUGIN_CHILD_ID,
+    outcome: "terminal",
+    state: "failed",
+    error_code: "model_unavailable",
+  });
+  // 成功事实不携带事件级错误码。
+  assert.equal(targetFailed.event.errorCode, undefined);
+
+  // 白名单外错误码静默省略；state failed 事实仍保留。
+  const unlistedFault = normalizeOwnToolActivityEvent(
+    pluginEnd("wait_agent", {
+      details: {
+        agent_id: PLUGIN_CHILD_ID,
+        outcome: "terminal",
+        state: "failed",
+        error: { code: "secret_internal_code" },
+      },
+    }, false),
+    "plugin",
+    startArgs,
+  );
+  assert.equal(unlistedFault.kind, "event");
+  if (unlistedFault.kind !== "event" || unlistedFault.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(unlistedFault.event), {
+    tool: "wait_agent",
+    agent_id: PLUGIN_CHILD_ID,
+    outcome: "terminal",
+    state: "failed",
+  });
+});
+
+test("控制工具成功事实区分幂等、强制回收、压缩阻塞与状态查询片段", () => {
+  // interrupt：进入 interrupting、unchanged 与压缩阻塞。
+  const interruptCases: readonly {
+    readonly details: unknown;
+    readonly expected: unknown;
+  }[] = [
+    { details: { agent_id: PLUGIN_CHILD_ID, accepted: true, changed: true, state: "interrupting" }, expected: { tool: "interrupt_agent", agent_id: PLUGIN_CHILD_ID, changed: true } },
+    { details: { agent_id: PLUGIN_CHILD_ID, accepted: true, changed: false, state: "working" }, expected: { tool: "interrupt_agent", agent_id: PLUGIN_CHILD_ID, changed: false } },
+    {
+      details: { agent_id: PLUGIN_CHILD_ID, accepted: true, changed: false, state: "working", blocked_reason: "compaction_active" },
+      expected: { tool: "interrupt_agent", agent_id: PLUGIN_CHILD_ID, changed: false, blocked_reason: "compaction_active" },
+    },
+  ];
+  for (const item of interruptCases) {
+    const ended = normalizeOwnToolActivityEvent(
+      controlEnd("interrupt_agent", item.details),
+      "plugin",
+      { agent_id: PLUGIN_CHILD_ID },
+    );
+    assert.equal(ended.kind, "event");
+    if (ended.kind !== "event" || ended.event.type !== "tool_execution_end") return;
+    assert.deepEqual(summaryOf(ended.event), item.expected);
+  }
+
+  // terminate：回收数量、幂等与强制回收事实。
+  const terminateCases: readonly { readonly details: unknown; readonly expected: unknown }[] = [
+    {
+      details: { agent_id: PLUGIN_CHILD_ID, state: "terminated", changed: true, forced: false, terminated_count: 2 },
+      expected: { tool: "terminate_agent", agent_id: PLUGIN_CHILD_ID, changed: true, terminated_count: 2 },
+    },
+    {
+      details: { agent_id: PLUGIN_CHILD_ID, state: "terminated", changed: true, forced: true, terminated_count: 3 },
+      expected: { tool: "terminate_agent", agent_id: PLUGIN_CHILD_ID, changed: true, forced: true, terminated_count: 3 },
+    },
+    {
+      details: { agent_id: PLUGIN_CHILD_ID, state: "terminated", changed: false, forced: false, terminated_count: 0 },
+      expected: { tool: "terminate_agent", agent_id: PLUGIN_CHILD_ID, changed: false, terminated_count: 0 },
+    },
+  ];
+  for (const item of terminateCases) {
+    const ended = normalizeOwnToolActivityEvent(
+      controlEnd("terminate_agent", item.details),
+      "plugin",
+      { agent_id: PLUGIN_CHILD_ID },
+    );
+    assert.equal(ended.kind, "event");
+    if (ended.kind !== "event" || ended.event.type !== "tool_execution_end") return;
+    assert.deepEqual(summaryOf(ended.event), item.expected);
+  }
+
+  // get_agent_status：working 携带 phase，failed 携带错误码，terminated 携带
+  // 终止结果；revision、时间与上下文占用一律忽略。
+  const statusCases: readonly { readonly details: unknown; readonly expected: unknown }[] = [
+    {
+      details: {
+        agent_id: PLUGIN_CHILD_ID, state: "working", revision: 7,
+        activity: { phase: "executing_tools" }, context_usage_percent: 88,
+      },
+      expected: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "working", phase: "executing_tools" },
+    },
+    {
+      details: { agent_id: PLUGIN_CHILD_ID, state: "idle", revision: 8 },
+      expected: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "idle" },
+    },
+    {
+      details: {
+        agent_id: PLUGIN_CHILD_ID, state: "failed", revision: 9,
+        error: { code: "provider_unavailable", message: "底层异常", retryable: false },
+      },
+      expected: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "failed", error_code: "provider_unavailable" },
+    },
+    {
+      details: {
+        agent_id: PLUGIN_CHILD_ID, state: "terminated", revision: 10,
+        termination_result: "completed",
+      },
+      expected: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "terminated", termination_result: "completed" },
+    },
+  ];
+  for (const item of statusCases) {
+    const ended = normalizeOwnToolActivityEvent(
+      controlEnd("get_agent_status", item.details),
+      "plugin",
+      { agent_id: PLUGIN_CHILD_ID },
+    );
+    assert.equal(ended.kind, "event");
+    if (ended.kind !== "event" || ended.event.type !== "tool_execution_end") return;
+    assert.deepEqual(summaryOf(ended.event), item.expected);
+  }
+
+  // get_agent_tree：成功与失败都是无载荷摘要；树统计不进入摘要。
+  for (const isError of [false, true]) {
+    const ended = normalizeOwnToolActivityEvent(
+      controlEnd("get_agent_tree", {
+        revision: 11,
+        scope: "subtree",
+        nodes: [{ agent_id: PLUGIN_CHILD_ID, state: "working" }],
+        stats: { working: 1 },
+      }, isError),
+      "plugin",
+      {},
+    );
+    assert.equal(ended.kind, "event");
+    if (ended.kind !== "event" || ended.event.type !== "tool_execution_end") return;
+    assert.deepEqual(summaryOf(ended.event), { tool: "get_agent_tree" });
+    if (isError) assert.equal(ended.event.errorCode, "agent_not_found");
+  }
+});
+
+test("等待与控制工具失败事实携带输入目标与白名单稳定错误码", () => {
+  const failed = normalizeOwnToolActivityEvent(
+    controlEnd("wait_agent", undefined, true),
+    "plugin",
+    { agent_ids: [PLUGIN_CHILD_ID] },
+  );
+  assert.equal(failed.kind, "event");
+  if (failed.kind !== "event" || failed.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(failed.event), { tool: "wait_agent", agent_id: PLUGIN_CHILD_ID });
+  assert.equal(failed.event.errorCode, "agent_not_found");
+
+  const failedStatus = normalizeOwnToolActivityEvent(
+    controlEnd("get_agent_status", undefined, true),
+    "plugin",
+    { agent_id: PLUGIN_CHILD_ID },
+  );
+  assert.equal(failedStatus.kind, "event");
+  if (failedStatus.kind !== "event" || failedStatus.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(failedStatus.event), { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID });
+  assert.equal(failedStatus.event.errorCode, "agent_not_found");
+});
+
+test("等待与控制工具必需字段缺失或类型错误时完整降级为安全兜底", () => {
+  // 开始参数违约：开始与失败结束事实都完整降级，失败错误码仍提取。
+  const startCases: readonly { readonly toolName: string; readonly startArgs: unknown }[] = [
+    { toolName: "wait_agent", startArgs: { agent_ids: ["not-a-uuid"] } },
+    { toolName: "wait_agent", startArgs: { agent_ids: [] } },
+    { toolName: "wait_agent", startArgs: {} },
+    { toolName: "interrupt_agent", startArgs: { agent_id: "short" } },
+    { toolName: "terminate_agent", startArgs: {} },
+    { toolName: "get_agent_status", startArgs: { agent_id: 42 } },
+  ];
+  for (const item of startCases) {
+    const start = normalizeOwnToolActivityEvent(pluginStart(item.toolName, item.startArgs), "plugin");
+    assert.equal(start.kind, "event", item.toolName);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.equal(start.event.summary, undefined, `${item.toolName} start`);
+
+    const end = normalizeOwnToolActivityEvent(
+      pluginEnd(item.toolName, pluginErrorShell("agent_not_found"), true),
+      "plugin",
+      isRecordArgs(item.startArgs) ? item.startArgs : undefined,
+    );
+    assert.equal(end.kind, "event", item.toolName);
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    assert.equal(end.event.summary, undefined, `${item.toolName} end`);
+    assert.equal(end.event.errorCode, "agent_not_found", item.toolName);
+  }
+
+  // 成功结果违约：开始事实保留目标事实，结束事实完整降级为无载荷兜底。
+  const endCases: readonly {
+    readonly toolName: string;
+    readonly startArgs: unknown;
+    readonly endResult: unknown;
+  }[] = [
+    { toolName: "wait_agent", startArgs: { agent_ids: [PLUGIN_CHILD_ID] }, endResult: { details: { agent_id: PLUGIN_CHILD_ID, revision: 1 } } },
+    { toolName: "wait_agent", startArgs: { agent_ids: [PLUGIN_CHILD_ID] }, endResult: { details: { agent_id: PLUGIN_CHILD_ID, outcome: "detached" } } },
+    { toolName: "wait_agent", startArgs: { agent_ids: [PLUGIN_CHILD_ID] }, endResult: { details: { outcome: "batch_released" } } },
+    { toolName: "wait_agent", startArgs: { agent_ids: [PLUGIN_CHILD_ID] }, endResult: { details: { outcome: "batch_released", released_by_agent_id: "short", released_by_outcome: "reply" } } },
+    { toolName: "interrupt_agent", startArgs: { agent_id: PLUGIN_CHILD_ID }, endResult: { details: { agent_id: PLUGIN_CHILD_ID, accepted: true } } },
+    { toolName: "terminate_agent", startArgs: { agent_id: PLUGIN_CHILD_ID }, endResult: { details: { agent_id: PLUGIN_CHILD_ID, changed: true, terminated_count: -1 } } },
+    { toolName: "get_agent_status", startArgs: { agent_id: PLUGIN_CHILD_ID }, endResult: { details: { agent_id: PLUGIN_CHILD_ID, state: "detached" } } },
+    { toolName: "get_agent_status", startArgs: { agent_id: PLUGIN_CHILD_ID }, endResult: {} },
+  ];
+  for (const item of endCases) {
+    const start = normalizeOwnToolActivityEvent(pluginStart(item.toolName, item.startArgs), "plugin");
+    assert.equal(start.kind, "event", item.toolName);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.notEqual(start.event.summary, undefined, `${item.toolName} start`);
+
+    const end = normalizeOwnToolActivityEvent(
+      pluginEnd(item.toolName, item.endResult, false),
+      "plugin",
+      isRecordArgs(item.startArgs) ? item.startArgs : undefined,
+    );
+    assert.equal(end.kind, "event", item.toolName);
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    assert.equal(end.event.summary, undefined, `${item.toolName} end`);
+  }
+});
+
+test("同名覆盖的等待与控制工具名不产生插件摘要与错误码", () => {
+  for (const origin of ["unknown", "pi_native"] as const) {
+    const start = normalizeOwnToolActivityEvent(
+      pluginStart("wait_agent", { agent_ids: [PLUGIN_CHILD_ID] }),
+      origin,
+    );
+    assert.equal(start.kind, "event", origin);
+    if (start.kind !== "event" || start.event.type !== "tool_execution_start") continue;
+    assert.equal(start.event.summary, undefined, origin);
+
+    const end = normalizeOwnToolActivityEvent(
+      pluginEnd("get_agent_status", { details: { agent_id: PLUGIN_CHILD_ID, state: "working" } }, false),
+      origin,
+      { agent_id: PLUGIN_CHILD_ID },
+    );
+    assert.equal(end.kind, "event", origin);
+    if (end.kind !== "event" || end.event.type !== "tool_execution_end") continue;
+    assert.equal(end.event.summary, undefined, origin);
+  }
+});
+
+test("等待与控制摘要的 wire 闭集：未知键、非法目标与闭集外枚举判违约", () => {
+  const validWait = {
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "wait_agent",
+    origin: "plugin",
+    isError: false,
+    summary: {
+      tool: "wait_agent", target_count: 2, outcome: "batch_released",
+      released_by: WAIT_RELEASED_BY_ID, released_outcome: "reply",
+    },
+  };
+  assert.equal(parseAgentActivityEvent(validWait).kind, "event");
+
+  const invalidCases: readonly Record<string, unknown>[] = [
+    // 未知键判违约。
+    { ...validWait, summary: { ...validWait.summary, revision: 3 } },
+    // 单目标与多目标互斥，也不允许同时缺失。
+    { ...validWait, summary: { tool: "wait_agent", agent_id: PLUGIN_CHILD_ID, target_count: 2, outcome: "reply" } },
+    { ...validWait, summary: { tool: "wait_agent", outcome: "reply" } },
+    // 目标必须是完整 UUID；数量必须是正数。
+    { ...validWait, summary: { tool: "wait_agent", agent_id: "short-id", outcome: "reply" } },
+    { ...validWait, summary: { tool: "wait_agent", target_count: 0, outcome: "timeout" } },
+    // outcome 与释放事实闭集。
+    { ...validWait, summary: { tool: "wait_agent", target_count: 2, outcome: "detached" } },
+    { ...validWait, summary: { tool: "wait_agent", target_count: 2, outcome: "batch_released", released_by: "short", released_outcome: "reply" } },
+    { ...validWait, summary: { tool: "wait_agent", target_count: 2, outcome: "batch_released", released_by: WAIT_RELEASED_BY_ID, released_outcome: "timeout" } },
+    // 目标失败状态只允许 failed；错误码必须白名单内。
+    { ...validWait, summary: { tool: "wait_agent", agent_id: PLUGIN_CHILD_ID, outcome: "terminal", state: "terminated" } },
+    { ...validWait, summary: { tool: "wait_agent", agent_id: PLUGIN_CHILD_ID, outcome: "terminal", state: "failed", error_code: "not_public" } },
+  ];
+  for (const candidate of invalidCases) {
+    assert.equal(parseAgentActivityEvent(candidate).kind, "invalid");
+  }
+
+  // interrupt：压缩阻塞只属于未变更事实。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "interrupt_agent",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "interrupt_agent", agent_id: PLUGIN_CHILD_ID, changed: false, blocked_reason: "compaction_active" },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "interrupt_agent",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "interrupt_agent", agent_id: PLUGIN_CHILD_ID, changed: true, blocked_reason: "compaction_active" },
+  }).kind, "invalid");
+
+  // terminate：forced 只允许 true；数量非负。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "terminate_agent",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "terminate_agent", agent_id: PLUGIN_CHILD_ID, changed: true, forced: false, terminated_count: 1 },
+  }).kind, "invalid");
+
+  // status：phase、错误码与终止结果闭集。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "get_agent_status",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "failed", phase: "executing_tools" },
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "get_agent_status",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "working", phase: "thinking" },
+  }).kind, "invalid");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "get_agent_status",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "terminated", termination_result: "aborted" },
+  }).kind, "invalid");
+
+  // tree：无载荷摘要之外的任何键判违约；失败事实可携带白名单错误码。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "get_agent_tree",
+    origin: "plugin",
+    isError: true,
+    summary: { tool: "get_agent_tree" },
+    errorCode: "agent_unavailable",
+  }).kind, "event");
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "get_agent_tree",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "get_agent_tree", revision: 3 },
+  }).kind, "invalid");
 });

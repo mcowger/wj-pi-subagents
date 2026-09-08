@@ -1,4 +1,12 @@
 import { REPLY_MAX_TEXT_BYTES } from "./child-reply-limits.ts";
+import {
+  AGENT_ACTIVITY_PHASES,
+  AGENT_TERMINATION_RESULTS,
+  type AgentActivityPhase,
+  type AgentLifecycleState,
+  type AgentTerminationResult,
+} from "./agent-snapshot-codec.ts";
+import { LIFECYCLE_STATES } from "./conversation-lifecycle.ts";
 import { PUBLIC_ERROR_CODES, isCanonicalUuid } from "./tree-controller.ts";
 
 /**
@@ -42,6 +50,7 @@ export const PI_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
  */
 export const PLUGIN_TOOL_SUMMARY_NAMES: ReadonlySet<string> = new Set([
   "get_agent_templates", "spawn_agent", "send_message", "normal_reply", "final_report",
+  "wait_agent", "interrupt_agent", "terminate_agent", "get_agent_status", "get_agent_tree",
 ]);
 
 /**
@@ -154,6 +163,66 @@ export type SafeToolSummary =
   | {
       readonly tool: "final_report";
       readonly message: string;
+    }
+  | {
+      readonly tool: "wait_agent";
+      /** 单目标完整 UUID；显示层负责固定八位短 ID。多目标不携带。 */
+      readonly agent_id?: string;
+      /** 单目标且解析成功时的目标名称；解析失败时不携带。 */
+      readonly name?: string;
+      /** 多目标数量；单目标不携带。 */
+      readonly target_count?: number;
+      /** 成功返回的实际 outcome；开始与失败事实不携带。 */
+      readonly outcome?: WaitAgentSummaryOutcome;
+      /** batch_released 的释放者完整 UUID。 */
+      readonly released_by?: string;
+      /** batch_released 释放者名称（解析成功时）。 */
+      readonly released_by_name?: string;
+      /** batch_released 的释放 outcome。 */
+      readonly released_outcome?: WaitAgentEventOutcomeName;
+      /** 目标观察到的失败状态；仅成功事实携带。 */
+      readonly state?: "failed";
+      /** 目标失败时的安全错误码（白名单内）。 */
+      readonly error_code?: string;
+    }
+  | {
+      readonly tool: "interrupt_agent";
+      readonly agent_id: string;
+      /** 解析成功时的目标名称。 */
+      readonly name?: string;
+      /** 成功控制结果：true 表示已进入 interrupting。 */
+      readonly changed?: boolean;
+      /** 压缩阻塞原因；仅未变更时携带。 */
+      readonly blocked_reason?: "compaction_active";
+    }
+  | {
+      readonly tool: "terminate_agent";
+      readonly agent_id: string;
+      /** 解析成功时的目标名称。 */
+      readonly name?: string;
+      /** 成功回收事实：false 表示 already terminated。 */
+      readonly changed?: boolean;
+      /** 强制回收事实；仅强制时携带。 */
+      readonly forced?: boolean;
+      /** 本次回收确认的节点数量。 */
+      readonly terminated_count?: number;
+    }
+  | {
+      readonly tool: "get_agent_status";
+      readonly agent_id: string;
+      /** 解析成功时的目标名称。 */
+      readonly name?: string;
+      /** 查询到的生命周期状态。 */
+      readonly state?: AgentLifecycleState;
+      /** working/interrupting 时的活动阶段。 */
+      readonly phase?: AgentActivityPhase;
+      /** 目标 failed 时的安全错误码（白名单内）。 */
+      readonly error_code?: string;
+      /** 目标 terminated 时的终止结果。 */
+      readonly termination_result?: AgentTerminationResult;
+    }
+  | {
+      readonly tool: "get_agent_tree";
     };
 
 const READ_SUMMARY_KEYS = Object.freeze([
@@ -175,6 +244,61 @@ const TEMPLATE_COUNT_SUMMARY_KEYS = Object.freeze(["tool", "count"] as const);
 const SPAWN_SUMMARY_KEYS = Object.freeze(["tool", "name", "template_id", "agent_id"] as const);
 const SEND_MESSAGE_SUMMARY_KEYS = Object.freeze(["tool", "agent_id", "message", "name"] as const);
 const MESSAGE_ONLY_SUMMARY_KEYS = Object.freeze(["tool", "message"] as const);
+const WAIT_SUMMARY_KEYS = Object.freeze([
+  "tool", "agent_id", "name", "target_count", "outcome",
+  "released_by", "released_by_name", "released_outcome", "state", "error_code",
+] as const);
+const INTERRUPT_SUMMARY_KEYS = Object.freeze([
+  "tool", "agent_id", "name", "changed", "blocked_reason",
+] as const);
+const TERMINATE_SUMMARY_KEYS = Object.freeze([
+  "tool", "agent_id", "name", "changed", "forced", "terminated_count",
+] as const);
+const STATUS_SUMMARY_KEYS = Object.freeze([
+  "tool", "agent_id", "name", "state", "phase", "error_code", "termination_result",
+] as const);
+const TREE_SUMMARY_KEYS = Object.freeze(["tool"] as const);
+
+/** wait_agent 摘要允许的全部 outcome 值闭集（含等待包装事实）。 */
+type WaitAgentSummaryOutcome =
+  | "reply"
+  | "final_report"
+  | "idle"
+  | "terminal"
+  | "timeout"
+  | "batch_released";
+/** wait_agent 事件 outcome 闭集（batch release 的释放者 outcome）。 */
+type WaitAgentEventOutcomeName = "reply" | "final_report" | "idle" | "terminal";
+
+const WAIT_OUTCOME_NAMES: ReadonlySet<string> = new Set<WaitAgentSummaryOutcome>([
+  "reply", "final_report", "idle", "terminal", "timeout", "batch_released",
+]);
+const WAIT_EVENT_OUTCOME_NAMES: ReadonlySet<string> = new Set<WaitAgentEventOutcomeName>([
+  "reply", "final_report", "idle", "terminal",
+]);
+const LIFECYCLE_STATE_NAMES: ReadonlySet<string> = new Set<string>(LIFECYCLE_STATES);
+const ACTIVITY_PHASE_NAMES: ReadonlySet<string> = new Set<string>(AGENT_ACTIVITY_PHASES);
+const TERMINATION_RESULT_NAMES: ReadonlySet<string> = new Set<string>(AGENT_TERMINATION_RESULTS);
+
+function isWaitOutcomeName(value: string): value is WaitAgentSummaryOutcome {
+  return WAIT_OUTCOME_NAMES.has(value);
+}
+
+function isWaitEventOutcomeName(value: string): value is WaitAgentEventOutcomeName {
+  return WAIT_EVENT_OUTCOME_NAMES.has(value);
+}
+
+function isLifecycleStateName(value: string): value is AgentLifecycleState {
+  return LIFECYCLE_STATE_NAMES.has(value);
+}
+
+function isActivityPhaseName(value: string): value is AgentActivityPhase {
+  return ACTIVITY_PHASE_NAMES.has(value);
+}
+
+function isTerminationResultName(value: string): value is AgentTerminationResult {
+  return TERMINATION_RESULT_NAMES.has(value);
+}
 
 /**
  * 活动正文事实净化：过滤 ANSI 与危险终端控制字符，保留换行与可读空白。
@@ -610,12 +734,13 @@ export function normalizeAssistantMessageUpdate(
  * 原始结果与错误正文在此处丢弃，永不跨进程；来源身份由调用方验证后随
  * 规范化输入传递。来源验证通过的 Pi 原生专用工具（read/grep/find/ls/write/
  * edit/bash/powershell）与本插件专用工具（get_agent_templates/spawn_agent/
- * send_message/normal_reply/final_report）各自使用专用摘要规则：只保留
- * 白名单参数与结果事实，Shell 外 Pi 工具失败时自包含净化后的完整错误正文，
- * 插件工具失败时自包含规范稳定错误码。专用解析宽容未来新增字段并忽略它
- * 们；必需字段缺失或类型错误、开始参数缺失或来源验证失败时完整降级为无
- * 载荷安全兜底。允许未来新增字段并忽略它们；关联身份缺失或来源闭集之外
- * 属于结构违约，由调用方决定是否升级，不在本函数内降级。
+ * send_message/normal_reply/final_report/wait_agent/interrupt_agent/
+ * terminate_agent/get_agent_status/get_agent_tree）各自使用专用摘要规则：
+ * 只保留白名单参数与结果事实，Shell 外 Pi 工具失败时自包含净化后的完整
+ * 错误正文，插件工具失败时自包含规范稳定错误码。专用解析宽容未来新增字段
+ * 并忽略它们；必需字段缺失或类型错误、开始参数缺失或来源验证失败时完整
+ * 降级为无载荷安全兜底。允许未来新增字段并忽略它们；关联身份缺失或来源
+ * 闭集之外属于结构违约，由调用方决定是否升级，不在本函数内降级。
  */
 export function normalizeOwnToolActivityEvent(
   event: unknown,
@@ -1030,9 +1155,162 @@ function extractPluginToolSummary(
         message: sanitizeSafeActivityText(message),
       };
     }
+    case "wait_agent": {
+      // 开始与失败事实只保留目标事实：单目标名称与固定八位短 ID 的完整
+      // UUID，多目标只保留数量；timeout_ms 等其余参数忽略。
+      const agentIds = args.agent_ids;
+      if (!Array.isArray(agentIds) || agentIds.length === 0) return undefined;
+      const validIds: string[] = [];
+      for (const candidate of agentIds) {
+        if (!isCanonicalUuid(candidate)) return undefined;
+        validIds.push(candidate);
+      }
+      const base = validIds.length === 1
+        ? singleTargetFacts(validIds[0]!, resolveAgentName)
+        : { target_count: validIds.length };
+      if (isError !== false) return { tool: "wait_agent", ...base };
+      // 成功事实自包含实际 outcome；batch release 追加释放者与释放 outcome；
+      // 目标 state failed 追加安全错误码。原始结果结构、报告正文与任务结果
+      // 一律不进入摘要。
+      const details = successDetails;
+      const outcome = details?.outcome;
+      if (typeof outcome !== "string" || !isWaitOutcomeName(outcome)) return undefined;
+      if (outcome === "batch_released") {
+        const releasedBy = details?.released_by_agent_id;
+        const releasedOutcome = details?.released_by_outcome;
+        if (
+          !isCanonicalUuid(releasedBy)
+          || typeof releasedOutcome !== "string"
+          || !isWaitEventOutcomeName(releasedOutcome)
+        ) return undefined;
+        const releasedName = readResolvedAgentName(releasedBy, resolveAgentName);
+        return {
+          tool: "wait_agent",
+          ...base,
+          outcome,
+          released_by: releasedBy,
+          ...(releasedName === undefined ? {} : { released_by_name: releasedName }),
+          released_outcome: releasedOutcome,
+        };
+      }
+      if (details === undefined || details.state !== "failed") {
+        return { tool: "wait_agent", ...base, outcome };
+      }
+      const fault = isRecord(details.error) ? details.error.code : undefined;
+      const errorCode = typeof fault === "string" && isPublicErrorCode(fault) ? fault : undefined;
+      return {
+        tool: "wait_agent",
+        ...base,
+        outcome,
+        state: "failed",
+        ...(errorCode === undefined ? {} : { error_code: errorCode }),
+      };
+    }
+    case "interrupt_agent": {
+      const agentId = args.agent_id;
+      if (!isCanonicalUuid(agentId)) return undefined;
+      const base = singleTargetFacts(agentId, resolveAgentName);
+      if (isError !== false) return { tool: "interrupt_agent", ...base };
+      // 成功事实区分进入 interrupting、unchanged 与压缩阻塞；结果 state 等
+      // 其余字段忽略。
+      const details = successDetails;
+      const changed = details?.changed;
+      if (typeof changed !== "boolean") return undefined;
+      const blockedReason = details?.blocked_reason;
+      const knownBlock = changed === false && blockedReason === "compaction_active"
+        ? blockedReason
+        : undefined;
+      return {
+        tool: "interrupt_agent",
+        ...base,
+        changed,
+        ...(knownBlock === undefined ? {} : { blocked_reason: knownBlock }),
+      };
+    }
+    case "terminate_agent": {
+      const agentId = args.agent_id;
+      if (!isCanonicalUuid(agentId)) return undefined;
+      const base = singleTargetFacts(agentId, resolveAgentName);
+      if (isError !== false) return { tool: "terminate_agent", ...base };
+      // 成功事实保留幂等、强制回收与回收数量事实；state 等其余字段忽略。
+      const details = successDetails;
+      const changed = details?.changed;
+      const terminatedCount = details?.terminated_count;
+      if (
+        typeof changed !== "boolean"
+        || typeof terminatedCount !== "number"
+        || !Number.isSafeInteger(terminatedCount)
+        || terminatedCount < 0
+      ) return undefined;
+      return {
+        tool: "terminate_agent",
+        ...base,
+        changed,
+        ...(details?.forced === true ? { forced: true } : {}),
+        terminated_count: terminatedCount,
+      };
+    }
+    case "get_agent_status": {
+      const agentId = args.agent_id;
+      if (!isCanonicalUuid(agentId)) return undefined;
+      const base = singleTargetFacts(agentId, resolveAgentName);
+      if (isError !== false) return { tool: "get_agent_status", ...base };
+      // 成功事实只保留生命周期状态与条件性 phase、错误码、终止结果；
+      // revision、时间、上下文占用与完整快照一律不进入摘要。
+      const details = successDetails;
+      const state = details?.state;
+      if (typeof state !== "string" || !isLifecycleStateName(state)) return undefined;
+      const phase = state === "working" || state === "interrupting"
+        ? readActivityPhase(details?.activity)
+        : undefined;
+      const fault = state === "failed" && details !== undefined
+        ? details.error
+        : undefined;
+      const errorCode = fault === undefined ? undefined : readPublicFaultCode(fault);
+      const terminationResult = state === "terminated"
+        ? readTerminationResult(details?.termination_result)
+        : undefined;
+      return {
+        tool: "get_agent_status",
+        ...base,
+        state,
+        ...(phase === undefined ? {} : { phase }),
+        ...(errorCode === undefined ? {} : { error_code: errorCode }),
+        ...(terminationResult === undefined ? {} : { termination_result: terminationResult }),
+      };
+    }
+    case "get_agent_tree": {
+      // 无载荷摘要：成功与失败都只显示工具名与状态；revision、scope、节点
+      // 列表与状态统计一律不进入摘要。
+      return { tool: "get_agent_tree" };
+    }
     default:
       return undefined;
   }
+}
+
+/** 直接子目标事实：完整 UUID 加可选的解析名称。 */
+function singleTargetFacts(
+  agentId: string,
+  resolveAgentName: ((agentId: string) => string | undefined) | undefined,
+): { readonly agent_id: string; readonly name?: string } {
+  const name = readResolvedAgentName(agentId, resolveAgentName);
+  return { agent_id: agentId, ...(name === undefined ? {} : { name }) };
+}
+
+function readActivityPhase(activity: unknown): AgentActivityPhase | undefined {
+  const phase = isRecord(activity) ? activity.phase : undefined;
+  return typeof phase === "string" && isActivityPhaseName(phase) ? phase : undefined;
+}
+
+function readTerminationResult(value: unknown): AgentTerminationResult | undefined {
+  return typeof value === "string" && isTerminationResultName(value) ? value : undefined;
+}
+
+/** 目标故障事实中的安全错误码：只接受白名单内的稳定码，其余静默省略。 */
+function readPublicFaultCode(error: unknown): string | undefined {
+  const code = isRecord(error) ? error.code : undefined;
+  return typeof code === "string" && isPublicErrorCode(code) ? code : undefined;
 }
 
 /** 单行事实净化：在正文净化基础上折叠换行，供名称、模板 ID 等内联字段使用。 */
@@ -1198,7 +1476,8 @@ function parsePiToolSummary(
 /**
  * wire 闭集校验：摘要只允许来源验证通过的本插件专用工具携带，键集合与
  * 类型严格闭合。消息类工具的完整尝试正文（成功与失败都保留）经产生端
- * 净化后进入摘要；spawn 成功的 agent_id 必须是完整规范 UUID。
+ * 净化后进入摘要；spawn 成功的 agent_id 必须是完整规范 UUID；等待与控制
+ * 工具只携带目标事实、outcome 与控制结果闭集，原始结果结构不进入摘要。
  */
 function parsePluginToolSummary(
   toolName: string,
@@ -1238,9 +1517,94 @@ function parsePluginToolSummary(
       if (typeof value.message !== "string" || value.message.length === 0) return undefined;
       return value as unknown as SafeToolSummary;
     }
+    case "wait_agent": {
+      if (!hasOnlySummaryKeys(value, WAIT_SUMMARY_KEYS)) return undefined;
+      // 单目标与多目标互斥：单目标携带完整 UUID，多目标携带正数数量。
+      if ((value.agent_id === undefined) === (value.target_count === undefined)) return undefined;
+      if (value.agent_id !== undefined && !isCanonicalUuid(value.agent_id)) return undefined;
+      if (!validOptionalName(value, "name")) return undefined;
+      if (
+        value.target_count !== undefined
+        && !(typeof value.target_count === "number" && Number.isSafeInteger(value.target_count)
+          && value.target_count > 0)
+      ) return undefined;
+      if (
+        value.outcome !== undefined
+        && !(typeof value.outcome === "string" && isWaitOutcomeName(value.outcome))
+      ) return undefined;
+      if (value.released_by !== undefined && !isCanonicalUuid(value.released_by)) return undefined;
+      if (!validOptionalName(value, "released_by_name")) return undefined;
+      if (
+        value.released_outcome !== undefined
+        && !(typeof value.released_outcome === "string" && isWaitEventOutcomeName(value.released_outcome))
+      ) return undefined;
+      if (value.state !== undefined && value.state !== "failed") return undefined;
+      if (
+        value.error_code !== undefined
+        && !(typeof value.error_code === "string" && isPublicErrorCode(value.error_code))
+      ) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    case "interrupt_agent": {
+      if (!hasOnlySummaryKeys(value, INTERRUPT_SUMMARY_KEYS)) return undefined;
+      if (!isCanonicalUuid(value.agent_id)) return undefined;
+      if (!validOptionalName(value, "name")) return undefined;
+      if (value.changed !== undefined && typeof value.changed !== "boolean") return undefined;
+      // 压缩阻塞只属于未变更的成功事实。
+      if (
+        value.blocked_reason !== undefined
+        && !(value.changed === false && value.blocked_reason === "compaction_active")
+      ) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    case "terminate_agent": {
+      if (!hasOnlySummaryKeys(value, TERMINATE_SUMMARY_KEYS)) return undefined;
+      if (!isCanonicalUuid(value.agent_id)) return undefined;
+      if (!validOptionalName(value, "name")) return undefined;
+      if (value.changed !== undefined && typeof value.changed !== "boolean") return undefined;
+      if (value.forced !== undefined && value.forced !== true) return undefined;
+      if (
+        value.terminated_count !== undefined
+        && !(typeof value.terminated_count === "number" && Number.isSafeInteger(value.terminated_count)
+          && value.terminated_count >= 0)
+      ) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    case "get_agent_status": {
+      if (!hasOnlySummaryKeys(value, STATUS_SUMMARY_KEYS)) return undefined;
+      if (!isCanonicalUuid(value.agent_id)) return undefined;
+      if (!validOptionalName(value, "name")) return undefined;
+      if (
+        value.state !== undefined
+        && !(typeof value.state === "string" && isLifecycleStateName(value.state))
+      ) return undefined;
+      if (
+        value.phase !== undefined
+        && !(typeof value.phase === "string" && isActivityPhaseName(value.phase))
+      ) return undefined;
+      if (
+        value.error_code !== undefined
+        && !(typeof value.error_code === "string" && isPublicErrorCode(value.error_code))
+      ) return undefined;
+      if (
+        value.termination_result !== undefined
+        && !(typeof value.termination_result === "string" && isTerminationResultName(value.termination_result))
+      ) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
+    case "get_agent_tree": {
+      if (!hasOnlySummaryKeys(value, TREE_SUMMARY_KEYS)) return undefined;
+      return value as unknown as SafeToolSummary;
+    }
     default:
       return undefined;
   }
+}
+
+/** 可选的目标名称字段：缺省合法，出现时必须是长度大于 0 的字符串。 */
+function validOptionalName(value: Record<string, unknown>, key: string): boolean {
+  const name = value[key];
+  return name === undefined || (typeof name === "string" && name.length > 0);
 }
 
 /**

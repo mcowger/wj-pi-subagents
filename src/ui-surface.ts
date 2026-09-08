@@ -121,7 +121,15 @@ export function renderFramedPanelLine(
   style: UiPanelLineStyle,
   selected: boolean,
   theme: unknown,
+  errorTail?: string,
 ): string {
+  const segmented = renderSegmentedText(value, contentWidth, style, theme, errorTail);
+  if (segmented !== undefined) {
+    const borderColor = style === "header" || selected ? "borderAccent" : "border";
+    const pad = " ".repeat(Math.max(0, contentWidth - displayWidth(value)));
+    const line = `${themeFg(theme, borderColor, "┃")} ${segmented}${pad} ${themeFg(theme, borderColor, "┃")}`;
+    return themeBg(theme, selected ? "selectedBg" : "customMessageBg", line);
+  }
   const padded = padToDisplayWidth(value, contentWidth);
   const borderColor = style === "header" || selected ? "borderAccent" : "border";
   const line = `${themeFg(theme, borderColor, "┃")} ${stylePanelText(padded, style, theme)} ${themeFg(theme, borderColor, "┃")}`;
@@ -134,13 +142,42 @@ export function renderNarrowPanelLine(
   style: UiPanelLineStyle,
   selected: boolean,
   theme: unknown,
+  errorTail?: string,
 ): string {
+  const segmented = renderSegmentedText(value, width, style, theme, errorTail);
+  if (segmented !== undefined) {
+    const pad = " ".repeat(Math.max(0, width - displayWidth(value)));
+    return themeBg(
+      theme,
+      selected ? "selectedBg" : "customMessageBg",
+      `${segmented}${pad}`,
+    );
+  }
   const padded = padToDisplayWidth(value, width);
   return themeBg(
     theme,
     selected ? "selectedBg" : "customMessageBg",
     stylePanelText(padded, style, theme),
   );
+}
+
+/**
+ * 行尾局部错误片段：value 以 errorTail 结尾且整体不超宽时，前段保持行样式、
+ * 行尾片段使用错误色；否则返回 undefined，由调用方按整行样式渲染。
+ */
+function renderSegmentedText(
+  value: string,
+  width: number,
+  style: UiPanelLineStyle,
+  theme: unknown,
+  errorTail: string | undefined,
+): string | undefined {
+  if (errorTail === undefined || errorTail.length === 0 || !value.endsWith(errorTail)) {
+    return undefined;
+  }
+  const head = value.slice(0, value.length - errorTail.length);
+  if (displayWidth(head) + displayWidth(errorTail) > width) return undefined;
+  return `${stylePanelText(head, style, theme)}${stylePanelText(errorTail, "error", theme)}`;
 }
 
 function graphemeWidth(grapheme: string): number {

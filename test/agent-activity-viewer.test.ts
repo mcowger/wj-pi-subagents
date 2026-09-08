@@ -1387,3 +1387,257 @@ test("未知来源的插件工具名走安全兜底，不显示插件摘要与�
   assert.ok(lines.some((line) => line === "× final_report"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /·|worker|1b3f2a7c|agent_unavailable/u);
 });
+
+const WAIT_RELEASER_ID = "22c4d1e8-3a5b-4c6d-8e9f-0a1b2c3d4e5f";
+const CONTROL_CHILD_ID = "33d5e2f9-4b6c-4d7e-9f0a-1b2c3d4e5f6a";
+
+test("等待与控制工具的运行中摘要只显示目标事实", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("t1", "wait_agent", "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+    }),
+    toolStart("t2", "wait_agent", "plugin", INCARNATION_ID, {
+      tool: "wait_agent", target_count: 3,
+    }),
+    toolStart("t3", "interrupt_agent", "plugin", INCARNATION_ID, {
+      tool: "interrupt_agent", agent_id: CONTROL_CHILD_ID, name: "worker-c",
+    }),
+    toolStart("t4", "terminate_agent", "plugin", INCARNATION_ID, {
+      tool: "terminate_agent", agent_id: CONTROL_CHILD_ID,
+    }),
+    toolStart("t5", "get_agent_status", "plugin", INCARNATION_ID, {
+      tool: "get_agent_status", agent_id: CONTROL_CHILD_ID, name: "worker-c",
+    }),
+    toolStart("t6", "get_agent_tree", "plugin", INCARNATION_ID, {
+      tool: "get_agent_tree",
+    }),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 单目标显示名称与固定八位短 ID；timeout_ms 等调用约束不显示。
+  assert.match(body, /▶ wait_agent · worker-b · 1b3f2a7c\n/u);
+  // 多目标只显示数量。
+  assert.match(body, /▶ wait_agent · 3 targets\n/u);
+  assert.doesNotMatch(body, /timeout_ms|agent_ids|300000/u);
+  // 控制工具显示目标；查询与回收目标同样使用固定八位短 ID。
+  assert.match(body, /▶ interrupt_agent · worker-c · 33d5e2f9\n/u);
+  assert.match(body, /▶ terminate_agent · 33d5e2f9\n/u);
+  assert.match(body, /▶ get_agent_status · worker-c · 33d5e2f9\n/u);
+  assert.match(body, /▶ get_agent_tree\n/u);
+});
+
+test("wait_agent 成功摘要显示实际 outcome 与 batch release 事实", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b", outcome: "reply",
+    }),
+    toolEnd("t2", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b", outcome: "final_report",
+    }),
+    toolEnd("t3", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, outcome: "idle",
+    }),
+    toolEnd("t4", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, outcome: "terminal",
+    }),
+    toolEnd("t5", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, outcome: "timeout",
+    }),
+    toolEnd("t6", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", target_count: 3, outcome: "timeout",
+    }),
+    toolEnd("t7", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", target_count: 3, outcome: "batch_released",
+      released_by: WAIT_RELEASER_ID, released_by_name: "worker-a", released_outcome: "reply",
+    }),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 所有成功返回的 outcome 都使用成功符号。
+  assert.match(body, /✓ wait_agent · worker-b · 1b3f2a7c · reply\n/u);
+  assert.match(body, /✓ wait_agent · worker-b · 1b3f2a7c · final_report\n/u);
+  assert.match(body, /✓ wait_agent · 1b3f2a7c · idle\n/u);
+  assert.match(body, /✓ wait_agent · 1b3f2a7c · terminal\n/u);
+  assert.match(body, /✓ wait_agent · 1b3f2a7c · timeout\n/u);
+  assert.match(body, /✓ wait_agent · 3 targets · timeout\n/u);
+  // batch release：数量、释放者与释放 outcome。
+  assert.match(body, /✓ wait_agent · 3 targets · batch_released · worker-a · 22c4d1e8 · reply\n/u);
+  // 原始结果结构、报告正文与 revision 不进入摘要。
+  assert.doesNotMatch(body, /revision|task_result|accepted/u);
+  assert.doesNotMatch(body, /22c4d1e8-3a5b/u);
+});
+
+test("wait_agent 目标 failed 显示红色失败与安全错误码，调用失败整行红色", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+      outcome: "terminal", state: "failed", error_code: "model_unavailable",
+    }),
+    toolEnd("t2", "wait_agent", true, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+    }, undefined, "agent_not_found"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 目标 state failed：红色失败与白名单安全错误码；调用本身成功。
+  assert.match(body, /× wait_agent · worker-b · 1b3f2a7c · terminal · failed · model_unavailable\n/u);
+  // 调用本身失败：整行红色与稳定错误码。
+  assert.match(body, /× wait_agent · worker-b · 1b3f2a7c · agent_not_found\n/u);
+
+  const surface = renderAgentActivityViewerSurface(viewer, 160, theme).join("\n");
+  assert.match(surface, /<fg:error>[^]*× wait_agent · worker-b · 1b3f2a7c · terminal · failed/u);
+  assert.match(surface, /<fg:error>[^]*× wait_agent · worker-b · 1b3f2a7c · agent_not_found/u);
+});
+
+test("interrupt_agent 区分进入中断、unchanged 与压缩阻塞", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "interrupt_agent", false, "plugin", INCARNATION_ID, {
+      tool: "interrupt_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b", changed: true,
+    }),
+    toolEnd("t2", "interrupt_agent", false, "plugin", INCARNATION_ID, {
+      tool: "interrupt_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b", changed: false,
+    }),
+    toolEnd("t3", "interrupt_agent", false, "plugin", INCARNATION_ID, {
+      tool: "interrupt_agent", agent_id: CHILD_SPAWN_ID, changed: false,
+      blocked_reason: "compaction_active",
+    }),
+    toolEnd("t4", "interrupt_agent", true, "plugin", INCARNATION_ID, {
+      tool: "interrupt_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+    }, undefined, "agent_not_found"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 进入 interrupting：成功且无额外事实。
+  assert.match(body, /✓ interrupt_agent · worker-b · 1b3f2a7c\n/u);
+  // unchanged 与压缩阻塞：中性事实并列在行尾。
+  assert.match(body, /✓ interrupt_agent · worker-b · 1b3f2a7c · unchanged\n/u);
+  assert.match(body, /✓ interrupt_agent · 1b3f2a7c · compaction_active\n/u);
+  // 稳定调用错误：红色失败。
+  assert.match(body, /× interrupt_agent · worker-b · 1b3f2a7c · agent_not_found\n/u);
+});
+
+test("terminate_agent 显示回收数量、幂等与强制回收警告", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "terminate_agent", false, "plugin", INCARNATION_ID, {
+      tool: "terminate_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+      changed: true, terminated_count: 2,
+    }),
+    toolEnd("t2", "terminate_agent", false, "plugin", INCARNATION_ID, {
+      tool: "terminate_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+      changed: false, terminated_count: 0,
+    }),
+    toolEnd("t3", "terminate_agent", true, "plugin", INCARNATION_ID, {
+      tool: "terminate_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+    }, undefined, "termination_incomplete"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 正常回收：成功符号加回收数量。
+  assert.match(body, /✓ terminate_agent · worker-b · 1b3f2a7c · 2 reclaimed\n/u);
+  // already terminated：中性幂等事实。
+  assert.match(body, /✓ terminate_agent · worker-b · 1b3f2a7c · already terminated\n/u);
+  // 清理不完整：红色失败。
+  assert.match(body, /× terminate_agent · worker-b · 1b3f2a7c · termination_incomplete\n/u);
+
+  // 强制回收成功：警告而非失败，成功结果与风险事实同时保留。
+  const forcedViewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t4", "terminate_agent", false, "plugin", INCARNATION_ID, {
+      tool: "terminate_agent", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+      changed: true, forced: true, terminated_count: 3,
+    }),
+  ], { viewport_height: 20 });
+  const forcedBody = forcedViewer.render(160).slice(1, -1).join("\n");
+  assert.match(forcedBody, /⚠ terminate_agent · worker-b · 1b3f2a7c · 3 reclaimed · forced\n/u);
+  const forcedSurface = renderAgentActivityViewerSurface(forcedViewer, 160, theme).join("\n");
+  assert.match(forcedSurface, /<fg:warning>[^]*⚠ terminate_agent · worker-b · 1b3f2a7c · 3 reclaimed · forced/u);
+});
+
+test("get_agent_status 只将 failed 与错误码片段标红，查询成功始终成功符号", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "get_agent_status", false, "plugin", INCARNATION_ID, {
+      tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+      state: "working", phase: "executing_tools",
+    }),
+    toolEnd("t2", "get_agent_status", false, "plugin", INCARNATION_ID, {
+      tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, state: "idle",
+    }),
+    toolEnd("t3", "get_agent_status", false, "plugin", INCARNATION_ID, {
+      tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, state: "terminated",
+      termination_result: "completed",
+    }),
+    toolEnd("t4", "get_agent_status", false, "plugin", INCARNATION_ID, {
+      tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+      state: "failed", error_code: "provider_unavailable",
+    }),
+    toolEnd("t5", "get_agent_status", true, "plugin", INCARNATION_ID, {
+      tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, name: "worker-b",
+    }, undefined, "not_direct_child"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // working/interrupting 可显示 activity phase；terminated 显示终止结果。
+  assert.match(body, /✓ get_agent_status · worker-b · 1b3f2a7c · working · executing_tools\n/u);
+  assert.match(body, /✓ get_agent_status · 1b3f2a7c · idle\n/u);
+  assert.match(body, /✓ get_agent_status · 1b3f2a7c · terminated · completed\n/u);
+  // 目标 failed：failed 与错误码片段并列行尾；查询仍是成功调用。
+  assert.match(body, /✓ get_agent_status · worker-b · 1b3f2a7c · failed · provider_unavailable\n/u);
+  // 查询调用失败：整行红色。
+  assert.match(body, /× get_agent_status · worker-b · 1b3f2a7c · not_direct_child\n/u);
+  // revision、时间与上下文占用不进入显示。
+  assert.doesNotMatch(body, /revision|created_at|elapsed|context_usage|88/u);
+
+  const surface = renderAgentActivityViewerSurface(viewer, 160, theme).join("\n");
+  // 局部标红：failed 与错误码片段使用错误色，前段保持成功弱化色。
+  assert.match(
+    surface,
+    /<fg:dim>✓ get_agent_status · worker-b · 1b3f2a7c · <\/fg:dim><fg:error>failed · provider_unavailable<\/fg:error>/u,
+  );
+  // 成功查询行不整行变红。
+  assert.doesNotMatch(surface, /<fg:error>✓ get_agent_status/u);
+  // 调用失败整行红色。
+  assert.match(surface, /<fg:error>[^]*× get_agent_status · worker-b · 1b3f2a7c · not_direct_child/u);
+});
+
+test("get_agent_tree 成功只显示工具名与成功状态", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "get_agent_tree", false, "plugin", INCARNATION_ID, {
+      tool: "get_agent_tree",
+    }),
+    toolEnd("t2", "get_agent_tree", true, "plugin", INCARNATION_ID, {
+      tool: "get_agent_tree",
+    }, undefined, "agent_unavailable"),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  assert.match(body, /✓ get_agent_tree\n/u);
+  assert.match(body, /× get_agent_tree · agent_unavailable\n/u);
+  // revision、scope、节点列表与状态统计不进入显示。
+  assert.doesNotMatch(body, /revision|scope|nodes|stats|worker/u);
+});
+
+test("未知来源的等待与控制工具走安全兜底", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "wait_agent", false, "unknown"),
+    toolEnd("t2", "get_agent_status", true, "unknown"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+
+  assert.ok(lines.some((line) => line === "✓ wait_agent"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "× get_agent_status"), lines.join("\n"));
+  assert.doesNotMatch(lines.join("\n"), /·|1b3f2a7c|worker/u);
+});
