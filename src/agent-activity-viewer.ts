@@ -1,4 +1,9 @@
-import { Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
+import {
+  Markdown,
+  type MarkdownTheme,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
+} from "@earendil-works/pi-tui";
 import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
 import {
   isMessageToolSummary,
@@ -429,6 +434,41 @@ export class AgentActivityViewerModel {
       return "changed";
     }
     return "ignored";
+  }
+
+  /**
+   * 鼠标支持：滚轮滚动与左键点击切换展开。framed 表示表面按框线布局渲染，
+   * 正文行从 y=3 开始；窄布局正文从 y=1 开始。事件 x 不参与命中判定。
+   */
+  handleMouse(event: TuiMouseEvent, framed: boolean): TuiMouseEventResult | undefined {
+    if (event.type === "wheel") {
+      const delta = event.wheelDelta ?? 0;
+      if (delta === 0) return undefined;
+      this.scrollBy(delta);
+      return { handled: true };
+    }
+    if (event.type === "click" && event.button === "left") {
+      const bodyIndex = event.y - (framed ? 3 : 1);
+      if (bodyIndex >= 0 && bodyIndex < this.viewportHeight) {
+        const line = this.eventLines(this.layoutWidth)[this.scrollOffset + bodyIndex];
+        const key = line?.selectable_key;
+        if (key !== undefined && this.isExpandableKey(key)) {
+          this.setKeyExpanded(key, !this.expandedKeys.has(key));
+        }
+      }
+      return { handled: true };
+    }
+    return undefined;
+  }
+
+  /** 与键盘 ↓ 相同的滚动语义：滚到底恢复自动跟随，其余移动暂停跟随。 */
+  private scrollBy(delta: number): "changed" | "ignored" {
+    const maxOffset = this.maxScrollOffset();
+    const next = clamp(this.scrollOffset + delta, 0, maxOffset);
+    if (next === this.scrollOffset) return "ignored";
+    this.scrollOffset = next;
+    this.followEnabled = next >= maxOffset;
+    return "changed";
   }
 
   getViewportHeight(): number {

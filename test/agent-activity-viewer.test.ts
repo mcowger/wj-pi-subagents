@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
   AgentActivityViewerModel,
   displayWidth,
@@ -1848,4 +1849,194 @@ test("setViewportHeight 响应式扩展或收缩视口，保持跟随与滚动�
   // 非法输入忽略，不重置当前视口。
   viewer.setViewportHeight(0);
   assert.equal(viewer.getViewportHeight(), 3);
+});
+
+/* ---------------------------------- 鼠标支持 ---------------------------------- */
+
+/** 全字段填齐的 TuiMouseEvent 构造器；未覆盖字段使用中性默认值。 */
+function mkMouseEvent(
+  overrides: Partial<TuiMouseEvent> & Pick<TuiMouseEvent, "type">,
+): TuiMouseEvent {
+  return {
+    button: "none",
+    x: 0,
+    y: 0,
+    screenX: 0,
+    screenY: 0,
+    width: 80,
+    height: 24,
+    shift: false,
+    alt: false,
+    ctrl: false,
+    ...overrides,
+  };
+}
+
+test("鼠标滚轮滚动正文，超界夹紧且 wheelDelta 为 0 时忽略", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "目标思考" }]),
+    textMessage("a\nb\nc\nd\ne"),
+  ], { viewport_height: 3 });
+  // 1 行 thinking + 5 行正文，视口 3 行；跟随底部时 offset=3。
+  assert.equal(viewer.render(160).length, 5);
+  assert.equal(viewer.getPublicState().scroll_offset, 3);
+
+  // 向下滚动超界：offset 夹紧到最大值，滚轮事件一律吞掉。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 10, y: 4 }), true),
+    { handled: true },
+  );
+  assert.equal(viewer.getPublicState().scroll_offset, 3);
+
+  // 向上滚动按 delta 移动。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: -1, y: 4 }), true),
+    { handled: true },
+  );
+  assert.equal(viewer.getPublicState().scroll_offset, 2);
+
+  // 再向上超界：夹紧到 0。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: -10, y: 4 }), true),
+    { handled: true },
+  );
+  assert.equal(viewer.getPublicState().scroll_offset, 0);
+
+  // wheelDelta 为 0 的事件被忽略且不改变位置。
+  assert.equal(
+    viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 0, y: 4 }), true),
+    undefined,
+  );
+  assert.equal(viewer.getPublicState().scroll_offset, 0);
+});
+
+test("鼠标滚轮向下滚到底恢复 follow，向上滚暂停", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "目标思考" }]),
+    textMessage("a\nb\nc\nd\ne"),
+  ], { viewport_height: 3 });
+  assert.equal(viewer.render(160).length, 5);
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+
+  // 向上滚动：暂停 follow。
+  viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: -2, y: 4 }), true);
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+  assert.equal(viewer.getPublicState().scroll_offset, 1);
+
+  // 向下滚到底：与键盘 ↓ 语义一致，恢复 follow。
+  viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 3, y: 4 }), true);
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+  assert.equal(
+    viewer.getPublicState().scroll_offset,
+    viewer.getPublicState().max_scroll_offset,
+  );
+
+  // 未到底的向下移动不恢复 follow。
+  viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: -1, y: 4 }), true);
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+  viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 1, y: 4 }), true);
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+  viewer.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: -1, y: 4 }), true);
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+  assert.equal(viewer.getPublicState().scroll_offset, 2);
+});
+
+test("鼠标左键点击可展开行切换折叠，framed 与 narrow 正文偏移都生效", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "思考" }]),
+    textMessage("正文"),
+  ], { viewport_height: 8 });
+  assert.equal(viewer.render(160).length, 10);
+  assert.equal(viewer.getExpandedKeys().length, 0);
+
+  // framed：正文从 y=3 开始；点击第一行（Thinking 标题）展开。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 3 }), true),
+    { handled: true },
+  );
+  assert.equal(viewer.getExpandedKeys().length, 1);
+  assert.match(viewer.render(160).join("\n"), /▾ Thinking/u);
+
+  // 再次点击同一行折叠还原。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 3 }), true),
+    { handled: true },
+  );
+  assert.equal(viewer.getExpandedKeys().length, 0);
+
+  // narrow：正文从 y=1 开始。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 1 }), false),
+    { handled: true },
+  );
+  assert.equal(viewer.getExpandedKeys().length, 1);
+  viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 1 }), false);
+  assert.equal(viewer.getExpandedKeys().length, 0);
+});
+
+test("鼠标点击普通正文行吞事件但不改变展开或选择状态", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "思考" }]),
+    textMessage("正文"),
+  ], { viewport_height: 8 });
+  assert.equal(viewer.render(160).length, 10);
+  const selectedBefore = viewer.getSelectedKey();
+
+  // 正文行没有可展开身份：只吞事件，不产生状态变化。
+  assert.deepEqual(
+    viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 4 }), true),
+    { handled: true },
+  );
+  assert.equal(viewer.getExpandedKeys().length, 0);
+  assert.equal(viewer.getSelectedKey(), selectedBefore);
+});
+
+test("鼠标点击 header、footer 与边框行吞事件但无状态变化", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "思考" }]),
+    textMessage("正文"),
+  ], { viewport_height: 8 });
+  assert.equal(viewer.render(160).length, 10);
+  const selectedBefore = viewer.getSelectedKey();
+
+  // framed：顶边框、header、分隔线、分隔线、footer、底边框都在正文区之外。
+  for (const y of [0, 1, 2, 11, 12, 13]) {
+    assert.deepEqual(
+      viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y }), true),
+      { handled: true },
+    );
+  }
+  assert.equal(viewer.getExpandedKeys().length, 0);
+  assert.equal(viewer.getSelectedKey(), selectedBefore);
+
+  // narrow：header 与 footer 同样只吞事件。
+  for (const y of [0, 9]) {
+    assert.deepEqual(
+      viewer.handleMouse(mkMouseEvent({ type: "click", button: "left", y }), false),
+      { handled: true },
+    );
+  }
+  assert.equal(viewer.getExpandedKeys().length, 0);
+  assert.equal(viewer.getSelectedKey(), selectedBefore);
+});
+
+test("非滚轮与非左键点击的鼠标事件返回 undefined", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    messageEntry([{ type: "thinking", thinking: "思考" }]),
+    textMessage("正文"),
+  ], { viewport_height: 8 });
+  assert.equal(viewer.render(160).length, 10);
+
+  for (const type of ["press", "release", "move", "drag"] as const) {
+    assert.equal(
+      viewer.handleMouse(mkMouseEvent({ type, button: "left", y: 3 }), true),
+      undefined,
+    );
+  }
+  // 右键点击同样不处理。
+  assert.equal(
+    viewer.handleMouse(mkMouseEvent({ type: "click", button: "right", y: 3 }), true),
+    undefined,
+  );
+  assert.equal(viewer.getExpandedKeys().length, 0);
 });

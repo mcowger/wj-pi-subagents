@@ -15,6 +15,7 @@ import {
   CANONICAL_ACTIVITY_CONTRACT_VERSION,
 } from "../src/canonical-activity.ts";
 import { randomUUID } from "node:crypto";
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
 import type {
   AgentSnapshot,
   ScopedAgentTreeSnapshot,
@@ -516,4 +517,177 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   await Promise.all(overlayCompletions);
   assert.equal(activityChange, undefined);
   assert.equal(displayChange, undefined);
+});
+
+/* ---------------------------------- 鼠标支持 ---------------------------------- */
+
+/** 全字段填齐的 TuiMouseEvent 构造器；未覆盖字段使用中性默认值。 */
+function mkMouseEvent(
+  overrides: Partial<TuiMouseEvent> & Pick<TuiMouseEvent, "type">,
+): TuiMouseEvent {
+  return {
+    button: "none",
+    x: 0,
+    y: 0,
+    screenX: 0,
+    screenY: 0,
+    width: 80,
+    height: 24,
+    shift: false,
+    alt: false,
+    ctrl: false,
+    ...overrides,
+  };
+}
+
+test("鼠标滚轮滚动树视口并把选中行同步进视口", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 2 });
+  // 初始 5 行（顶层默认展开），offset=0，选中第一行。
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+  assert.equal(panel.getPublicState().scroll_offset, 0);
+
+  // 向下滚 3 行：offset 夹紧到 3，选中行同步到视口内第一行。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 3, y: 4 }), true),
+    { handled: true },
+  );
+  const scrolled = panel.getPublicState();
+  assert.equal(scrolled.scroll_offset, 3);
+  assert.equal(scrolled.selected_key, TERMINATED_PARENT_ID);
+
+  // 继续向下滚：offset 已到底，选中行保持在视口内。
+  panel.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 5, y: 4 }), true);
+  const bottom = panel.getPublicState();
+  assert.equal(bottom.scroll_offset, 3);
+  assert.equal(bottom.selected_key, TERMINATED_PARENT_ID);
+
+  // 向上滚回顶部：选中行同步到视口内最后一行。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: -5, y: 4 }), true),
+    { handled: true },
+  );
+  const top = panel.getPublicState();
+  assert.equal(top.scroll_offset, 0);
+  assert.equal(top.selected_key, WORKING_CHILD_ID);
+
+  // wheelDelta 为 0 的滚轮事件被忽略。
+  assert.equal(
+    panel.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 0, y: 4 }), true),
+    undefined,
+  );
+  assert.equal(panel.getPublicState().scroll_offset, 0);
+
+  // 空树滚轮与点击仍吞事件且不产生选中。
+  const empty = new AgentTreePanelModel(Object.freeze({
+    tree_revision: 1,
+    scope: Object.freeze({ kind: "root" as const }),
+    nodes: Object.freeze([]),
+  }), { viewport_height: 2 });
+  assert.deepEqual(
+    empty.handleMouse(mkMouseEvent({ type: "wheel", wheelDelta: 3, y: 3 }), true),
+    { handled: true },
+  );
+  assert.deepEqual(
+    empty.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 3 }), true),
+    { handled: true },
+  );
+  assert.equal(empty.getPublicState().selected_key, undefined);
+});
+
+test("鼠标左键点击已选中的有子节点行切换折叠，再点还原", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+
+  // framed：正文从 y=3 开始；点击选中行折叠其子树。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 3 }), true),
+    { handled: true },
+  );
+  const collapsed = panel.getPublicState();
+  assert.ok(!collapsed.expanded_agent_ids.includes(PARENT_ID));
+  assert.equal(collapsed.selected_key, PARENT_ID);
+  assert.match(
+    panel.render(160).join("\n"),
+    /descendants 2 · working 1 · failed 0 · terminated 1/u,
+  );
+
+  // 再次点击还原展开。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 3 }), true),
+    { handled: true },
+  );
+  assert.ok(panel.getPublicState().expanded_agent_ids.includes(PARENT_ID));
+
+  // narrow：正文从 y=1 开始。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 1 }), false),
+    { handled: true },
+  );
+  assert.ok(!panel.getPublicState().expanded_agent_ids.includes(PARENT_ID));
+  panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 1 }), false);
+  assert.ok(panel.getPublicState().expanded_agent_ids.includes(PARENT_ID));
+});
+
+test("鼠标左键点击未选中行移动选择，点击选中但无子节点的行不折叠", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+
+  // 点击第二行（working-child）：只移动选择，不折叠任何节点。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 4 }), true),
+    { handled: true },
+  );
+  const moved = panel.getPublicState();
+  assert.equal(moved.selected_key, WORKING_CHILD_ID);
+  assert.ok(moved.expanded_agent_ids.includes(PARENT_ID));
+
+  // 点击已选中的叶子行（无子节点）：无折叠变化，仍吞事件。
+  assert.deepEqual(
+    panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y: 4 }), true),
+    { handled: true },
+  );
+  assert.equal(panel.getPublicState().selected_key, WORKING_CHILD_ID);
+  assert.equal(panel.getPublicState().scroll_offset, 0);
+});
+
+test("鼠标点击 header、footer 与边框行吞事件但无状态变化", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+
+  // framed：顶边框、header、分隔线、分隔线、footer、底边框都在正文区之外。
+  for (const y of [0, 1, 2, 11, 12, 13]) {
+    assert.deepEqual(
+      panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y }), true),
+      { handled: true },
+    );
+  }
+  const untouched = panel.getPublicState();
+  assert.equal(untouched.selected_key, PARENT_ID);
+  assert.equal(untouched.scroll_offset, 0);
+  assert.ok(untouched.expanded_agent_ids.includes(PARENT_ID));
+
+  // narrow：header 与 footer 同样只吞事件。
+  for (const y of [0, 9]) {
+    assert.deepEqual(
+      panel.handleMouse(mkMouseEvent({ type: "click", button: "left", y }), false),
+      { handled: true },
+    );
+  }
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+});
+
+test("非滚轮与非左键点击的鼠标事件返回 undefined", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 8 });
+
+  for (const type of ["press", "release", "move", "drag"] as const) {
+    assert.equal(
+      panel.handleMouse(mkMouseEvent({ type, button: "left", y: 3 }), true),
+      undefined,
+    );
+  }
+  // 右键点击同样不处理。
+  assert.equal(
+    panel.handleMouse(mkMouseEvent({ type: "click", button: "right", y: 3 }), true),
+    undefined,
+  );
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
 });

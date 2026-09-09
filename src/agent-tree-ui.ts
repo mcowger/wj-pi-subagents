@@ -1,3 +1,4 @@
+import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type {
   AgentSnapshot,
   ControlResult,
@@ -98,6 +99,7 @@ interface AgentTreeTui {
 interface AgentTreeComponent {
   render(width: number): string[];
   handleInput?(data: string): void;
+  handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
   invalidate(): void;
   dispose?(): void;
 }
@@ -428,6 +430,7 @@ export function bindAgentTreeUi(
     try {
       invocation = custom.call(context.ui, (tui, theme, _keybindings, done) => {
         let closed = false;
+        let lastWidth = 0;
         let replay: readonly CanonicalAgentActivityEntry[] = [];
         try {
           replay = activity.readReplay(node.agent_id);
@@ -513,11 +516,23 @@ export function bindAgentTreeUi(
         activeViewer = { model, done: finish, scheduleRender: scheduleActivityRender };
         return {
           render: (width) => {
+            lastWidth = width;
             model.setViewportHeight(responsiveBodyHeight(tui, model.getViewportHeight()));
             try {
               return [...renderAgentActivityViewerSurface(model, width, theme)];
             } catch {
               return [...renderAgentActivityViewerSurface(model, width, undefined)];
+            }
+          },
+          handleMouse: (event: TuiMouseEvent): TuiMouseEventResult | undefined => {
+            try {
+              if (closed) return undefined;
+              const result = model.handleMouse(event, lastWidth >= 6);
+              if (result !== undefined) safeRequestRender(tui);
+              return result;
+            } catch {
+              // 鼠标处理异常保持在查看器边界内。
+              return undefined;
             }
           },
           handleInput: (data) => {
@@ -563,6 +578,7 @@ export function bindAgentTreeUi(
       try {
         invocation = custom.call(overrideContext.ui, (tui, theme, _keybindings, done) => {
           let closed = false;
+          let lastWidth = 0;
           const finish = (): void => {
             if (closed) return;
             closed = true;
@@ -577,6 +593,7 @@ export function bindAgentTreeUi(
           activePanel = panel;
           return {
             render: (width) => {
+              lastWidth = width;
               if (panel.model !== undefined) {
                 panel.model.setViewportHeight(
                   responsiveBodyHeight(tui, panel.model.getViewportHeight()),
@@ -587,6 +604,16 @@ export function bindAgentTreeUi(
               } catch {
                 panel.model?.markError();
                 return [...renderAgentTreePanelSurface(panel.model, width, undefined)];
+              }
+            },
+            handleMouse: (event: TuiMouseEvent): TuiMouseEventResult | undefined => {
+              try {
+                const result = panel.model?.handleMouse(event, lastWidth >= 6) ?? undefined;
+                if (result !== undefined) safeRequestRender(tui);
+                return result;
+              } catch {
+                // 鼠标处理异常保持在面板边界内。
+                return undefined;
               }
             },
             handleInput: (data) => {
@@ -771,6 +798,54 @@ export class AgentTreePanelModel {
     if (data === "\x1b[C" || data === "l") return this.expandSelected(selected.key);
     if (data === "\x1b[D" || data === "h") return this.collapseSelected(selected.key);
     return "ignored";
+  }
+
+  /**
+   * 鼠标支持：滚轮滚动与左键点击。滚动只移动视口并把选中行同步进视口，
+   * 不经 clampSelection（它会把视口拉回选中行导致互相打架）；点击未选
+   * 中行只移动选择，点击已选中的有子节点行切换折叠。framed 表示表面按
+   * 框线布局渲染，正文行从 y=3 开始；窄布局正文从 y=1 开始。事件 x 不
+   * 参与命中判定。
+   */
+  handleMouse(event: TuiMouseEvent, framed: boolean): TuiMouseEventResult | undefined {
+    if (event.type === "wheel") {
+      const delta = event.wheelDelta ?? 0;
+      if (delta === 0) return undefined;
+      const rows = this.buildRows();
+      if (rows.length === 0) return { handled: true };
+      const maxOffset = Math.max(0, rows.length - this.viewportHeight);
+      this.scrollOffset = Math.max(0, Math.min(this.scrollOffset + delta, maxOffset));
+      if (this.selectedIndex < this.scrollOffset) this.selectedIndex = this.scrollOffset;
+      if (this.selectedIndex >= this.scrollOffset + this.viewportHeight) {
+        this.selectedIndex = this.scrollOffset + this.viewportHeight - 1;
+      }
+      this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, rows.length - 1));
+      return { handled: true };
+    }
+    if (event.type === "click" && event.button === "left") {
+      const bodyIndex = event.y - (framed ? 3 : 1);
+      const rows = this.buildRows();
+      if (bodyIndex >= 0 && bodyIndex < this.viewportHeight) {
+        const index = this.scrollOffset + bodyIndex;
+        const row = rows[index];
+        const selectedKey = rows[this.selectedIndex]?.key;
+        if (row !== undefined) {
+          if (row.key === selectedKey) {
+            const children = this.childrenByParent().get(row.key) ?? [];
+            if (children.length > 0) {
+              if (this.expandedAgentIds.has(row.key)) this.expandedAgentIds.delete(row.key);
+              else this.expandedAgentIds.add(row.key);
+              this.clampSelection(this.buildRows().length);
+            }
+          } else {
+            this.selectedIndex = index;
+            this.clampSelection(rows.length);
+          }
+        }
+      }
+      return { handled: true };
+    }
+    return undefined;
   }
 
   getViewportHeight(): number {
