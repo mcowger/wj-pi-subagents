@@ -759,6 +759,34 @@ test("实时 thinking 草稿默认折叠为 Thinking · streaming 并可展开�
   assert.match(viewer.render(120).join("\n"), /流式思考/u);
 });
 
+test("权威消息落地替换草稿后，已展开的 streaming thinking 保持展开", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  registry.applyEvent(AGENT_ID, displayDelta("message-1", 1, 0, "thinking", "流式思考"));
+  registry.applyEvent(AGENT_ID, displayComplete("message-1", 2));
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [], {
+    drafts: registry.drafts(AGENT_ID),
+    viewport_height: 20,
+  });
+
+  // streaming 期间用户展开 thinking 草稿。
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.match(viewer.render(120).join("\n"), /流式思考/u);
+
+  // 权威完整消息落地：控制器登记条目并原地替换对应实时草稿。
+  assert.equal(
+    viewer.appendEntry(messageEntry([{ type: "thinking", thinking: "完整思考" }], "message-1")),
+    "changed",
+  );
+  assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), true);
+  viewer.setLiveDrafts(registry.drafts(AGENT_ID));
+
+  // 展开状态跨草稿→权威替换保持：正文可见且标题不再标记 streaming。
+  const body = viewer.render(120).join("\n");
+  assert.match(body, /完整思考/u);
+  assert.doesNotMatch(body, /streaming/u);
+});
+
 test("冻结 text 草稿末尾显示弱化省略号，冻结 thinking 标题显示 streaming incomplete", () => {
   const registry = new AgentDisplayDraftRegistry();
   // 256 个未来帧恰好到达边界（帧 3..258），第 257 个未来帧（帧 259）触发冻结：

@@ -28,7 +28,7 @@ export { displayWidth } from "./ui-surface.ts";
 const DEFAULT_VIEWER_VIEWPORT_HEIGHT = 20;
 const DEFAULT_LAYOUT_WIDTH = 80;
 const THINKING_COLLAPSED_TEXT = "Thinking";
-/** 流式 thinking 的折叠标题：完整权威消息到达后恢复普通 `Thinking`。 */
+/** 流式 thinking 的折叠标题：完整权威消息到达后恢复普通 `Thinking`；已展开的正文跨替换保持展开。 */
 const THINKING_STREAMING_TEXT = "Thinking · streaming";
 /** 冻结流的折叠标题：异常乱序冻结后等待权威完整消息。 */
 const THINKING_FROZEN_TEXT = "Thinking · streaming incomplete";
@@ -224,6 +224,21 @@ function parentMessageKey(entryId: string): string {
 
 function liveThinkingKey(draftKey: string, contentIndex: number): string {
   return `thinking:live:${draftKey}:${contentIndex}`;
+}
+
+/**
+ * 与实时显示流关联的权威消息 thinking 复用草稿期展开身份：展开状态跨
+ * “草稿被权威消息替换”保持稳定，streaming 结束不自动折叠。
+ */
+function messageThinkingKey(
+  entryId: string,
+  incarnationId: string,
+  streamId: string | undefined,
+  blockIndex: number,
+): string {
+  return streamId === undefined
+    ? thinkingKey(entryId, blockIndex)
+    : liveThinkingKey(`${incarnationId}|${streamId}`, blockIndex);
 }
 
 /**
@@ -573,7 +588,13 @@ export class AgentActivityViewerModel {
     for (const [entryIndex, entry] of this.entries.entries()) {
       const body = entry.body;
       if (body.type === "message") {
-        entries.push({ kind: "message", entryId: entry.entry_id, content: body.content });
+        entries.push({
+          kind: "message",
+          entryId: entry.entry_id,
+          incarnationId: entry.incarnation_id,
+          ...(body.streamId === undefined ? {} : { streamId: body.streamId }),
+          content: body.content,
+        });
         continue;
       }
 
@@ -684,11 +705,17 @@ export class AgentActivityViewerModel {
           if (block.type === "text") {
             lines.push(...renderMarkdownBlock(block.text, contentWidth, "body"));
           } else {
+            const key = messageThinkingKey(
+              entry.entryId,
+              entry.incarnationId,
+              entry.streamId,
+              blockIndex,
+            );
             lines.push(...renderThinkingBlock(
               block.thinking,
               contentWidth,
-              thinkingKey(entry.entryId, blockIndex),
-              this.expandedKeys.has(thinkingKey(entry.entryId, blockIndex)),
+              key,
+              this.expandedKeys.has(key),
             ));
           }
           blockIndex += 1;
@@ -797,6 +824,10 @@ type DisplayEntry =
   | {
       readonly kind: "message";
       readonly entryId: string;
+      /** 运行实例身份；与 streamId 共同构成实时显示流的草稿身份。 */
+      readonly incarnationId: string;
+      /** 与实时显示流的精确关联身份；缺省表示没有可关联的实时流。 */
+      readonly streamId?: string;
       readonly content: readonly SafeAgentActivityContentBlock[];
     }
   | {
