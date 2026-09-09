@@ -155,6 +155,49 @@ test("message_complete 只收束显示流：连续草稿在 complete 后继续�
   assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["草稿"]);
 });
 
+test("相邻 streaming thinking 实时合并，complete 后同一标题变为 Thinking", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "thinking", "第一段"));
+  const viewer = new AgentActivityViewerModel({
+    agent_id: AGENT_ID,
+    template_id: "worker",
+    name: "worker-a",
+    state: "working",
+  }, [], { drafts: registry.drafts(AGENT_ID), viewport_height: 20 });
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expandedKey = viewer.getSelectedKey();
+
+  registry.applyEvent(AGENT_ID, delta("message-1", 2, 1, "thinking", "第二段"));
+  const mergedDrafts = registry.drafts(AGENT_ID);
+  assert.deepEqual(mergedDrafts[0]?.blocks, [{
+    contentIndex: 0,
+    contentType: "thinking",
+    value: "第一段\n\n第二段",
+  }]);
+  viewer.setLiveDrafts(mergedDrafts);
+  let body = viewer.render(160).slice(1, -1);
+  assert.deepEqual(body.filter((line) => line.includes("Thinking")), ["▾ Thinking · streaming"]);
+  assert.ok(body.includes("│ 第一段"), body.join("\n"));
+  assert.ok(body.includes("│ 第二段"), body.join("\n"));
+  assert.equal(viewer.getSelectedKey(), expandedKey);
+
+  assert.equal(registry.applyEvent(AGENT_ID, complete("message-1", 3)), true);
+  viewer.setLiveDrafts(registry.drafts(AGENT_ID));
+  body = viewer.render(160).slice(1, -1);
+  assert.deepEqual(body.filter((line) => line.includes("Thinking")), ["▾ Thinking"]);
+  assert.doesNotMatch(body.join("\n"), /streaming/u);
+  assert.ok(body.includes("│ 第一段") && body.includes("│ 第二段"), body.join("\n"));
+
+  const separated = new AgentDisplayDraftRegistry();
+  separated.applyEvent(AGENT_ID, delta("message-2", 1, 0, "thinking", "前"));
+  separated.applyEvent(AGENT_ID, delta("message-2", 2, 1, "text", "中"));
+  separated.applyEvent(AGENT_ID, delta("message-2", 3, 2, "thinking", "后"));
+  assert.deepEqual(
+    separated.drafts(AGENT_ID)[0]?.blocks.map((block) => block.contentType),
+    ["thinking", "text", "thinking"],
+  );
+});
+
 test("权威消息先到时登记墓碑：后续该流迟到的 delta 与 complete 被忽略", () => {
   const registry = new AgentDisplayDraftRegistry();
   assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), false);
@@ -417,7 +460,7 @@ test("查看器投影直接消费草稿视图：流式与冻结标题随状态�
       blocks: [Object.freeze({ contentIndex: 0, contentType: "thinking" as const, value: "流式" })],
     }],
   });
-  assert.match(viewer.render(160).join("\n"), /Thinking · streaming/u);
+  assert.match(viewer.render(160).join("\n"), /▸ Thinking · streaming/u);
 
   const frozenViewer = new AgentActivityViewerModel({
     agent_id: AGENT_ID,
@@ -431,7 +474,7 @@ test("查看器投影直接消费草稿视图：流式与冻结标题随状态�
       blocks: [Object.freeze({ contentIndex: 0, contentType: "thinking" as const, value: "冻结" })],
     }],
   });
-  assert.match(frozenViewer.render(160).join("\n"), /Thinking · streaming incomplete/u);
+  assert.match(frozenViewer.render(160).join("\n"), /▸ Thinking · streaming incomplete/u);
 
   const surface = renderAgentActivityViewerSurface(frozenViewer, 160, undefined);
   assert.ok(surface.length > 0);

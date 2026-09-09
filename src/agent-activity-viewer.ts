@@ -15,6 +15,10 @@ import {
   renderNarrowPanelLine,
   renderPanelRule,
   safeUiFact,
+  stylePanelText,
+  themeBg,
+  themeBold,
+  themeFg,
   truncateToDisplayWidth,
   type UiPanelLineStyle,
 } from "./ui-surface.ts";
@@ -79,13 +83,22 @@ export interface AgentActivityViewerPublicState {
   readonly selected_key: string | undefined;
 }
 
+interface ViewerStatusTail {
+  readonly text: string;
+  readonly style: UiPanelLineStyle;
+}
+
 interface ViewerSemanticLine {
   readonly text: string;
   readonly style: UiPanelLineStyle;
-  /** 可展开条目身份：thinking 组；选中背景只作用于该行。 */
+  /** 可展开条目身份；选中背景只作用于该标题行。 */
   readonly selectable_key?: string;
   /** 该行是否为当前选中条目；仅渲染层消费。 */
   readonly selected?: boolean;
+  /** 标题使用粗体强调色；状态尾标仍按自身状态色渲染。 */
+  readonly emphasized_title?: boolean;
+  /** 位于标题右侧的工具状态图标及其独立颜色。 */
+  readonly status_tail?: ViewerStatusTail;
   /** 行尾局部错误片段：仅该片段使用错误色，其余保持行样式。 */
   readonly error_tail?: string;
 }
@@ -103,7 +116,7 @@ type ToolRunState =
 
 interface ToolDisplayEntry {
   readonly kind: "tool";
-  /** 条目身份：错误正文展开的稳定可展开键。 */
+  /** 条目身份：工具附属正文使用的稳定可展开键。 */
   readonly entryId: string;
   /** 运行实例身份；与工具活动 ID、执行代次共同承担回填匹配职责。 */
   readonly incarnationId: string;
@@ -125,16 +138,16 @@ interface ToolDisplayEntry {
 }
 
 /**
- * 安全兜底视觉规则：运行中强调色；成功与中性弱化；警告色；失败整行错误色。
- * 行首结构预留“状态图标、折叠标记、摘要”的稳定位置；兜底条目没有可展开
- * 正文，折叠标记恒为空，后续专用规则的附属正文将共用整行背景顶格显示。
+ * 标题使用统一展开标记和强调样式，工具状态图标固定在标题右侧。状态视觉为：
+ * 运行中 `↻` 强调色、成功 `✓` 弱化色、失败 `×` 错误色；收束警告与
+ * terminated 继续保留各自语义。
  */
 const TOOL_STATE_VISUALS: Readonly<Record<ToolRunState["phase"], {
   readonly icon: string;
   readonly style: UiPanelLineStyle;
   readonly suffix?: string;
 }>> = Object.freeze({
-  running: Object.freeze({ icon: "▶", style: "accent" as const }),
+  running: Object.freeze({ icon: "↻", style: "accent" as const }),
   success: Object.freeze({ icon: "✓", style: "terminal" as const }),
   failure: Object.freeze({ icon: "×", style: "error" as const }),
   unavailable: Object.freeze({ icon: "⚠", style: "warning" as const, suffix: "result unavailable" }),
@@ -185,6 +198,10 @@ function toolErrorKey(entryId: string): string {
 
 function toolMessageKey(entryId: string): string {
   return `tool-message:${entryId}`;
+}
+
+function toolCommandKey(entryId: string): string {
+  return `tool-command:${entryId}`;
 }
 
 function parentMessageKey(entryId: string): string {
@@ -338,6 +355,10 @@ export class AgentActivityViewerModel {
         text: truncateToDisplayWidth(line.text, contentWidth),
         style: line.style,
         selected: line.selectable_key !== undefined && line.selectable_key === this.selectedKey,
+        ...(line.emphasized_title === undefined
+          ? {}
+          : { emphasized_title: line.emphasized_title }),
+        ...(line.status_tail === undefined ? {} : { status_tail: line.status_tail }),
         ...(line.error_tail === undefined ? {} : { error_tail: line.error_tail }),
       }));
     while (visible.length < this.viewportHeight) {
@@ -497,6 +518,7 @@ export class AgentActivityViewerModel {
     return key.startsWith("thinking:")
       || key.startsWith("tool-error:")
       || key.startsWith("tool-message:")
+      || key.startsWith("tool-command:")
       || key.startsWith("parent-message:");
   }
 
@@ -661,57 +683,74 @@ export class AgentActivityViewerModel {
       }
 
       const visual = toolDisplayVisual(entry);
-      // 行首顺序固定为状态图标、折叠标记、摘要。专用摘要展示白名单参数
-      // 与结果事实；错误正文与消息正文默认折叠，展开后顶格显示。
+      // 工具摘要统一作为标题：可展开项以 ▸/▾ 开头，状态图标位于右侧。
+      // Shell 只展开完整 command；即使收到违约错误正文也不显示输出或退出信息。
       if (entry.summary !== undefined) {
+        const shell = entry.summary.tool === "bash" || entry.summary.tool === "powershell";
         const messageBody = toolMessageBody(entry.summary);
-        const expandable = entry.errorText !== undefined || messageBody !== undefined;
-        const expandKey = entry.errorText !== undefined
-          ? toolErrorKey(entry.entryId)
-          : toolMessageKey(entry.entryId);
+        const errorBody = shell ? undefined : entry.errorText;
+        const expandable = shell || errorBody !== undefined || messageBody !== undefined;
+        const expandKey = shell
+          ? toolCommandKey(entry.entryId)
+          : errorBody !== undefined
+            ? toolErrorKey(entry.entryId)
+            : toolMessageKey(entry.entryId);
         const expanded = expandable && this.expandedKeys.has(expandKey);
-        const marker = expandable ? (expanded ? "▾" : "▸") : "";
-        // 失败事实的规范稳定错误码与收束事实并列在行尾。
+        // 失败事实的规范稳定错误码与收束事实并列在标题中、状态图标之前。
         const suffix = toolLineSuffix(visual, entry.errorCode);
-        // 摘要预算扣除行首图标/折叠标记与行尾收束事实，避免二次右侧截断。
-        const summaryWidth = contentWidth
-          - displayWidth(visual.icon) - 1
-          - (marker === "" ? 0 : displayWidth(marker) + 1)
-          - displayWidth(suffix);
+        const summaryWidth = Math.max(
+          1,
+          contentWidth
+            - (expandable ? 2 : 0)
+            - displayWidth(suffix)
+            - displayWidth(visual.icon) - 1,
+        );
         // get_agent_status 目标 failed 时只将 failed 与错误码片段标红。
         const failureTail = statusFailureTail(entry.summary);
         const summaryText = formatStatusSummary(entry.summary, summaryWidth, failureTail);
-        lines.push(Object.freeze({
-          text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${summaryText}${suffix}`,
-          style: visual.style,
-          ...(expandable ? { selectable_key: expandKey } : {}),
-          ...(failureTail === undefined ? {} : { error_tail: failureTail }),
+        lines.push(toolTitleLine({
+          label: `${summaryText}${suffix}`,
+          visual,
+          width: contentWidth,
+          ...(expandable ? { key: expandKey, expanded } : {}),
+          ...(failureTail === undefined ? {} : { errorTail: failureTail }),
         }));
-        // Shell 工具的完整 command 始终在摘要行下方的独立代码区域显示：
-        // 状态变化只更新摘要行，命令区域不重排。
-        if (entry.summary.tool === "bash" || entry.summary.tool === "powershell") {
-          lines.push(...renderShellCommandBody(entry.summary.command, contentWidth));
+        if (
+          expanded
+          && (entry.summary.tool === "bash" || entry.summary.tool === "powershell")
+        ) {
+          const command = entry.summary.command;
+          lines.push(...renderGuidedBody(
+            contentWidth,
+            (bodyWidth) => renderShellCommandBody(command, bodyWidth),
+          ));
         }
-        if (expanded && entry.errorText !== undefined) {
-          lines.push(...renderToolErrorBody(entry.errorText, contentWidth));
+        if (expanded && errorBody !== undefined) {
+          lines.push(...renderGuidedBody(
+            contentWidth,
+            (bodyWidth) => renderToolErrorBody(errorBody, bodyWidth),
+          ));
         }
         if (expanded && messageBody !== undefined) {
-          lines.push(...renderMarkdownBlock(messageBody, contentWidth, "body"));
+          lines.push(...renderGuidedBody(
+            contentWidth,
+            (bodyWidth) => renderMarkdownBlock(messageBody, bodyWidth, "body"),
+          ));
         }
         continue;
       }
-      // 安全兜底：只显示工具名与状态；不可展开，折叠标记恒为空但位置稳定。
+      // 安全兜底只显示工具名与状态，不提供展开入口。
       const summary = safeUiFact(entry.toolName);
-      const marker = "";
       const suffixParts = [
         ...(visual.suffix === undefined ? [] : [visual.suffix]),
         ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
       ];
-      lines.push(Object.freeze({
-        text: `${visual.icon} ${marker}${marker === "" ? "" : " "}${summary}${
+      lines.push(toolTitleLine({
+        label: `${summary}${
           suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`
         }`,
-        style: visual.style,
+        visual,
+        width: contentWidth,
       }));
     }
 
@@ -738,6 +777,65 @@ type DisplayEntry =
     }
   | ToolDisplayEntry;
 
+interface ToolTitleLineOptions {
+  readonly label: string;
+  readonly visual: ReturnType<typeof toolDisplayVisual>;
+  readonly width: number;
+  readonly key?: string;
+  readonly expanded?: boolean;
+  readonly errorTail?: string;
+}
+
+/** 工具标题固定为“可选展开标记、摘要、右侧状态图标”。 */
+function toolTitleLine(options: ToolTitleLineOptions): ViewerSemanticLine {
+  const marker = options.key === undefined ? "" : `${options.expanded === true ? "▾" : "▸"} `;
+  const iconWidth = displayWidth(options.visual.icon);
+  const headWidth = Math.max(0, options.width - iconWidth - 1);
+  const head = truncateToDisplayWidth(`${marker}${options.label}`, headWidth);
+  const text = head.length === 0
+    ? truncateToDisplayWidth(options.visual.icon, options.width)
+    : `${head} ${options.visual.icon}`;
+  return Object.freeze({
+    text,
+    style: "terminal" as const,
+    emphasized_title: true,
+    status_tail: Object.freeze({ text: options.visual.icon, style: options.visual.style }),
+    ...(options.key === undefined ? {} : { selectable_key: options.key }),
+    ...(options.errorTail === undefined ? {} : { error_tail: options.errorTail }),
+  });
+}
+
+/** 无工具状态的可展开标题同样使用统一箭头和粗体强调色。 */
+function disclosureTitleLine(
+  label: string,
+  key: string,
+  expanded: boolean,
+): ViewerSemanticLine {
+  return Object.freeze({
+    text: `${expanded ? "▾" : "▸"} ${label}`,
+    style: "terminal" as const,
+    selectable_key: key,
+    emphasized_title: true,
+  });
+}
+
+const EXPANDED_BODY_GUIDE = "│ ";
+
+/** 展开正文先扣除引导线宽度再渲染，保证换行后每一行都保留 `│`。 */
+function renderGuidedBody(
+  width: number,
+  renderBody: (bodyWidth: number) => readonly ViewerSemanticLine[],
+): readonly ViewerSemanticLine[] {
+  if (width <= 1) {
+    return Object.freeze(renderBody(1).map((line) => Object.freeze({ ...line, text: "│" })));
+  }
+  const bodyWidth = width - displayWidth(EXPANDED_BODY_GUIDE);
+  return Object.freeze(renderBody(bodyWidth).map((line) => Object.freeze({
+    ...line,
+    text: `${EXPANDED_BODY_GUIDE}${line.text}`,
+  })));
+}
+
 /**
  * 实时草稿渲染：text 块实时按 Markdown 重渲染，不增加流式标签、角色标签
  * 或消息分隔线；thinking 默认折叠，标题按草稿状态区分流式与冻结，手动
@@ -752,7 +850,9 @@ function renderLiveDraft(
 ): void {
   const thinkingTitle = draft.state === "frozen"
     ? THINKING_FROZEN_TEXT
-    : THINKING_STREAMING_TEXT;
+    : draft.state === "complete"
+      ? THINKING_COLLAPSED_TEXT
+      : THINKING_STREAMING_TEXT;
   for (const block of draft.blocks) {
     if (block.contentType === "text") {
       lines.push(...renderMarkdownBlock(block.value, width, "body"));
@@ -760,20 +860,25 @@ function renderLiveDraft(
     }
     const key = liveThinkingKey(draft.key, block.contentIndex);
     const expanded = expandedKeys.has(key);
-    const title: ViewerSemanticLine = Object.freeze({
-      text: thinkingTitle,
-      style: "terminal" as const,
-      selectable_key: key,
-    });
-    lines.push(title);
-    if (expanded) lines.push(...renderMarkdownBlock(block.value, width, "terminal"));
+    lines.push(disclosureTitleLine(thinkingTitle, key, expanded));
+    if (expanded) {
+      lines.push(...renderGuidedBody(
+        width,
+        (bodyWidth) => renderMarkdownBlock(block.value, bodyWidth, "terminal"),
+      ));
+    }
   }
   if (draft.state !== "frozen" || draft.blocks.length === 0) return;
   const last = draft.blocks.at(-1)!;
-  const lastExpanded = last.contentType === "text"
-    || expandedKeys.has(liveThinkingKey(draft.key, last.contentIndex));
-  if (lastExpanded) {
+  if (last.contentType === "text") {
     lines.push(Object.freeze({ text: FROZEN_DRAFT_ELLIPSIS, style: "terminal" as const }));
+    return;
+  }
+  if (expandedKeys.has(liveThinkingKey(draft.key, last.contentIndex))) {
+    lines.push(Object.freeze({
+      text: `${EXPANDED_BODY_GUIDE}${FROZEN_DRAFT_ELLIPSIS}`,
+      style: "terminal" as const,
+    }));
   }
 }
 
@@ -797,13 +902,10 @@ export function renderAgentActivityViewerSurface(
   if (!framed) {
     return Object.freeze([
       renderNarrowPanelLine(header, panelWidth, "header", false, theme),
-      ...body.map((line) => renderNarrowPanelLine(
-        line.text,
+      ...body.map((line) => renderViewerNarrowPanelLine(
+        line,
         panelWidth,
-        line.style,
-        line.selected === true,
         theme,
-        line.error_tail,
       )),
       renderNarrowPanelLine(footer, panelWidth, "footer", false, theme),
     ]);
@@ -813,18 +915,100 @@ export function renderAgentActivityViewerSurface(
     renderPanelRule(panelWidth, "top", theme),
     renderFramedPanelLine(header, contentWidth, "header", false, theme),
     renderPanelRule(panelWidth, "divider", theme),
-    ...body.map((line) => renderFramedPanelLine(
+    ...body.map((line) => renderViewerFramedPanelLine(
+      line,
+      contentWidth,
+      theme,
+    )),
+    renderPanelRule(panelWidth, "divider", theme),
+    renderFramedPanelLine(footer, contentWidth, "footer", false, theme),
+    renderPanelRule(panelWidth, "bottom", theme),
+  ]);
+}
+
+/** 标题和右侧状态需要独立着色；普通正文继续复用共享面板渲染器。 */
+function renderViewerFramedPanelLine(
+  line: ViewerSemanticLine,
+  contentWidth: number,
+  theme: unknown,
+): string {
+  if (line.emphasized_title !== true && line.status_tail === undefined) {
+    return renderFramedPanelLine(
       line.text,
       contentWidth,
       line.style,
       line.selected === true,
       theme,
       line.error_tail,
-    )),
-    renderPanelRule(panelWidth, "divider", theme),
-    renderFramedPanelLine(footer, contentWidth, "footer", false, theme),
-    renderPanelRule(panelWidth, "bottom", theme),
-  ]);
+    );
+  }
+  const value = truncateToDisplayWidth(line.text, contentWidth);
+  const pad = " ".repeat(Math.max(0, contentWidth - displayWidth(value)));
+  const borderColor = line.selected === true ? "borderAccent" : "border";
+  const rendered = `${themeFg(theme, borderColor, "┃")} ${
+    styleViewerSemanticText({ ...line, text: value }, theme)
+  }${pad} ${themeFg(theme, borderColor, "┃")}`;
+  return themeBg(theme, line.selected === true ? "selectedBg" : "customMessageBg", rendered);
+}
+
+function renderViewerNarrowPanelLine(
+  line: ViewerSemanticLine,
+  width: number,
+  theme: unknown,
+): string {
+  if (line.emphasized_title !== true && line.status_tail === undefined) {
+    return renderNarrowPanelLine(
+      line.text,
+      width,
+      line.style,
+      line.selected === true,
+      theme,
+      line.error_tail,
+    );
+  }
+  const value = truncateToDisplayWidth(line.text, width);
+  const pad = " ".repeat(Math.max(0, width - displayWidth(value)));
+  return themeBg(
+    theme,
+    line.selected === true ? "selectedBg" : "customMessageBg",
+    `${styleViewerSemanticText({ ...line, text: value }, theme)}${pad}`,
+  );
+}
+
+/** 粗体强调标题、局部错误事实与右侧状态图标分别应用主题。 */
+function styleViewerSemanticText(line: ViewerSemanticLine, theme: unknown): string {
+  let title = line.text;
+  let status: ViewerStatusTail | undefined;
+  if (line.status_tail !== undefined) {
+    const suffix = ` ${line.status_tail.text}`;
+    if (title.endsWith(suffix)) {
+      title = title.slice(0, -suffix.length);
+      status = line.status_tail;
+    } else if (title === line.status_tail.text) {
+      title = "";
+      status = line.status_tail;
+    }
+  }
+
+  let errorTail: string | undefined;
+  if (line.error_tail !== undefined && title.endsWith(line.error_tail)) {
+    title = title.slice(0, -line.error_tail.length);
+    errorTail = line.error_tail;
+  }
+  const styledTitle = line.emphasized_title === true
+    ? themeFg(theme, "accent", themeBold(theme, title))
+    : stylePanelText(title, line.style, theme);
+  const styledError = errorTail === undefined
+    ? ""
+    : themeFg(
+      theme,
+      "error",
+      line.emphasized_title === true ? themeBold(theme, errorTail) : errorTail,
+    );
+  const styledStatus = status === undefined
+    ? ""
+    : ` ${stylePanelText(status.text, status.style, theme)}`;
+  return `${styledTitle}${styledError}${styledStatus}`;
 }
 
 function unavailableViewerLines(width: number): readonly ViewerSemanticLine[] {
@@ -858,8 +1042,8 @@ function renderMarkdownBlock(
 }
 
 /**
- * thinking 块默认折叠为不含行数与预览的 `Thinking`；展开后保留标题并以
- * 顶格、弱化、无逐行前缀、无独立背景的 Markdown 显示。
+ * thinking 块默认折叠为不含行数与预览的 `Thinking`；展开后保留统一标题，
+ * 正文以 `│` 引导线和弱化 Markdown 显示。
  */
 function renderThinkingBlock(
   raw: string,
@@ -867,13 +1051,12 @@ function renderThinkingBlock(
   key: string,
   expanded: boolean,
 ): readonly ViewerSemanticLine[] {
-  const title: ViewerSemanticLine = Object.freeze({
-    text: THINKING_COLLAPSED_TEXT,
-    style: "terminal" as const,
-    selectable_key: key,
-  });
+  const title = disclosureTitleLine(THINKING_COLLAPSED_TEXT, key, expanded);
   if (!expanded) return Object.freeze([title]);
-  const body = renderMarkdownBlock(raw, width, "terminal");
+  const body = renderGuidedBody(
+    width,
+    (bodyWidth) => renderMarkdownBlock(raw, bodyWidth, "terminal"),
+  );
   return Object.freeze([title, ...body]);
 }
 
@@ -881,8 +1064,8 @@ const PARENT_MESSAGE_TITLE = "Parent message";
 
 /**
  * 已接纳父代理输入统一折叠为 `Parent message`：不区分首条与后续消息，
- * 不显示父代理身份。正文完整保留、默认折叠；展开后按统一背景、顶格无
- * 缩进的正常 Markdown 显示。逐条独立身份，完全相同正文不去重。
+ * 不显示父代理身份。正文完整保留、默认折叠；展开后使用 `│` 引导线显示
+ * 正常 Markdown。逐条独立身份，完全相同正文不去重。
  */
 function renderParentMessageBlock(
   content: readonly SafeAgentActivityContentBlock[],
@@ -890,24 +1073,22 @@ function renderParentMessageBlock(
   key: string,
   expanded: boolean,
 ): readonly ViewerSemanticLine[] {
-  const title: ViewerSemanticLine = Object.freeze({
-    text: PARENT_MESSAGE_TITLE,
-    style: "terminal" as const,
-    selectable_key: key,
-  });
+  const title = disclosureTitleLine(PARENT_MESSAGE_TITLE, key, expanded);
   if (!expanded) return Object.freeze([title]);
   const lines: ViewerSemanticLine[] = [title];
   let blockIndex = 0;
   for (const block of content) {
     if (block.type === "text") {
-      lines.push(...renderMarkdownBlock(block.text, width, "body"));
-    } else {
-      lines.push(...renderThinkingBlock(
-        block.thinking,
+      lines.push(...renderGuidedBody(
         width,
-        `${key}:${blockIndex}`,
-        true,
+        (bodyWidth) => renderMarkdownBlock(block.text, bodyWidth, "body"),
       ));
+    } else {
+      const thinkingTitleKey = `${key}:${blockIndex}`;
+      lines.push(...renderGuidedBody(width, (bodyWidth) => Object.freeze([
+        disclosureTitleLine(THINKING_COLLAPSED_TEXT, thinkingTitleKey, true),
+        ...renderMarkdownBlock(block.thinking, bodyWidth, "terminal"),
+      ])));
     }
     blockIndex += 1;
   }
@@ -920,7 +1101,7 @@ function wrapPlainText(value: string, width: number): readonly string[] {
 
 /**
  * 工具错误正文：红色预格式化纯文本。不解析 Markdown、不做语义摘要或字符
- * 截断，只按面板宽度软换行，保留换行与可读空白；顶格无前缀。
+ * 截断，只按正文宽度软换行，保留换行与可读空白；调用方统一添加引导线。
  */
 function renderToolErrorBody(
   errorText: string,
@@ -935,9 +1116,8 @@ function renderToolErrorBody(
 }
 
 /**
- * Shell 工具的完整命令：独立代码区域。统一工具正文背景，顶格、不折叠、
- * 不缩进、不做内容截断；单行与多行命令采用同一种结构（软换行不丢失字符）。
- * 该区域始终显示，不需要展开操作，也不随状态变化重排。
+ * Shell 工具的完整命令：默认折叠，展开后作为独立预格式化正文显示。
+ * 单行与多行命令采用同一种软换行结构，不截断命令字符。
  */
 function renderShellCommandBody(
   command: string,

@@ -110,19 +110,16 @@ export class AgentDisplayDraftStore {
     return true;
   }
 
-  /** 当前草稿的连续前缀投影；没有可见内容的流不产生视图。 */
+  /**
+   * 当前草稿的连续前缀投影；没有可见内容的流不产生视图。相邻 thinking
+   * 块在显示边界实时合并，底层帧重排仍保留原始 contentIndex。
+   */
   drafts(): readonly AgentDisplayDraftView[] {
     const views: AgentDisplayDraftView[] = [];
     for (const [key, stream] of this.streams) {
       if (stream.blocks.size === 0) continue;
-      const blocks = [...stream.blocks.entries()]
-        .sort(([left], [right]) => left - right)
-        .map(([contentIndex, block]) => Object.freeze({
-          contentIndex,
-          contentType: block.contentType,
-          value: block.value,
-        }));
-      views.push(Object.freeze({ key, state: stream.state, blocks: Object.freeze(blocks) }));
+      const blocks = projectDisplayDraftBlocks(stream.blocks);
+      views.push(Object.freeze({ key, state: stream.state, blocks }));
     }
     return Object.freeze(views);
   }
@@ -233,6 +230,31 @@ export class AgentDisplayDraftStore {
       this.tombstones.delete(oldest);
     }
   }
+}
+
+/** 与权威消息一致：相邻 thinking 组成一个显示组，text 会明确中断合并。 */
+function projectDisplayDraftBlocks(
+  blocks: ReadonlyMap<number, { readonly contentType: "text" | "thinking"; readonly value: string }>,
+): readonly AgentDisplayDraftBlockView[] {
+  const projected: AgentDisplayDraftBlockView[] = [];
+  const ordered = [...blocks.entries()].sort(([left], [right]) => left - right);
+  for (const [contentIndex, block] of ordered) {
+    const previous = projected.at(-1);
+    if (previous?.contentType === "thinking" && block.contentType === "thinking") {
+      projected[projected.length - 1] = Object.freeze({
+        contentIndex: previous.contentIndex,
+        contentType: "thinking",
+        value: `${previous.value}\n\n${block.value}`,
+      });
+      continue;
+    }
+    projected.push(Object.freeze({
+      contentIndex,
+      contentType: block.contentType,
+      value: block.value,
+    }));
+  }
+  return Object.freeze(projected);
 }
 
 /**
