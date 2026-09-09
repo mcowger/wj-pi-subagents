@@ -1,4 +1,9 @@
-import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import {
+  Key,
+  matchesKey,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
+} from "@earendil-works/pi-tui";
 import type {
   AgentSnapshot,
   ControlResult,
@@ -727,7 +732,7 @@ export class AgentTreePanelModel {
         terminal: row.terminal,
         selected: this.scrollOffset + index === this.selectedIndex,
       })),
-      neutralPanelLine(truncateToDisplayWidth("↑↓ scroll · ←→ fold · Esc close", width)),
+      neutralPanelLine(truncateToDisplayWidth("↑↓ scroll · ←→ fold · Home/End jump · Esc close", width)),
     ]);
   }
 
@@ -780,6 +785,20 @@ export class AgentTreePanelModel {
     if (this.status === "error") return "ignored";
     const rows = this.buildRows();
     this.clampSelection(rows.length);
+    if (matchesKey(data, Key.home)) {
+      if (rows.length === 0) return "ignored";
+      if (this.selectedIndex === 0 && this.scrollOffset === 0) return "ignored";
+      this.selectedIndex = 0;
+      this.clampSelection(rows.length);
+      return "changed";
+    }
+    if (matchesKey(data, Key.end)) {
+      if (rows.length === 0) return "ignored";
+      if (this.selectedIndex === rows.length - 1) return "ignored";
+      this.selectedIndex = rows.length - 1;
+      this.clampSelection(rows.length);
+      return "changed";
+    }
     if (data === "\x1b[A" || data === "k") {
       if (this.selectedIndex <= 0) return "ignored";
       this.selectedIndex -= 1;

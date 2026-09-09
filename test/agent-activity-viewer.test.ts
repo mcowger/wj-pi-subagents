@@ -664,14 +664,14 @@ test("向上滚动暂停 follow，向下滚到底恢复，footer 始终固定且
   assert.equal(viewer.getPublicState().follow_enabled, true);
   assert.equal(
     viewer.render(160).at(-1),
-    "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back",
+    "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Home/End jump · Esc back",
   );
 
   assert.equal(viewer.handleInput("\x1b[A"), "changed");
   assert.equal(viewer.getPublicState().follow_enabled, false);
   assert.equal(
     viewer.render(160).at(-1),
-    "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back",
+    "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Home/End jump · Esc back",
   );
   assert.doesNotMatch(viewer.render(160).at(-1) ?? "", /paused/u);
 
@@ -2039,4 +2039,54 @@ test("非滚轮与非左键点击的鼠标事件返回 undefined", () => {
     undefined,
   );
   assert.equal(viewer.getExpandedKeys().length, 0);
+});
+
+/* --------------------------------- Home/End 跳转 --------------------------------- */
+
+test("Home/End 跳转首尾并切换 follow，重复按键忽略且 footer 提示更新", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
+    viewport_height: VIEWPORT,
+  });
+  // 初始跟随底部：按 End 已在尾部且跟随，返回 ignored。
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+  assert.equal(viewer.handleInput("\x1b[F"), "ignored");
+
+  // Home 跳到首部：回看历史，暂停 follow。
+  assert.equal(viewer.handleInput("\x1b[H"), "changed");
+  let state = viewer.getPublicState();
+  assert.equal(state.scroll_offset, 0);
+  assert.equal(state.follow_enabled, false);
+  // 已在首部且非跟随：再次 Home 忽略。
+  assert.equal(viewer.handleInput("\x1b[H"), "ignored");
+
+  // End 跳到尾部：恢复 follow。
+  assert.equal(viewer.handleInput("\x1b[F"), "changed");
+  state = viewer.getPublicState();
+  assert.equal(state.scroll_offset, state.max_scroll_offset);
+  assert.equal(state.follow_enabled, true);
+  // 已在尾部且跟随：再次 End 忽略。
+  assert.equal(viewer.handleInput("\x1b[F"), "ignored");
+
+  // footer 提示新快捷键。
+  assert.ok(
+    (viewer.render(160).at(-1) ?? "").includes("Home/End jump"),
+    viewer.render(160).join("\n"),
+  );
+});
+
+test("End 跳到尾部恢复 follow，后续追加条目视口继续跟随", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), replayFixture(), {
+    viewport_height: VIEWPORT,
+  });
+  assert.equal(viewer.handleInput("\x1b[H"), "changed");
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+
+  assert.equal(viewer.handleInput("\x1b[F"), "changed");
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+
+  // 追加新条目：跟随语义保持，视口对齐最新底部。
+  viewer.syncFrom([...replayFixture(), toolStart("t2", "run_cmd")]);
+  const state = viewer.getPublicState();
+  assert.equal(state.follow_enabled, true);
+  assert.equal(state.scroll_offset, state.max_scroll_offset);
 });

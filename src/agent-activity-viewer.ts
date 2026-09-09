@@ -1,5 +1,7 @@
 import {
+  Key,
   Markdown,
+  matchesKey,
   type MarkdownTheme,
   type TuiMouseEvent,
   type TuiMouseEventResult,
@@ -43,7 +45,7 @@ const WAIT_AGENT_RUNNING_TEXT = "…";
 const FROZEN_DRAFT_ELLIPSIS = "…";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
-const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Esc back";
+const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Home/End jump · Esc back";
 const RENDER_VIEWER_LINES = Symbol("renderViewerLines");
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
@@ -418,6 +420,21 @@ export class AgentActivityViewerModel {
     if (data === "\r" || data === "\n" || data === " ") return this.toggleSelectedKey();
     if (data === "\x1b[C") return this.setSelectedExpansion(true);
     if (data === "\x1b[D") return this.setSelectedExpansion(false);
+    if (matchesKey(data, Key.home)) {
+      if (this.scrollOffset === 0 && !this.followEnabled) return "ignored";
+      // 跳到首部 = 回看历史：暂停自动跟随。
+      this.scrollOffset = 0;
+      this.followEnabled = false;
+      return "changed";
+    }
+    if (matchesKey(data, Key.end)) {
+      const maxOffset = this.maxScrollOffset();
+      if (this.scrollOffset === maxOffset && this.followEnabled) return "ignored";
+      // 跳到尾部 = 观察最新活动：恢复自动跟随。
+      this.scrollOffset = maxOffset;
+      this.followEnabled = true;
+      return "changed";
+    }
 
     const maxOffset = this.maxScrollOffset();
     if (this.followEnabled) this.scrollOffset = maxOffset;

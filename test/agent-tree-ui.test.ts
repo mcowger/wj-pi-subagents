@@ -691,3 +691,43 @@ test("非滚轮与非左键点击的鼠标事件返回 undefined", () => {
   );
   assert.equal(panel.getPublicState().selected_key, PARENT_ID);
 });
+
+/* --------------------------------- Home/End 跳转 --------------------------------- */
+
+test("Home/End 跳转树首尾行，重复按键忽略且 footer 提示更新", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 2 });
+  // 初始在首行：按 Home 忽略。
+  assert.equal(panel.getPublicState().selected_key, PARENT_ID);
+  assert.equal(panel.handleInput("\x1b[H"), "ignored");
+
+  // End 跳到最后一行：选中 incomplete-child，视口收敛到底部。
+  assert.equal(panel.handleInput("\x1b[F"), "changed");
+  let state = panel.getPublicState();
+  assert.equal(state.selected_key, INCOMPLETE_CHILD_ID);
+  assert.equal(state.scroll_offset, 3);
+  // 已在尾部：再次 End 忽略。
+  assert.equal(panel.handleInput("\x1b[F"), "ignored");
+
+  // Home 跳回首行：视口回顶。
+  assert.equal(panel.handleInput("\x1b[H"), "changed");
+  state = panel.getPublicState();
+  assert.equal(state.selected_key, PARENT_ID);
+  assert.equal(state.scroll_offset, 0);
+  // 已在首部：再次 Home 忽略。
+  assert.equal(panel.handleInput("\x1b[H"), "ignored");
+
+  // 空树：Home/End 均忽略。
+  const empty = new AgentTreePanelModel(Object.freeze({
+    tree_revision: 1,
+    scope: Object.freeze({ kind: "root" as const }),
+    nodes: Object.freeze([]),
+  }), { viewport_height: 2 });
+  assert.equal(empty.handleInput("\x1b[H"), "ignored");
+  assert.equal(empty.handleInput("\x1b[F"), "ignored");
+
+  // footer 提示新快捷键。
+  assert.ok(
+    (panel.render(160).at(-1) ?? "").includes("Home/End jump"),
+    panel.render(160).join("\n"),
+  );
+});
