@@ -251,6 +251,90 @@ test("握手完成前发布活动流被拒绝，终止屏障后活动帧被丢�
   void parent;
 });
 
+test("重同步窗口内的补齐活动帧静默丢弃：序号前进、无交付、不故障", () => {
+  const { parent, child, childAgentId } = readyPair();
+
+  // 两条连续活动帧（seq=3、4）。只投递第二条制造跳号 → gap → resyncing。
+  const first = child.publishActivity({ entry: canonicalEntry(childAgentId, "丢失条目") })[0];
+  const second = child.publishActivity({ entry: canonicalEntry(childAgentId, "触发跳号") })[0];
+  assert.ok(first && second);
+  const gapResult = parent.receive(second);
+  assert.equal(gapResult.kind, "gap");
+  assert.equal(parent.getPublicState().state, "resyncing");
+
+  // 丢失帧补齐：序号前进，但条目静默缺失（不交付、不故障、通道不中断）。
+  const filled = parent.receive(first);
+  assert.equal(filled.kind, "accepted");
+  if (filled.kind === "accepted") assert.equal(filled.activity, undefined);
+  assert.equal(parent.getPublicState().state, "resyncing");
+});
+
+test("重同步窗口内的补齐 display 帧静默丢弃，通道保持重同步状态", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const displayEvent = {
+    type: "message_delta" as const,
+    streamId: "message-1",
+    sequence: 1,
+    contentIndex: 0,
+    contentType: "text" as const,
+    delta: "partial",
+    agentId: childAgentId,
+    incarnationId: randomUUID(),
+  };
+  const first = child.publishDisplayActivity({ event: displayEvent })[0];
+  const second = child.publishActivity({ entry: canonicalEntry(childAgentId) })[0];
+  assert.ok(first && second);
+  // 先投 activity 帧制造跳号进入 resyncing，再补齐 display 帧。
+  assert.equal(parent.receive(second).kind, "gap");
+  const filled = parent.receive(first);
+  assert.equal(filled.kind, "accepted");
+  if (filled.kind === "accepted") assert.equal(filled.display, undefined);
+  assert.equal(parent.getPublicState().state, "resyncing");
+});
+
+test("reset 快照落地后活动帧恢复正常交付", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const delivered: SupervisorActivityDelivery[] = [];
+
+  const first = child.publishActivity({ entry: canonicalEntry(childAgentId, "丢失条目") })[0];
+  const second = child.publishActivity({ entry: canonicalEntry(childAgentId, "触发跳号") })[0];
+  assert.ok(first && second);
+  const gapResult = parent.receive(second);
+  assert.equal(gapResult.kind, "gap");
+
+  // 把 parent 的 snapshot_request 转交 child，取得 reset 快照并喂回 parent。
+  const request = (gapResult as Extract<SupervisorReceiveResult, { kind: "gap" }>).outbound[0];
+  assert.ok(request);
+  const childResult = child.receive(request);
+  assert.equal(childResult.kind, "accepted");
+  const resetSnapshot = (childResult as Extract<SupervisorReceiveResult, { kind: "accepted" }>).outbound[0];
+  assert.ok(resetSnapshot);
+  const synced = parent.receive(resetSnapshot);
+  assert.equal(synced.kind, "accepted");
+  assert.equal(parent.getPublicState().state, "ready");
+
+  // 重同步完成后活动流恢复交付。
+  const next = child.publishActivity({ entry: canonicalEntry(childAgentId, "重同步后") });
+  deliverAll(parent, next, delivered);
+  assert.equal(delivered.length, 1);
+  assert.deepEqual(delivered[0]?.entry.body, {
+    type: "message",
+    content: [{ type: "text", text: "重同步后" }],
+  });
+});
+
+test("终止屏障下活动帧被无条件丢弃：不交付、不升级故障", () => {
+  const { parent, child, childAgentId } = readyPair();
+  parent.establishTerminationBarrier();
+  assert.equal(parent.getPublicState().state, "closing");
+  const frame = child.publishActivity({ entry: canonicalEntry(childAgentId) })[0];
+  assert.ok(frame);
+  // receiveFrame 对屏障后的所有帧直接丢弃，活动帧不会影响节点状态。
+  const result = parent.receive(frame);
+  assert.equal(result.kind, "discarded");
+  assert.equal(parent.getPublicState().state, "closing");
+});
+
 // --- 传输适配层（StreamSupervisorChannel）---
 
 async function readyStreamPair(): Promise<{

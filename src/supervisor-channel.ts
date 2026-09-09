@@ -1822,11 +1822,15 @@ export class SupervisorChannel {
   }
 
   /**
-   * 活动流帧只分发规范条目交付；分块帧在通道内按身份聚合，缺块静默等待，
-   * 结构违约与越权身份与既有帧语义一致，升级为协议故障。
+   * 活动流帧只分发规范条目交付；分块帧在通道内按身份聚合，缺块静默等待。
+   * 结构违约与越权身份升级为协议故障；重同步窗口（awaiting_snapshot/
+   * resyncing）内的条目按可丢弃展示数据静默缺失——条目无确认、无配对，
+   * 丢失只造成面板缺口，不应中断整条监督通道。
    */
   private applyActivity(frame: InternalFrame): SupervisorActivityDelivery | undefined {
-    if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+    if (this.role !== "parent") frameError("sequence_violation");
+    if (this.state === "awaiting_snapshot" || this.state === "resyncing") return undefined;
+    if (this.state !== "ready") frameError("sequence_violation");
     const payload = frame.payload;
     if (!isRecord(payload)) frameError("invalid_frame");
     if (hasExactObjectKeys(payload, ["agent_id", "entry"])) {
@@ -1855,10 +1859,13 @@ export class SupervisorChannel {
 
   /**
    * 实时显示帧只分发与外层代理身份一致、携带完整流身份的短暂事件；它不
-   * 进入活动缓存，也不参与生命周期或阶段跟踪。
+   * 进入活动缓存，也不参与生命周期或阶段跟踪。重同步窗口内的显示事件与
+   * 活动帧同样静默缺失：transient 数据不值得中断通道。
    */
-  private applyDisplay(frame: InternalFrame): SupervisorDisplayDelivery {
-    if (this.role !== "parent" || this.state !== "ready") frameError("sequence_violation");
+  private applyDisplay(frame: InternalFrame): SupervisorDisplayDelivery | undefined {
+    if (this.role !== "parent") frameError("sequence_violation");
+    if (this.state === "awaiting_snapshot" || this.state === "resyncing") return undefined;
+    if (this.state !== "ready") frameError("sequence_violation");
     const payload = frame.payload;
     if (!isRecord(payload) || !hasExactObjectKeys(payload, ["agent_id", "event"])) {
       frameError("invalid_frame");

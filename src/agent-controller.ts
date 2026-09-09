@@ -1118,14 +1118,28 @@ export class AgentController {
     ) {
       this.notifySessionEvent(agentId, "final_report");
     }
+    // 活动流转发是纯展示数据通道：任何失败只表现为面板条目缺失，不得沿
+    // onEvent 回调传播影响节点生命周期（与 reply 观察者同一语义）。
     if (event.kind === "activity" && agentId !== undefined) {
-      this.tree.updateActivity(agentId, event.activity);
+      try {
+        this.tree.updateActivity(agentId, event.activity);
+      } catch {
+        // 活动缓存更新失败静默缺失。
+      }
     }
     if (event.kind === "activity_stream" && agentId !== undefined) {
-      this.recordActivity(event.agent_id ?? agentId, event.entry);
+      try {
+        this.recordActivity(event.agent_id ?? agentId, event.entry);
+      } catch {
+        // 转发失败静默缺失，不改变节点生命周期。
+      }
     }
     if (event.kind === "activity_display" && agentId !== undefined) {
-      this.handleDisplayEvent(event.agent_id ?? agentId, event.event);
+      try {
+        this.handleDisplayEvent(event.agent_id ?? agentId, event.event);
+      } catch {
+        // 草稿转发失败静默缺失，不改变节点生命周期。
+      }
     }
     // 实时草稿只服务显示层：代理进入 idle、failed 或 terminated 时清除该代理
     // 仍未被权威消息替换的草稿。收束不改变生命周期或缓存行为；之后同一运行

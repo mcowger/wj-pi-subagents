@@ -134,6 +134,10 @@ class FakeSupervisor implements AgentSupervisor {
       listener(Object.freeze({ kind: "lifecycle", agent_id: agentId, event }));
     }
   }
+
+  emitRaw(event: RpcSupervisorEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
 }
 
 function messageEntry(agentId: string, text: string): CanonicalAgentActivityEntry {
@@ -563,4 +567,48 @@ test("工具开始与结束事实确定性共享同一条目身份", async () =>
   assert.equal(child.recordOwnActivity(endBody), true);
   const replayAfterRepeat = root.getActivityReplay(AGENT_ID);
   assert.equal(replayAfterRepeat[2]?.entry_id, replay[0]?.entry_id);
+});
+
+test("活动流转发异常被屏障吞掉：不沿 onEvent 传播，后续事件正常处理", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, upstream } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  // 注入转发故障：三个活动分支的目标内部调用全部抛错。
+  const internal = controller as unknown as {
+    tree: { updateActivity: () => void };
+    recordActivity: () => void;
+    handleDisplayEvent: () => void;
+  };
+  internal.tree.updateActivity = () => {
+    throw new Error("注入缓存故障");
+  };
+  internal.recordActivity = () => {
+    throw new Error("注入转发故障");
+  };
+  internal.handleDisplayEvent = () => {
+    throw new Error("注入草稿故障");
+  };
+
+  // 三个活动分支的转发失败都被屏障吞掉：面板数据静默缺失，不炸事件回调。
+  assert.doesNotThrow(() => {
+    fake.emitRaw(Object.freeze({
+      kind: "activity",
+      agent_id: AGENT_ID,
+      activity: messageEntry(AGENT_ID, "缓存分支条目"),
+    }) as RpcSupervisorEvent);
+    fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, "转发分支条目") });
+    fake.emitActivityDisplay({
+      agent_id: AGENT_ID,
+      event: displayDelta("message-9", 1, 0, "text", "草稿分支"),
+    });
+  });
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
+  assert.deepEqual(upstream, []);
+
+  // 屏障之后的生命周期事件仍正常处理：收束路径可正常到达。
+  assert.doesNotThrow(() => {
+    fake.emitLifecycle(AGENT_ID, { type: "agent_settled", expected_generation: 0 });
+  });
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
 });
