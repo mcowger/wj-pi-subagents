@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  MouseRegion,
+  type TuiMouseEvent,
+} from "@earendil-works/pi-tui";
+import {
   CHILD_REPLY_SCHEMA,
   CHILD_REPLY_VERSION,
   CHILD_TERMINAL_SCHEMA,
   encodeChildReplyEnvelope,
+  encodeTerminalNotice,
   parseChildReplyEnvelope,
   parseTerminalNotice,
   type ChildReplyEnvelope,
@@ -15,9 +20,12 @@ import {
 } from "../src/child-reply-coordinator.ts";
 import {
   ParentReplyInbox,
+  registerParentReplyMessageRenderers,
   WJ_PI_SUBAGENTS_FINAL_TYPE,
   WJ_PI_SUBAGENTS_MESSAGE_TYPE,
   WJ_PI_SUBAGENTS_TERMINAL_TYPE,
+  type ParentReplyMessageRenderer,
+  type ParentReplyMessageTheme,
 } from "../src/parent-reply-inbox.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
@@ -189,4 +197,142 @@ test("父端 fire-and-forget 提交决定消息事件，context/UI 异常不撤�
   });
   assert.equal(terminalInbox.acceptTerminal(AGENT_ID), true);
   assert.deepEqual(terminalMessages, [WJ_PI_SUBAGENTS_TERMINAL_TYPE]);
+});
+
+
+type FgCall = { readonly color: string; readonly text: string };
+
+function parentTheme(calls: FgCall[] = []): ParentReplyMessageTheme {
+  return {
+    fg: (color, text) => {
+      calls.push({ color, text });
+      return text;
+    },
+    bg: (_color, text) => text,
+    bold: (text) => text,
+  };
+}
+
+function renderers(): Map<string, ParentReplyMessageRenderer> {
+  const registered = new Map<string, ParentReplyMessageRenderer>();
+  registerParentReplyMessageRenderers({
+    registerMessageRenderer(customType, renderer): void {
+      registered.set(customType, renderer);
+    },
+  });
+  return registered;
+}
+
+function customReplyMessage(
+  kind: "message" | "final_report",
+  payload: string,
+): unknown {
+  return {
+    customType: kind === "message" ? WJ_PI_SUBAGENTS_MESSAGE_TYPE : WJ_PI_SUBAGENTS_FINAL_TYPE,
+    content: [{ type: "text", text: encodeChildReplyEnvelope(envelope(kind, payload)) }],
+    details: { agent_id: AGENT_ID, kind },
+  };
+}
+
+function terminalMessage(): unknown {
+  return {
+    customType: WJ_PI_SUBAGENTS_TERMINAL_TYPE,
+    content: [{
+      type: "text",
+      text: encodeTerminalNotice({
+        schema: CHILD_TERMINAL_SCHEMA,
+        version: CHILD_REPLY_VERSION,
+        kind: "terminal",
+        agent_id: AGENT_ID,
+        state: "failed",
+        error_code: "runtime_fault",
+      }),
+    }],
+    details: { agent_id: AGENT_ID, kind: "terminal" },
+  };
+}
+
+function mouseEvent(
+  type: TuiMouseEvent["type"],
+  button: TuiMouseEvent["button"],
+): TuiMouseEvent {
+  return {
+    type,
+    button,
+    x: 1,
+    y: 1,
+    screenX: 1,
+    screenY: 1,
+    width: 120,
+    height: 20,
+    shift: false,
+    alt: false,
+    ctrl: false,
+  };
+}
+
+test("消息卡片折叠为六行正文加分段提示，并仅响应左键 click", () => {
+  const registered = renderers();
+  const renderer = registered.get(WJ_PI_SUBAGENTS_MESSAGE_TYPE);
+  assert.ok(renderer);
+  const calls: FgCall[] = [];
+  const payload = Array.from({ length: 8 }, (_, index) => `payload-${index + 1}`).join("\n");
+  const component = renderer(
+    customReplyMessage("message", payload),
+    { expanded: false, outputPad: 0 },
+    parentTheme(calls),
+  );
+  assert.ok(component instanceof MouseRegion);
+  const region = component as MouseRegion;
+
+  assert.match(component.render(120).join("\n"), /payload-1/u);
+  assert.match(component.render(120).join("\n"), /\.\.\. \(2 more lines, ctrl\+o to expand\)/u);
+  assert.doesNotMatch(component.render(120).join("\n"), /payload-7/u);
+  assert.deepEqual(
+    calls.filter(({ text }) => [
+      "... (2 more lines,",
+      " ",
+      "ctrl+o",
+      " to expand)",
+    ].includes(text)).slice(-4),
+    [
+      { color: "customMessageText", text: "... (2 more lines," },
+      { color: "customMessageText", text: " " },
+      { color: "dim", text: "ctrl+o" },
+      { color: "customMessageText", text: " to expand)" },
+    ],
+  );
+
+  assert.equal(region.handleMouse(mouseEvent("press", "left")), undefined);
+  assert.doesNotMatch(component.render(120).join("\n"), /payload-7/u);
+  assert.equal(region.handleMouse(mouseEvent("click", "right")), undefined);
+  assert.doesNotMatch(component.render(120).join("\n"), /payload-7/u);
+  assert.deepEqual(region.handleMouse(mouseEvent("click", "left")), { handled: true });
+  assert.match(component.render(120).join("\n"), /payload-8/u);
+  assert.doesNotMatch(component.render(120).join("\n"), /more lines/u);
+  assert.deepEqual(region.handleMouse(mouseEvent("click", "left")), { handled: true });
+  assert.doesNotMatch(component.render(120).join("\n"), /payload-7/u);
+});
+
+test("final_report 可点击，terminal 卡片保持非 MouseRegion，expanded 初值生效", () => {
+  const registered = renderers();
+  const finalRenderer = registered.get(WJ_PI_SUBAGENTS_FINAL_TYPE);
+  const terminalRenderer = registered.get(WJ_PI_SUBAGENTS_TERMINAL_TYPE);
+  assert.ok(finalRenderer);
+  assert.ok(terminalRenderer);
+  const payload = Array.from({ length: 7 }, (_, index) => `report-${index + 1}`).join("\n");
+  const expanded = finalRenderer(
+    customReplyMessage("final_report", payload),
+    { expanded: true, outputPad: 0 },
+    parentTheme(),
+  );
+  assert.ok(expanded instanceof MouseRegion);
+  assert.match(expanded.render(120).join("\n"), /report-7/u);
+
+  const terminal = terminalRenderer(
+    terminalMessage(),
+    { expanded: false, outputPad: 0 },
+    parentTheme(),
+  );
+  assert.equal(terminal instanceof MouseRegion, false);
 });

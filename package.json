@@ -35,16 +35,16 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.4",
-    "@earendil-works/pi-tui": ">=0.84.4"
+    "@earendil-works/pi-coding-agent": ">=0.85.1",
+    "@earendil-works/pi-tui": ">=0.85.1"
   },
   "dependencies": {
     "semver": "7.8.0",
     "yaml": "2.9.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.4",
-    "@earendil-works/pi-tui": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1",
     "@types/node": "24.12.4",
     "@types/semver": "7.7.1",
     "typescript": "5.9.3"
@@ -57,7 +57,7 @@
     "prepack": "npm run build:bridge",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build:bridge",
-    "test": "node --experimental-strip-types --test-reporter=dot --test test/*.test.ts",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
     "check": "npm run typecheck && npm test",
     "compat:pi": "node scripts/pi-compat-smoke.mjs"
   },
@@ -67,6 +67,6 @@
     ]
   },
   "wjPiSubagents": {
-    "requiresPi": ">=0.84.4"
+    "requiresPi": ">=0.85.1"
   }
 }

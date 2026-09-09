@@ -1,5 +1,6 @@
 import {
   Markdown,
+  MouseRegion,
   truncateToWidth,
   visibleWidth,
   type MarkdownTheme,
@@ -20,7 +21,9 @@ import {
   type AgentToolRenderComponent,
   type AgentToolRenderTheme,
   type SafeRenderLine,
+  type SafeRenderSegment,
 } from "./agent-tool-rendering.ts";
+import { expandHintSegments } from "./expand-hint.ts";
 import type { ManagedRpcReply } from "./managed-rpc-node.ts";
 import { isCanonicalUuid } from "./tree-controller.ts";
 
@@ -29,7 +32,7 @@ export const WJ_PI_SUBAGENTS_FINAL_TYPE = "wj-pi-subagents-final-report" as cons
 export const WJ_PI_SUBAGENTS_TERMINAL_TYPE = "wj-pi-subagents-terminal" as const;
 
 export interface ParentConversationApi {
-  /** Mirrors Pi 0.84.4 ExtensionAPI.sendMessage, which is fire-and-forget. */
+  /** Mirrors Pi 0.85.1 ExtensionAPI.sendMessage, which is fire-and-forget. */
   sendMessage(message: unknown, options?: unknown): void;
 }
 
@@ -234,7 +237,7 @@ export function registerParentReplyMessageRenderers(
 }
 
 type VisibleKind = "message" | "final_report" | "terminal";
-const MAX_COLLAPSED_PAYLOAD_LINES = 8;
+const MAX_COLLAPSED_PAYLOAD_LINES = 6;
 
 function createParentReplyMessageRenderer(
   kind: VisibleKind,
@@ -294,13 +297,19 @@ function createParentReplyMessageRenderer(
       createParentReplyMarkdownTheme(theme),
       { color: (text) => theme.fg("customMessageText", text) },
     );
-    return new ParentReplyMarkdownComponent(
+    const component = new ParentReplyMarkdownComponent(
       createSafeTextComponent(headerLines, theme, {}),
       markdown,
       theme,
       renderOptions.expanded === true,
       renderOptions.outputPad ?? 1,
     );
+    if (kind === "terminal") return component;
+    return new MouseRegion(component, (event) => {
+      if (event.type !== "click" || event.button !== "left") return undefined;
+      component.toggleExpanded();
+      return { handled: true };
+    });
   };
 }
 
@@ -309,7 +318,7 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
   private readonly header: AgentToolRenderComponent;
   private readonly payload: AgentToolRenderComponent;
   private readonly theme: ParentReplyMessageTheme;
-  private readonly expanded: boolean;
+  private expanded: boolean;
   private readonly requestedPadding: number;
 
   constructor(
@@ -326,6 +335,10 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
     this.requestedPadding = requestedPadding;
   }
 
+  toggleExpanded(): void {
+    this.expanded = !this.expanded;
+  }
+
   render(width: number): string[] {
     const availableWidth = Number.isSafeInteger(width) && width > 0 ? width : 1;
     const paddingX = safeMessagePadding(this.requestedPadding, availableWidth);
@@ -334,8 +347,15 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
     const visiblePayloadLines = this.expanded || payloadLines.length <= MAX_COLLAPSED_PAYLOAD_LINES
       ? payloadLines
       : [
-        ...payloadLines.slice(0, MAX_COLLAPSED_PAYLOAD_LINES - 1),
-        this.theme.fg("customMessageText", "… (expand to view full content)"),
+        ...payloadLines.slice(0, MAX_COLLAPSED_PAYLOAD_LINES),
+        renderExpandHintSegments(
+          this.theme,
+          expandHintSegments(
+            this.theme,
+            "customMessageText",
+            payloadLines.length - MAX_COLLAPSED_PAYLOAD_LINES,
+          ),
+        ),
       ];
     const contentLines = [
       ...this.header.render(contentWidth),
@@ -362,6 +382,16 @@ class ParentReplyMarkdownComponent implements AgentToolRenderComponent {
     this.header.invalidate();
     this.payload.invalidate();
   }
+}
+
+function renderExpandHintSegments(
+  theme: ParentReplyMessageTheme,
+  segments: readonly SafeRenderSegment[],
+): string {
+  return segments.map((segment) => theme.fg(
+    segment.color,
+    segment.bold === true ? theme.bold(segment.text) : segment.text,
+  )).join("");
 }
 
 function createParentReplyMarkdownTheme(theme: ParentReplyMessageTheme): MarkdownTheme {

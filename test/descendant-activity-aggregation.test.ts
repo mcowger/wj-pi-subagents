@@ -143,7 +143,7 @@ test("子模式扩展把本进程完整活动规范化上行且不在本层缓�
     await activator(api as unknown as ExtensionApiSurface, {
       ok: true,
       nodeVersion: process.versions.node,
-      piVersion: "0.84.4",
+      piVersion: "0.85.1",
       platform: process.platform,
       processTreeAdapter: {} as never,
     } as AvailableHostCapabilities);

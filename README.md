@@ -8,7 +8,7 @@ No built-in templates · No preset workflows · Everything is yours to shape
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D%2022.19.0-5FA04E?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![Pi](https://img.shields.io/badge/Pi-%3E%3D%200.84.4-2563EB)](https://github.com/earendil-works/pi-mono)
+[![Pi](https://img.shields.io/badge/Pi-%3E%3D%200.85.1-2563EB)](https://github.com/earendil-works/pi-mono)
 
 </div>
 
@@ -31,14 +31,14 @@ No built-in templates · No preset workflows · Everything is yours to shape
 | ♻️ | **Context reuse** | The same subagent can take on tasks consecutively while keeping its own session context |
 | 🎛️ | **Controlled management** | A parent agent can only manage its direct children, supporting wait, status query, interrupt, reuse, and termination |
 | 👁️ | **Visible status** | The TUI shows the status of direct subagents; `/agents` shows the full agent tree within the current session scope |
-| 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 0.84.4`; each root session and subagent manages its own context through its independent Pi session |
+| 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 0.85.1`; each root session and subagent manages its own context through its independent Pi session |
 
 ## 📦 Requirements
 
 | Item | Requirement |
 | --- | --- |
 | Node.js | `>= 22.19.0` |
-| Pi | `>= 0.84.4` |
+| Pi | `>= 0.85.1` |
 
 ## 🚀 Installation
 
@@ -225,9 +225,9 @@ Runtime configuration is read when the root session starts. After changing it, e
 
 ## 🗜️ Context Compaction
 
-Pi `>= 0.84.4` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
+Pi `>= 0.85.1` decides on and runs context compaction through the native post-tool flow after each tool execution. The root session and every subagent are independent Pi sessions; each compacts and continues based on its actual context state, with no extra plugin or coordination protocol required.
 
-This plugin observes Pi's native compaction lifecycle events and `get_state.isCompacting` to calibrate agent status and TUI activity hints. Messages from the parent to a child Pi are still adjudicated by Pi command responses; if Pi rejects a message because it is compacting, the caller receives a retryable `compaction_active`. Pi 0.84.4 has no `abort_compaction` RPC, so an interrupt during compaction returns `compaction_active` based on the current native compaction observation instead of calling the plain `abort`, which cannot cancel compaction. Child replies use Pi's fire-and-forget extension message API; a successful result only means the parent extension runtime has accepted the submission.
+This plugin observes Pi's native compaction lifecycle events and `get_state.isCompacting` to calibrate agent status and TUI activity hints. Messages from the parent to a child Pi are still adjudicated by Pi command responses; if Pi rejects a message because it is compacting, the caller receives a retryable `compaction_active`. Pi has no `abort_compaction` RPC, so an interrupt during compaction returns `compaction_active` based on the current native compaction observation instead of calling the plain `abort`, which cannot cancel compaction. Child replies use Pi's fire-and-forget extension message API; a successful result only means the parent extension runtime has accepted the submission.
 
 ## 🔄 Update and Uninstall
 

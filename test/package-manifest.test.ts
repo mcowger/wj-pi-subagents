@@ -36,7 +36,7 @@ test("npm test 先干净重建 bridge，避免源码协议与旧 dist 进程不�
   assert.equal(existsSync(join(repositoryRoot, "scripts", "build-bridge.mjs")), true);
 });
 
-test("package manifest、lock 和 CI 固定 Pi 0.84.4 clean-break 基线", () => {
+test("package manifest、lock 和 CI 固定 Pi 0.85.1 clean-break 基线", () => {
   const manifest = JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
     peerDependencies?: Record<string, unknown>;
     devDependencies?: Record<string, unknown>;
@@ -46,13 +46,13 @@ test("package manifest、lock 和 CI 固定 Pi 0.84.4 clean-break 基线", () =>
     packages?: Record<string, Record<string, unknown>>;
   };
 
-  assert.equal(manifest.wjPiSubagents?.requiresPi, ">=0.84.4");
-  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], ">=0.84.4");
-  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], ">=0.84.4");
-  assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], "0.84.4");
-  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.84.4");
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "0.84.4");
-  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, "0.84.4");
+  assert.equal(manifest.wjPiSubagents?.requiresPi, ">=0.85.1");
+  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-coding-agent"], ">=0.85.1");
+  assert.equal(manifest.peerDependencies?.["@earendil-works/pi-tui"], ">=0.85.1");
+  assert.equal(manifest.devDependencies?.["@earendil-works/pi-coding-agent"], "0.85.1");
+  assert.equal(manifest.devDependencies?.["@earendil-works/pi-tui"], "0.85.1");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-coding-agent"]?.version, "0.85.1");
+  assert.equal(lock.packages?.["node_modules/@earendil-works/pi-tui"]?.version, "0.85.1");
 
   const workflow = parseYaml(readFileSync(join(repositoryRoot, ".github", "workflows", "ci.yml"), "utf8")) as {
     jobs?: { test?: { steps?: readonly { readonly name?: unknown; readonly run?: unknown }[] } };
@@ -60,7 +60,7 @@ test("package manifest、lock 和 CI 固定 Pi 0.84.4 clean-break 基线", () =>
   const installPi = workflow.jobs?.test?.steps?.find((step) => step.name === "Install Pi");
   assert.equal(
     installPi?.run,
-    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.84.4",
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1",
   );
 });
 

@@ -592,11 +592,10 @@ test("活动流转发异常被屏障吞掉：不沿 onEvent 传播，后续事�
 
   // 三个活动分支的转发失败都被屏障吞掉：面板数据静默缺失，不炸事件回调。
   assert.doesNotThrow(() => {
-    fake.emitRaw(Object.freeze({
+    fake.emitRaw({
       kind: "activity",
-      agent_id: AGENT_ID,
-      activity: messageEntry(AGENT_ID, "缓存分支条目"),
-    }) as RpcSupervisorEvent);
+      activity: { phase: "processing" },
+    });
     fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, "转发分支条目") });
     fake.emitActivityDisplay({
       agent_id: AGENT_ID,

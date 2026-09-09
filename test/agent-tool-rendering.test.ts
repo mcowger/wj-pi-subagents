@@ -693,19 +693,76 @@ test("未归类异常 message 有独立诊断长度上限", () => {
   assert.match(rendered, /…$/u);
 });
 
-test("send_message 在默认收起上下文中也完整展示消息正文", () => {
+test("send_message 收起时显示六行正文和分段着色的展开提示", () => {
+  const calls: Array<{ readonly color: string; readonly text: string }> = [];
+  const recordingTheme = {
+    fg: (color: string, text: string): string => {
+      calls.push({ color, text });
+      return text;
+    },
+    bold: (text: string): string => text,
+  };
+  const message = Array.from({ length: 8 }, (_, index) => `line-${index + 1}`).join("\n");
   const component = renderAgentToolCall(
     "send_message",
-    { agent_id: "agent-1", message: longMessage },
-    theme,
+    { agent_id: "agent-1", message },
+    recordingTheme,
     { expanded: false },
   );
-  const rendered = component.render(80).join("\n");
+  const rendered = component.render(120);
 
-  assert.match(rendered, /line-1/);
-  assert.match(rendered, /line-6/);
-  assert.doesNotMatch(rendered, /expand to view full content/);
+  assert.deepEqual(rendered, [
+    "send_message · agent-1",
+    "line-1",
+    "line-2",
+    "line-3",
+    "line-4",
+    "line-5",
+    "line-6",
+    "... (2 more lines, ctrl+o to expand)",
+  ]);
+  assert.deepEqual(
+    calls.slice(-4),
+    [
+      { color: "muted", text: "... (2 more lines," },
+      { color: "muted", text: " " },
+      { color: "dim", text: "ctrl+o" },
+      { color: "muted", text: " to expand)" },
+    ],
+  );
 });
+
+test("send_message 正文不超过六行时不追加提示，展开时显示完整正文", () => {
+  const message = Array.from({ length: 6 }, (_, index) => `line-${index + 1}`).join("\n");
+  const collapsed = renderAgentToolCall(
+    "send_message",
+    { agent_id: "agent-1", message },
+    theme,
+    { expanded: false },
+  ).render(80);
+  assert.deepEqual(collapsed, [
+    "send_message · agent-1",
+    "line-1",
+    "line-2",
+    "line-3",
+    "line-4",
+    "line-5",
+    "line-6",
+  ]);
+  assert.doesNotMatch(collapsed.join("\n"), /more lines|expand to view full content/u);
+
+  const expandedMessage = Array.from({ length: 8 }, (_, index) => `line-${index + 1}`).join("\n");
+  const expanded = renderAgentToolCall(
+    "send_message",
+    { agent_id: "agent-1", message: expandedMessage },
+    theme,
+    { expanded: true },
+  ).render(80);
+  assert.equal(expanded.length, 9);
+  assert.match(expanded.join("\n"), /line-8/u);
+  assert.doesNotMatch(expanded.join("\n"), /more lines|expand to view full content/u);
+});
+
 
 test("normal_reply 未展开时仍保留正文折叠", () => {
   const component = renderAgentToolCall(

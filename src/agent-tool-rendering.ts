@@ -29,6 +29,7 @@ import {
   type PublicErrorCode,
   type ScopedAgentTreeSnapshot,
 } from "./tree-controller.ts";
+import { expandHintSegments } from "./expand-hint.ts";
 
 const SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const UNSAFE_DISPLAY_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu;
@@ -44,6 +45,12 @@ export interface AgentToolRenderTheme {
     text: string,
   ): string;
   bold(text: string): string;
+}
+
+export interface SafeRenderSegment {
+  readonly text: string;
+  readonly color: Parameters<AgentToolRenderTheme["fg"]>[0];
+  readonly bold?: boolean;
 }
 
 export interface AgentToolRenderLookups {
@@ -88,6 +95,7 @@ export interface SafeRenderLine {
   readonly prefix?: string;
   readonly maxLines?: number;
   readonly overflowText?: string;
+  readonly overflowHint?: (hiddenLines: number) => readonly SafeRenderSegment[];
 }
 
 export interface SafeTextComponentOptions {
@@ -144,18 +152,32 @@ export class SafeTextComponent implements AgentToolRenderComponent {
     const contentWidth = Math.max(1, availableWidth - outputPad - horizontalPadding * 2);
     const rendered: string[] = [];
 
-    const renderLine = (line: SafeRenderLine, text: string): string => {
-      const styled = line.bold === true ? this.theme.bold(text) : text;
+    const renderLine = (
+      line: SafeRenderLine,
+      text: string,
+      isStyled = false,
+    ): string => {
+      const styledText = isStyled
+        ? text
+        : line.bold === true ? this.theme.bold(text) : text;
       const leftPad = " ".repeat(outputPad + horizontalPadding);
       if (background === undefined) {
-        return this.theme.fg(line.color, `${leftPad}${styled}`);
+        return isStyled
+          ? `${leftPad}${styledText}`
+          : this.theme.fg(line.color, `${leftPad}${styledText}`);
       }
       const rightPad = " ".repeat(Math.max(
         0,
         availableWidth - outputPad - horizontalPadding - displayWidth(text),
       ));
-      return background(this.theme.fg(line.color, `${leftPad}${styled}${rightPad}`));
+      const padded = `${leftPad}${styledText}${rightPad}`;
+      return background(isStyled ? padded : this.theme.fg(line.color, padded));
     };
+    const styleSegmentText = (segment: SafeRenderSegment, text: string): string =>
+      this.theme.fg(
+        segment.color,
+        segment.bold === true ? this.theme.bold(text) : text,
+      );
 
     for (const line of this.lines) {
       const prefix = sanitizeInline(line.prefix ?? "");
@@ -166,16 +188,47 @@ export class SafeTextComponent implements AgentToolRenderComponent {
       let wrapped = safeText
         .split("\n")
         .flatMap((part) => wrapToDisplayWidth(part, lineWidth));
+      let overflowHintSegments: readonly SafeRenderSegment[] | undefined;
       if (line.maxLines !== undefined && wrapped.length > line.maxLines) {
         const keep = Math.max(0, line.maxLines - 1);
-        wrapped = [
-          ...wrapped.slice(0, keep),
-          line.overflowText ?? "…",
-        ];
+        const hidden = wrapped.length - keep;
+        if (line.overflowHint !== undefined) {
+          try {
+            const segments: SafeRenderSegment[] = line.overflowHint(hidden).map((segment) => ({
+              text: sanitizeInline(segment.text),
+              color: segment.color,
+              ...(segment.bold === undefined ? {} : { bold: segment.bold }),
+            }));
+            if (segments.length > 0) {
+              overflowHintSegments = segments;
+              wrapped = wrapped.slice(0, keep);
+            }
+          } catch {
+            // A malformed optional hint must not break the safe text fallback.
+          }
+        }
+        if (overflowHintSegments === undefined) {
+          wrapped = [
+            ...wrapped.slice(0, keep),
+            line.overflowText ?? "…",
+          ];
+        }
       }
       for (const part of wrapped) {
         const text = truncateToDisplayWidth(`${prefix}${part}`, contentWidth);
         rendered.push(renderLine(line, text));
+      }
+      if (overflowHintSegments !== undefined) {
+        const plainHint = `${prefix}${overflowHintSegments.map((segment) => segment.text).join("")}`;
+        const styledHint = displayWidth(plainHint) > contentWidth
+          ? styleSegmentText(
+            overflowHintSegments[0]!,
+            truncateToDisplayWidth(plainHint, contentWidth),
+          )
+          : `${prefix}${overflowHintSegments
+            .map((segment) => styleSegmentText(segment, segment.text))
+            .join("")}`;
+        rendered.push(renderLine(line, styledHint, true));
       }
     }
 
@@ -281,8 +334,7 @@ function createMessageCallComponent(
 ): AgentToolRenderComponent {
   const agentId = name === "normal_reply" ? undefined : readOptionalString(input, "agent_id");
   const message = readOptionalString(input, "message") ?? "";
-  // send_message 的正文是父代理提交的协作内容，始终完整展示。
-  const showFullMessage = expanded || name === "send_message";
+  const showFullMessage = expanded;
   const lines: SafeRenderLine[] = [{
     text: agentId === undefined ? name : `${name} · ${agentId}`,
     color: "toolTitle",
@@ -291,7 +343,10 @@ function createMessageCallComponent(
     text: message,
     color: "dim",
     multiline: true,
-    ...(showFullMessage ? {} : {
+    ...(showFullMessage ? {} : name === "send_message" ? {
+      maxLines: 7,
+      overflowHint: (hiddenLines: number) => expandHintSegments(theme, "muted", hiddenLines),
+    } : {
       maxLines: MAX_COLLAPSED_BODY_LINES,
       overflowText: "… (expand to view full content)",
     }),
