@@ -171,12 +171,12 @@ test("工具开始立即建立运行中条目，结束原地更新同一条目�
     toolStart("t1", "read_file"),
   ], { viewport_height: 20 });
   let lines = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(lines, /read_file ↻/u);
+  assert.match(lines, /↻ read_file/u);
   assert.doesNotMatch(lines, /✓|×/u);
 
   viewer.syncFrom([toolStart("t1", "read_file"), toolEnd("t1", "read_file", false)]);
   lines = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(lines, /read_file ✓/u);
+  assert.match(lines, /✓ read_file/u);
   assert.doesNotMatch(lines, /↻/u);
   // 不显示执行耗时。
   assert.doesNotMatch(lines, /ms|耗时|elapsed/u);
@@ -193,49 +193,65 @@ test("工具开始立即建立运行中条目，结束原地更新同一条目�
     toolEnd("t2", "run_cmd", true),
   ]);
   lines = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(lines, /read_file ✓/u);
-  assert.match(lines, /run_cmd ×/u);
+  assert.match(lines, /✓ read_file/u);
+  assert.match(lines, /× run_cmd/u);
 });
 
-test("工具标题使用粗体强调色，右侧状态图标使用运行、成功与失败颜色", () => {
+test("工具状态图标前置，标题颜色跟随状态，折叠指示符始终为 dim", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
     bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
     bold: (text: string): string => `<bold>${text}</bold>`,
   };
+  const summary = { tool: "bash", command: "echo ok", timeout: 5 } as const;
 
   const running = new AgentActivityViewerModel(viewerAgent(), [
-    toolStart("t1", "read_file"),
+    toolStart("t1", "bash", "pi_native", INCARNATION_ID, summary),
   ], { viewport_height: 20 });
-  const runningLines = renderAgentActivityViewerSurface(running, 120, theme).join("\n");
+  const runningLine = running.render(120).find((line) => line.includes("bash"));
+  assert.equal(runningLine, "▸ ↻ bash · timeout 5");
+  const runningSurface = renderAgentActivityViewerSurface(running, 120, theme).join("\n");
   assert.match(
-    runningLines,
-    /<fg:accent><bold>read_file<\/bold><\/fg:accent> <fg:accent>↻<\/fg:accent>/u,
+    runningSurface,
+    /<fg:dim>▸<\/fg:dim> <fg:accent>↻<\/fg:accent> <fg:accent><bold>bash · timeout 5<\/bold><\/fg:accent>/u,
   );
 
   const success = new AgentActivityViewerModel(viewerAgent(), [
-    toolStart("t1", "read_file"),
-    toolEnd("t1", "read_file", false),
+    toolEnd("t1", "bash", false, "pi_native", INCARNATION_ID, summary),
   ], { viewport_height: 20 });
-  const successLines = renderAgentActivityViewerSurface(success, 120, theme).join("\n");
+  const successLine = success.render(120).find((line) => line.includes("bash"));
+  assert.equal(successLine, "▸ ✓ bash · timeout 5");
+  const successSurface = renderAgentActivityViewerSurface(success, 120, theme).join("\n");
   assert.match(
-    successLines,
-    /<fg:accent><bold>read_file<\/bold><\/fg:accent> <fg:dim>✓<\/fg:dim>/u,
+    successSurface,
+    /<fg:dim>▸<\/fg:dim> <fg:dim>✓<\/fg:dim> <fg:dim><bold>bash · timeout 5<\/bold><\/fg:dim>/u,
   );
-  assert.doesNotMatch(successLines, /<fg:error>/u);
+  assert.doesNotMatch(successSurface, /<fg:error>/u);
 
   const failure = new AgentActivityViewerModel(viewerAgent(), [
-    toolStart("t1", "read_file"),
-    toolEnd("t1", "read_file", true),
+    toolEnd("t1", "bash", true, "pi_native", INCARNATION_ID, summary),
   ], { viewport_height: 20 });
-  const failureLines = renderAgentActivityViewerSurface(failure, 120, theme).join("\n");
+  const failureLine = failure.render(120).find((line) => line.includes("bash"));
+  assert.equal(failureLine, "▸ × bash · timeout 5");
+  const failureSurface = renderAgentActivityViewerSurface(failure, 120, theme).join("\n");
   assert.match(
-    failureLines,
-    /<fg:accent><bold>read_file<\/bold><\/fg:accent> <fg:error>×<\/fg:error>/u,
+    failureSurface,
+    /<fg:dim>▸<\/fg:dim> <fg:error>×<\/fg:error> <fg:error><bold>bash · timeout 5<\/bold><\/fg:error>/u,
+  );
+
+  const plain = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t2", "read_file", false),
+  ], { viewport_height: 20 });
+  const plainLine = plain.render(120).find((line) => line.includes("read_file"));
+  assert.equal(plainLine, "✓ read_file");
+  const plainSurface = renderAgentActivityViewerSurface(plain, 120, theme).join("\n");
+  assert.match(
+    plainSurface,
+    /<fg:dim>✓<\/fg:dim> <fg:dim><bold>read_file<\/bold><\/fg:dim>/u,
   );
 });
 
-test("安全兜底只显示工具名与右侧状态，不显示参数、结果或错误正文", () => {
+test("安全兜底只显示工具名与前置状态，不显示参数、结果或错误正文", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     toolStart("t1", "read_file", "unknown"),
     toolEnd("t1", "read_file", true, "unknown"),
@@ -244,8 +260,8 @@ test("安全兜底只显示工具名与右侧状态，不显示参数、结果�
   ], { viewport_height: 20 });
   const body = viewer.render(160).slice(1, -1).join("\n");
 
-  assert.match(body, /read_file ×/u);
-  assert.match(body, /query_database ✓/u);
+  assert.match(body, /× read_file/u);
+  assert.match(body, /✓ query_database/u);
   // 任何载荷、错误正文与可展开入口都不出现。
   assert.doesNotMatch(body, /collapsed|Enter to expand/u);
   assert.equal(
@@ -262,12 +278,12 @@ test("结束先到时自建完成条目，迟到开始被忽略且不重置状�
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     toolEnd("t1", "read_file", false),
   ], { viewport_height: 20 });
-  assert.match(viewer.render(160).slice(1, -1).join("\n"), /read_file ✓/u);
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /✓ read_file/u);
 
   // 迟到开始不得把完成条目退回运行中。
   viewer.syncFrom([toolEnd("t1", "read_file", false), toolStart("t1", "read_file")]);
   const body = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(body, /read_file ✓/u);
+  assert.match(body, /✓ read_file/u);
   assert.doesNotMatch(body, /↻/u);
   assert.equal(viewer.getPublicState().event_count, 2);
 });
@@ -281,7 +297,7 @@ test("重复开始与重复结束保持幂等", () => {
   ], { viewport_height: 20 });
 
   const body = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(body, /read_file ✓/u);
+  assert.match(body, /✓ read_file/u);
   assert.doesNotMatch(body, /↻/u);
   assert.equal(
     viewer.render(160).slice(1, -1).filter((line) => line.includes("read_file")).length,
@@ -299,7 +315,7 @@ test("代理进入 idle 时运行中工具收束为警告 result unavailable，�
 
   // 收束后身份匹配的结束事实回填真实状态。
   viewer.syncFrom([toolStart("t1", "read_file"), toolEnd("t1", "read_file", false)]);
-  assert.match(viewer.render(160).slice(1, -1).join("\n"), /read_file ✓/u);
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /✓ read_file/u);
   assert.doesNotMatch(viewer.render(160).slice(1, -1).join("\n"), /result unavailable/u);
 });
 
@@ -318,7 +334,7 @@ test("代理进入 failed 与 terminated 时按各自语义收束运行中工具
 
   // 终态收束后匹配结束仍可回填；失败结束回填为真实失败。
   terminated.syncFrom([toolStart("t1", "read_file"), toolEnd("t1", "read_file", true)]);
-  assert.match(terminated.render(160).slice(1, -1).join("\n"), /read_file ×/u);
+  assert.match(terminated.render(160).slice(1, -1).join("\n"), /× read_file/u);
   assert.doesNotMatch(
     terminated.render(160).slice(1, -1).join("\n"),
     /terminated before result/u,
@@ -336,7 +352,7 @@ test("非终态生命周期不收束运行中工具，收束只发生在 idle/fa
       toolStart("t1", "read_file"),
     ], { viewport_height: 20 });
     const body = viewer.render(160).slice(1, -1).join("\n");
-    assert.match(body, /read_file ↻/u, state);
+    assert.match(body, /↻ read_file/u, state);
     assert.doesNotMatch(body, /result unavailable|terminated before result/u, state);
   }
 });
@@ -345,11 +361,32 @@ test("生命周期变化立即失效投影：working 期间进入 idle 即收束
   const viewer = new AgentActivityViewerModel(viewerAgent("working"), [
     toolStart("t1", "read_file"),
   ], { viewport_height: 20 });
-  assert.match(viewer.render(160).slice(1, -1).join("\n"), /read_file ↻/u);
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /↻ read_file/u);
 
   // 不需要任何新事件：进入 idle 后运行中工具立即收束为警告。
   assert.equal(viewer.updateLifecycle("idle"), "changed");
   assert.match(viewer.render(160).slice(1, -1).join("\n"), /result unavailable/u);
+});
+
+test("wait_agent 早到于 working 快照且尚无摘要时显示等待中", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent("idle"), [
+    toolStart("previous", "read_file"),
+  ], { viewport_height: 20 });
+  assert.match(viewer.render(160).slice(1, -1).join("\n"), /result unavailable/u);
+
+  // 工具开始事件可能先于 working 生命周期快照到达；不能继承上一回合收束。
+  viewer.appendEntry(toolStart("waiting", "wait_agent", "plugin"));
+  let body = viewer.render(160).slice(1, -1);
+  let waitLine = body.find((line) => line.includes("wait_agent"));
+  assert.equal(waitLine, "↻ wait_agent · …");
+  assert.doesNotMatch(waitLine ?? "", /result unavailable/u);
+  // 上一回合已经收束的工具仍保持收束，不被新工具反向恢复。
+  assert.ok(body.some((line) => line.includes("read_file · result unavailable")), body.join("\n"));
+
+  assert.equal(viewer.updateLifecycle("working"), "changed");
+  body = viewer.render(160).slice(1, -1);
+  waitLine = body.find((line) => line.includes("wait_agent"));
+  assert.equal(waitLine, "↻ wait_agent · …");
 });
 
 test("不同运行实例的同名工具活动不互相回填或合并", () => {
@@ -363,8 +400,8 @@ test("不同运行实例的同名工具活动不互相回填或合并", () => {
   viewer.syncFrom([toolEnd("t1", "read_file", false, "unknown", otherIncarnation)]);
   const body = viewer.render(160).slice(1, -1).join("\n");
   assert.match(body, /terminated before result/u);
-  assert.doesNotMatch(body, /read_file ✓/u);
-  assert.doesNotMatch(body, /read_file ↻/u);
+  assert.doesNotMatch(body, /✓ read_file/u);
+  assert.doesNotMatch(body, /↻ read_file/u);
 });
 
 test("工具取消按普通失败显示", () => {
@@ -379,7 +416,7 @@ test("工具取消按普通失败显示", () => {
   ], { viewport_height: 20 });
 
   const body = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(body, /bash ×/u);
+  assert.match(body, /× bash/u);
   const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
   assert.match(surface, /<fg:error>×<\/fg:error>/u);
 });
@@ -393,7 +430,7 @@ test("生命周期收束不可逆：回看与重放不会把收束条目退回�
 
   // lifecycle 回到 working 也不恢复运行中显示（收束只由条目事实回填）。
   viewer.updateLifecycle("working");
-  assert.doesNotMatch(viewer.render(160).slice(1, -1).join("\n"), /read_file ↻/u);
+  assert.doesNotMatch(viewer.render(160).slice(1, -1).join("\n"), /↻ read_file/u);
 });
 
 test("text block 独立按正常 Markdown 完整渲染，不加角色标签或分隔线", () => {
@@ -465,7 +502,10 @@ test("展开 thinking 后标题变为 ▾ 且粗体强调，正文每行带 │ 
     bold: (text: string): string => `<bold>${text}</bold>`,
   };
   const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
-  assert.match(surface, /<fg:accent><bold>▾ Thinking<\/bold><\/fg:accent>/u);
+  assert.match(
+    surface,
+    /<fg:dim>▾<\/fg:dim> <fg:accent><bold>Thinking<\/bold><\/fg:accent>/u,
+  );
 });
 
 test("相邻 thinking 合并为同一折叠条目，被 text 隔开的 thinking 保持分离", () => {
@@ -885,7 +925,7 @@ test("read 运行中显示 path/offset/limit，结束原地补充截断事实且
     }),
   ], { viewport_height: 20 });
   const running = dedicatedToolLine(viewer, "read");
-  assert.match(running ?? "", /^read · src\/index\.ts · offset 5 · limit 20 ↻$/u);
+  assert.match(running ?? "", /^↻ read · src\/index\.ts · offset 5 · limit 20$/u);
   assert.doesNotMatch(running ?? "", /truncated/u);
 
   viewer.syncFrom([
@@ -897,7 +937,7 @@ test("read 运行中显示 path/offset/limit，结束原地补充截断事实且
     }),
   ]);
   const done = dedicatedToolLine(viewer, "read");
-  assert.match(done ?? "", /^read · src\/index\.ts · offset 5 · limit 20 · truncated \(lines\) ✓$/u);
+  assert.match(done ?? "", /^✓ read · src\/index\.ts · offset 5 · limit 20 · truncated \(lines\)$/u);
   assert.equal(done, done?.trimEnd());
   // 专用摘要仍是一个条目一行。
   assert.equal(viewer.render(160).slice(1, -1).filter((line) => line.includes("src/index.ts")).length, 1);
@@ -994,7 +1034,7 @@ test("专用工具失败保留统一标题，展开错误为带引导线的红�
   const collapsed = viewer.render(160).slice(1, -1);
   const summaryLine = collapsed.find((line) => line.includes("read"));
   // 失败摘要仍是输入参数，不附带成功侧统计，并有折叠标记。
-  assert.match(summaryLine ?? "", /^▸ read · src\/index\.ts · offset 9000 ×$/u);
+  assert.match(summaryLine ?? "", /^▸ × read · src\/index\.ts · offset 9000$/u);
   assert.doesNotMatch(summaryLine ?? "", /truncated/u);
   assert.match(summaryLine ?? "", /▸/u);
   // 错误正文默认不展开。
@@ -1040,7 +1080,7 @@ test("结束先到的专用工具仍自包含摘要；运行中收束后不可�
     toolStart("t2", "read", "pi_native", INCARNATION_ID, { tool: "read", path: "pending.txt" }),
   ], { viewport_height: 20 });
   const body = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(body, /ls · src ✓/u);
+  assert.match(body, /✓ ls · src/u);
   // 收束后的运行中工具保留输入参数摘要但无错误可展开。
   assert.match(body, /read · pending\.txt · result unavailable/u);
   for (const key of viewer.getExpandedKeys()) {
@@ -1086,8 +1126,8 @@ test("未知来源与同名覆盖工具仍走安全兜底，不显示专用摘�
   ], { viewport_height: 20 });
   const lines = viewer.render(160).slice(1, -1);
   // 兜底条目只显示工具名与状态，无分隔符或摘要字段。
-  assert.ok(lines.some((line) => line === "read ✓"), lines.join("\n"));
-  assert.ok(lines.some((line) => line === "grep ×"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "✓ read"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "× grep"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /·|glob|truncated/u);
 });
 
@@ -1108,7 +1148,7 @@ test("write 运行中与成功摘要都只显示 path，不显示写入统计", 
     toolStart("t1", "write", "pi_native", INCARNATION_ID, { tool: "write", path: "out/result.md" }),
   ], { viewport_height: 20 });
   const running = dedicatedToolLine(viewer, "write");
-  assert.match(running ?? "", /^write · out\/result\.md ↻$/u);
+  assert.match(running ?? "", /^↻ write · out\/result\.md$/u);
 
   viewer.syncFrom([
     toolStart("t1", "write", "pi_native", INCARNATION_ID, { tool: "write", path: "out/result.md" }),
@@ -1116,7 +1156,7 @@ test("write 运行中与成功摘要都只显示 path，不显示写入统计", 
   ]);
   const done = dedicatedToolLine(viewer, "write");
   // 成功摘要仍只有 path：行数、字节数等写入统计不出现。
-  assert.match(done ?? "", /^write · out\/result\.md ✓$/u);
+  assert.match(done ?? "", /^✓ write · out\/result\.md$/u);
   assert.doesNotMatch(done ?? "", /lines|bytes/u);
   // 成功摘要不可展开，无折叠标记。
   assert.doesNotMatch(done ?? "", /▸|▾/u);
@@ -1127,12 +1167,12 @@ test("edit 成功摘要只显示 path，不显示编辑统计", () => {
     toolEnd("t1", "edit", false, "pi_native", INCARNATION_ID, { tool: "edit", path: "src/a.ts" }),
   ], { viewport_height: 20 });
   const line = dedicatedToolLine(viewer, "edit");
-  assert.match(line ?? "", /^edit · src\/a\.ts ✓$/u);
+  assert.match(line ?? "", /^✓ edit · src\/a\.ts$/u);
   assert.doesNotMatch(line ?? "", /edits|edits count/u);
   assert.doesNotMatch(line ?? "", /▸|▾/u);
 });
 
-test("write/edit 失败标题状态在右侧，展开错误正文逐行带引导线", () => {
+test("write/edit 失败标题状态前置，展开错误正文逐行带引导线", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
     bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
@@ -1147,11 +1187,11 @@ test("write/edit 失败标题状态在右侧，展开错误正文逐行带引导
   const collapsed = viewer.render(160).slice(1, -1);
   // 失败摘要只显示 path：无写入统计、无编辑统计。
   const writeLine = collapsed.find((line) => line.includes("write"));
-  assert.match(writeLine ?? "", /^▸ write · \/etc\/hosts ×$/u);
+  assert.match(writeLine ?? "", /^▸ × write · \/etc\/hosts$/u);
   assert.doesNotMatch(writeLine ?? "", /lines|bytes|edits/u);
   assert.match(writeLine ?? "", /▸/u);
   const editLine = collapsed.find((line) => line.includes("edit"));
-  assert.match(editLine ?? "", /^▸ edit · src\/a\.ts ×$/u);
+  assert.match(editLine ?? "", /^▸ × edit · src\/a\.ts$/u);
   assert.doesNotMatch(editLine ?? "", /edits/u);
   // 错误正文默认不展开。
   assert.doesNotMatch(collapsed.join("\n"), /permission denied/u);
@@ -1176,14 +1216,14 @@ test("bash 命令默认折叠，状态原地更新后保持展开状态", () => 
   });
   const viewer = new AgentActivityViewerModel(viewerAgent(), [start], { viewport_height: 20 });
   let lines = viewer.render(160).slice(1, -1);
-  assert.ok(lines.includes("▸ bash · timeout 5 ↻"), lines.join("\n"));
+  assert.ok(lines.includes("▸ ↻ bash · timeout 5"), lines.join("\n"));
   assert.ok(!lines.some((line) => line.includes(command)), lines.join("\n"));
   assert.match(viewer.getSelectedKey() ?? "", /tool-command:/u);
 
   // Shell 复用既有展开按键；展开后命令正文逐行带引导线。
   assert.equal(viewer.handleInput("\r"), "changed");
   lines = viewer.render(160).slice(1, -1);
-  assert.ok(lines.includes("▾ bash · timeout 5 ↻"), lines.join("\n"));
+  assert.ok(lines.includes("▾ ↻ bash · timeout 5"), lines.join("\n"));
   assert.ok(lines.includes(`│ ${command}`), lines.join("\n"));
 
   // 结束原地更新：标题状态变化，命令保持展开且内容不重排。
@@ -1192,7 +1232,7 @@ test("bash 命令默认折叠，状态原地更新后保持展开状态", () => 
   })]);
   lines = viewer.render(160).slice(1, -1);
   const summaryIndex = lines.findIndex((line) => line.includes("bash"));
-  assert.equal(lines[summaryIndex], "▾ bash · timeout 5 ✓");
+  assert.equal(lines[summaryIndex], "▾ ✓ bash · timeout 5");
   assert.equal(lines[summaryIndex + 1], `│ ${command}`);
   assert.equal(lines.filter((line) => line.includes(command)).length, 1, lines.join("\n"));
 });
@@ -1207,8 +1247,8 @@ test("bash 与 powershell 多行命令逐项折叠，展开后完整显示", () 
     }),
   ], { viewport_height: 20 });
   let lines = viewer.render(160).slice(1, -1);
-  assert.ok(lines.includes("▸ bash ✓"), lines.join("\n"));
-  assert.ok(lines.includes("▸ powershell ✓"), lines.join("\n"));
+  assert.ok(lines.includes("▸ ✓ bash"), lines.join("\n"));
+  assert.ok(lines.includes("▸ ✓ powershell"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /npm run build|Get-ChildItem/u);
 
   // 初始选择最新 powershell，随后 Tab 回到 bash；两项可同时保持展开。
@@ -1240,12 +1280,12 @@ test("bash 失败只显示状态与完整 command，不显示 stdout、stderr �
     ),
   ], { viewport_height: 20 });
   let lines = viewer.render(160).slice(1, -1);
-  assert.ok(lines.includes("▸ bash · timeout 5 ×"), lines.join("\n"));
+  assert.ok(lines.includes("▸ × bash · timeout 5"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /exit 1|stdout|stderr|exited with code/u);
 
   assert.equal(viewer.handleInput("\r"), "changed");
   lines = viewer.render(160).slice(1, -1);
-  assert.ok(lines.includes("▾ bash · timeout 5 ×"), lines.join("\n"));
+  assert.ok(lines.includes("▾ × bash · timeout 5"), lines.join("\n"));
   assert.ok(lines.includes("│ exit 1"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /stdout|stderr|exited with code/u);
   const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
@@ -1272,7 +1312,7 @@ test("未知来源 bash 走安全兜底，不显示命令展开入口", () => {
     toolEnd("t1", "bash", false, "unknown"),
   ], { viewport_height: 20 });
   const lines = viewer.render(160).slice(1, -1);
-  assert.ok(lines.some((line) => line === "bash ✓"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "✓ bash"), lines.join("\n"));
   assert.equal(lines.filter((line) => line.includes("bash")).length, 1);
   assert.equal(viewer.getSelectedKey(), undefined);
 });
@@ -1324,18 +1364,18 @@ test("五种插件工具的运行中摘要只显示白名单参数", () => {
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // 无载荷摘要行没有任何尾随字段。
-  assert.match(body, /get_agent_templates ↻\n/u);
+  assert.match(body, /↻ get_agent_templates\n/u);
   // spawn_agent：name 与 template ID，无 depth、无初始 state、无 agent_id。
-  assert.match(body, /spawn_agent · worker-a · worker ↻\n/u);
+  assert.match(body, /↻ spawn_agent · worker-a · worker\n/u);
   assert.doesNotMatch(body, /depth|initial|state:/u);
   // send_message：目标名称与固定八位短 ID，无 accepted；正文默认折叠。
-  assert.match(body, /▸ send_message · worker-b · 1b3f2a7c ↻/u);
+  assert.match(body, /▸ ↻ send_message · worker-b · 1b3f2a7c/u);
   assert.doesNotMatch(body, /accepted/u);
   assert.doesNotMatch(body, /任务正文/u);
   assert.match(body, /▸/u);
   // 消息类摘要只显示工具名；完整正文默认折叠。
-  assert.match(body, /▸ normal_reply ↻\n/u);
-  assert.match(body, /▸ final_report ↻\n/u);
+  assert.match(body, /▸ ↻ normal_reply\n/u);
+  assert.match(body, /▸ ↻ final_report\n/u);
   assert.doesNotMatch(body, /中间回复正文|最终报告正文/u);
 });
 
@@ -1353,18 +1393,18 @@ test("插件工具成功摘要显示模板数量与固定八位短 ID，不显�
   ], { viewport_height: 20 });
   const body = viewer.render(160).slice(1, -1).join("\n");
 
-  assert.match(body, /get_agent_templates · 7 templates ✓/u);
+  assert.match(body, /✓ get_agent_templates · 7 templates/u);
   // 模板 ID、描述等配置不出现。
   assert.doesNotMatch(body, /template_|描述|description/u);
-  assert.match(body, /spawn_agent · worker-a · worker · 1b3f2a7c ✓/u);
+  assert.match(body, /✓ spawn_agent · worker-a · worker · 1b3f2a7c/u);
   assert.doesNotMatch(body, /1b3f2a7c-9d4e/u);
   // send_message 成功也不显示 accepted；正文仍默认折叠可展开。
-  assert.match(body, /▸ send_message · worker-b · 1b3f2a7c ✓/u);
+  assert.match(body, /▸ ✓ send_message · worker-b · 1b3f2a7c/u);
   assert.doesNotMatch(body, /accepted/u);
   assert.doesNotMatch(body, /你好/u);
 });
 
-test("插件工具失败标题显示稳定错误码，右侧状态为错误色", () => {
+test("插件工具失败标题显示稳定错误码，前置状态为错误色", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
     bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
@@ -1386,15 +1426,15 @@ test("插件工具失败标题显示稳定错误码，右侧状态为错误色",
   ], { viewport_height: 20 });
   const body = viewer.render(160).slice(1, -1).join("\n");
 
-  assert.match(body, /get_agent_templates · internal_error ×/u);
+  assert.match(body, /× get_agent_templates · internal_error/u);
   // 失败摘要不携带模板数量事实。
   assert.doesNotMatch(body, /\d+ templates/u);
   // 失败 spawn 摘要没有 agent_id：行尾只有稳定错误码。
-  assert.match(body, /spawn_agent · worker-a · worker · spawn_failed ×\n/u);
-  // 失败正文保留：标题含稳定错误码，右侧状态标红，正文默认折叠。
-  assert.match(body, /▸ send_message · worker-b · 1b3f2a7c · agent_unavailable ×/u);
+  assert.match(body, /× spawn_agent · worker-a · worker · spawn_failed\n/u);
+  // 失败正文保留：标题含稳定错误码，前置状态标红，正文默认折叠。
+  assert.match(body, /▸ × send_message · worker-b · 1b3f2a7c · agent_unavailable/u);
   assert.doesNotMatch(body, /投递正文/u);
-  assert.match(body, /▸ normal_reply · reply_too_large ×/u);
+  assert.match(body, /▸ × normal_reply · reply_too_large/u);
   assert.doesNotMatch(body, /过长回复正文/u);
 
   const surface = renderAgentActivityViewerSurface(viewer, 160, theme).join("\n");
@@ -1428,7 +1468,7 @@ test("消息工具展开为带引导线的 Markdown，状态变化不折叠正�
     tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "第一行\n**加粗正文**", name: "worker-b",
   })]);
   body = viewer.render(160).slice(1, -1);
-  assert.match(body.join("\n"), /▾ send_message · worker-b · 1b3f2a7c ✓/u);
+  assert.match(body.join("\n"), /▾ ✓ send_message · worker-b · 1b3f2a7c/u);
   assert.ok(body.includes("│ 第一行"), body.join("\n"));
 
   // 失败结束：正文继续可查看，行尾出现稳定错误码。
@@ -1442,7 +1482,7 @@ test("消息工具展开为带引导线的 Markdown，状态变化不折叠正�
     tool: "send_message", agent_id: CHILD_SPAWN_ID, message: "第一行\n**加粗正文**", name: "worker-b",
   }, undefined, "message_delivery_failed")]);
   const failBody = failViewer.render(160).slice(1, -1);
-  assert.match(failBody.join("\n"), /▾ send_message · worker-b · 1b3f2a7c · message_delivery_failed ×/u);
+  assert.match(failBody.join("\n"), /▾ × send_message · worker-b · 1b3f2a7c · message_delivery_failed/u);
   assert.ok(failBody.includes("│ 第一行"), failBody.join("\n"));
 });
 
@@ -1453,7 +1493,7 @@ test("final_report 失败正文保留并可展开为 Markdown", () => {
     }, undefined, "agent_unavailable"),
   ], { viewport_height: 20 });
   const collapsed = viewer.render(160).slice(1, -1).join("\n");
-  assert.match(collapsed, /▸ final_report · agent_unavailable ×/u);
+  assert.match(collapsed, /▸ × final_report · agent_unavailable/u);
   assert.doesNotMatch(collapsed, /结论正文/u);
 
   viewer.handleInput("\t");
@@ -1497,10 +1537,10 @@ test("未知来源的插件工具名走安全兜底，不显示插件摘要与�
   const lines = viewer.render(160).slice(1, -1);
 
   // 兜底条目只显示工具名与状态。
-  assert.ok(lines.some((line) => line === "spawn_agent ✓"), lines.join("\n"));
-  assert.ok(lines.some((line) => line === "send_message ×"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "✓ spawn_agent"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "× send_message"), lines.join("\n"));
   // plugin 来源缺必需摘要时同样兜底：无错误码可显示。
-  assert.ok(lines.some((line) => line === "final_report ×"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "× final_report"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /·|worker|1b3f2a7c|agent_unavailable/u);
 });
 
@@ -1531,15 +1571,15 @@ test("等待与控制工具的运行中摘要只显示目标事实", () => {
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // 单目标显示名称与固定八位短 ID；timeout_ms 等调用约束不显示。
-  assert.match(body, /wait_agent · worker-b · 1b3f2a7c ↻\n/u);
+  assert.match(body, /↻ wait_agent · worker-b · 1b3f2a7c\n/u);
   // 多目标只显示数量。
-  assert.match(body, /wait_agent · 3 targets ↻\n/u);
+  assert.match(body, /↻ wait_agent · 3 targets\n/u);
   assert.doesNotMatch(body, /timeout_ms|agent_ids|300000/u);
   // 控制工具显示目标；查询与回收目标同样使用固定八位短 ID。
-  assert.match(body, /interrupt_agent · worker-c · 33d5e2f9 ↻\n/u);
-  assert.match(body, /terminate_agent · 33d5e2f9 ↻\n/u);
-  assert.match(body, /get_agent_status · worker-c · 33d5e2f9 ↻\n/u);
-  assert.match(body, /get_agent_tree ↻\n/u);
+  assert.match(body, /↻ interrupt_agent · worker-c · 33d5e2f9\n/u);
+  assert.match(body, /↻ terminate_agent · 33d5e2f9\n/u);
+  assert.match(body, /↻ get_agent_status · worker-c · 33d5e2f9\n/u);
+  assert.match(body, /↻ get_agent_tree\n/u);
 });
 
 test("wait_agent 成功摘要显示实际 outcome 与 batch release 事实", () => {
@@ -1570,20 +1610,20 @@ test("wait_agent 成功摘要显示实际 outcome 与 batch release 事实", () 
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // 所有成功返回的 outcome 都使用成功符号。
-  assert.match(body, /wait_agent · worker-b · 1b3f2a7c · reply ✓\n/u);
-  assert.match(body, /wait_agent · worker-b · 1b3f2a7c · final_report ✓\n/u);
-  assert.match(body, /wait_agent · 1b3f2a7c · idle ✓\n/u);
-  assert.match(body, /wait_agent · 1b3f2a7c · terminal ✓\n/u);
-  assert.match(body, /wait_agent · 1b3f2a7c · timeout ✓\n/u);
-  assert.match(body, /wait_agent · 3 targets · timeout ✓\n/u);
+  assert.match(body, /✓ wait_agent · worker-b · 1b3f2a7c · reply\n/u);
+  assert.match(body, /✓ wait_agent · worker-b · 1b3f2a7c · final_report\n/u);
+  assert.match(body, /✓ wait_agent · 1b3f2a7c · idle\n/u);
+  assert.match(body, /✓ wait_agent · 1b3f2a7c · terminal\n/u);
+  assert.match(body, /✓ wait_agent · 1b3f2a7c · timeout\n/u);
+  assert.match(body, /✓ wait_agent · 3 targets · timeout\n/u);
   // batch release：数量、释放者与释放 outcome。
-  assert.match(body, /wait_agent · 3 targets · batch_released · worker-a · 22c4d1e8 · reply ✓\n/u);
+  assert.match(body, /✓ wait_agent · 3 targets · batch_released · worker-a · 22c4d1e8 · reply\n/u);
   // 原始结果结构、报告正文与 revision 不进入摘要。
   assert.doesNotMatch(body, /revision|task_result|accepted/u);
   assert.doesNotMatch(body, /22c4d1e8-3a5b/u);
 });
 
-test("wait_agent 目标 failed 与调用失败都使用右侧错误状态", () => {
+test("wait_agent 目标 failed 与调用失败都使用前置错误状态", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
     bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
@@ -1601,9 +1641,9 @@ test("wait_agent 目标 failed 与调用失败都使用右侧错误状态", () =
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // 目标 state failed：红色失败与白名单安全错误码；调用本身成功。
-  assert.match(body, /wait_agent · worker-b · 1b3f2a7c · terminal · failed · model_unavailable ×\n/u);
-  // 调用本身失败：标题保留稳定错误码，右侧状态为失败。
-  assert.match(body, /wait_agent · worker-b · 1b3f2a7c · agent_not_found ×\n/u);
+  assert.match(body, /× wait_agent · worker-b · 1b3f2a7c · terminal · failed · model_unavailable\n/u);
+  // 调用本身失败：标题保留稳定错误码，前置状态为失败。
+  assert.match(body, /× wait_agent · worker-b · 1b3f2a7c · agent_not_found\n/u);
 
   const surface = renderAgentActivityViewerSurface(viewer, 160, theme).join("\n");
   assert.match(surface, /<fg:error>×<\/fg:error>/u);
@@ -1628,12 +1668,12 @@ test("interrupt_agent 区分进入中断、unchanged 与压缩阻塞", () => {
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // 进入 interrupting：成功且无额外事实。
-  assert.match(body, /interrupt_agent · worker-b · 1b3f2a7c ✓\n/u);
-  // unchanged 与压缩阻塞：中性事实并列在状态之前。
-  assert.match(body, /interrupt_agent · worker-b · 1b3f2a7c · unchanged ✓\n/u);
-  assert.match(body, /interrupt_agent · 1b3f2a7c · compaction_active ✓\n/u);
-  // 稳定调用错误：右侧失败状态。
-  assert.match(body, /interrupt_agent · worker-b · 1b3f2a7c · agent_not_found ×\n/u);
+  assert.match(body, /✓ interrupt_agent · worker-b · 1b3f2a7c\n/u);
+  // unchanged 与压缩阻塞：中性事实位于标题中。
+  assert.match(body, /✓ interrupt_agent · worker-b · 1b3f2a7c · unchanged\n/u);
+  assert.match(body, /✓ interrupt_agent · 1b3f2a7c · compaction_active\n/u);
+  // 稳定调用错误：前置失败状态。
+  assert.match(body, /× interrupt_agent · worker-b · 1b3f2a7c · agent_not_found\n/u);
 });
 
 test("terminate_agent 显示回收数量、幂等与强制回收警告", () => {
@@ -1658,11 +1698,11 @@ test("terminate_agent 显示回收数量、幂等与强制回收警告", () => {
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // 正常回收：成功符号加回收数量。
-  assert.match(body, /terminate_agent · worker-b · 1b3f2a7c · 2 reclaimed ✓\n/u);
+  assert.match(body, /✓ terminate_agent · worker-b · 1b3f2a7c · 2 reclaimed\n/u);
   // already terminated：中性幂等事实。
-  assert.match(body, /terminate_agent · worker-b · 1b3f2a7c · already terminated ✓\n/u);
-  // 清理不完整：右侧失败状态。
-  assert.match(body, /terminate_agent · worker-b · 1b3f2a7c · termination_incomplete ×\n/u);
+  assert.match(body, /✓ terminate_agent · worker-b · 1b3f2a7c · already terminated\n/u);
+  // 清理不完整：前置失败状态。
+  assert.match(body, /× terminate_agent · worker-b · 1b3f2a7c · termination_incomplete\n/u);
 
   // 强制回收成功：警告而非失败，成功结果与风险事实同时保留。
   const forcedViewer = new AgentActivityViewerModel(viewerAgent(), [
@@ -1672,7 +1712,7 @@ test("terminate_agent 显示回收数量、幂等与强制回收警告", () => {
     }),
   ], { viewport_height: 20 });
   const forcedBody = forcedViewer.render(160).slice(1, -1).join("\n");
-  assert.match(forcedBody, /terminate_agent · worker-b · 1b3f2a7c · 3 reclaimed · forced ⚠\n/u);
+  assert.match(forcedBody, /⚠ terminate_agent · worker-b · 1b3f2a7c · 3 reclaimed · forced\n/u);
   const forcedSurface = renderAgentActivityViewerSurface(forcedViewer, 160, theme).join("\n");
   assert.match(forcedSurface, /<fg:warning>⚠<\/fg:warning>/u);
 });
@@ -1706,13 +1746,13 @@ test("get_agent_status 只将 failed 与错误码片段标红，查询成功始�
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // working/interrupting 可显示 activity phase；terminated 显示终止结果。
-  assert.match(body, /get_agent_status · worker-b · 1b3f2a7c · working · executing_tools ✓\n/u);
-  assert.match(body, /get_agent_status · 1b3f2a7c · idle ✓\n/u);
-  assert.match(body, /get_agent_status · 1b3f2a7c · terminated · completed ✓\n/u);
-  // 目标 failed：failed 与错误码片段并列，查询成功状态仍位于右侧。
-  assert.match(body, /get_agent_status · worker-b · 1b3f2a7c · failed · provider_unavailable ✓\n/u);
-  // 查询调用失败：右侧失败状态。
-  assert.match(body, /get_agent_status · worker-b · 1b3f2a7c · not_direct_child ×\n/u);
+  assert.match(body, /✓ get_agent_status · worker-b · 1b3f2a7c · working · executing_tools\n/u);
+  assert.match(body, /✓ get_agent_status · 1b3f2a7c · idle\n/u);
+  assert.match(body, /✓ get_agent_status · 1b3f2a7c · terminated · completed\n/u);
+  // 目标 failed：failed 与错误码片段并列，查询成功状态仍位于最左侧。
+  assert.match(body, /✓ get_agent_status · worker-b · 1b3f2a7c · failed · provider_unavailable\n/u);
+  // 查询调用失败：前置失败状态。
+  assert.match(body, /× get_agent_status · worker-b · 1b3f2a7c · not_direct_child\n/u);
   // revision、时间与上下文占用不进入显示。
   assert.doesNotMatch(body, /revision|created_at|elapsed|context_usage|88/u);
 
@@ -1720,11 +1760,11 @@ test("get_agent_status 只将 failed 与错误码片段标红，查询成功始�
   // 局部标红：标题保持粗体强调，failed 与错误码片段使用错误色，状态为 dim。
   assert.match(
     surface,
-    /<fg:accent><bold>get_agent_status · worker-b · 1b3f2a7c · <\/bold><\/fg:accent><fg:error><bold>failed · provider_unavailable<\/bold><\/fg:error> <fg:dim>✓<\/fg:dim>/u,
+    /<fg:dim>✓<\/fg:dim> <fg:dim><bold>get_agent_status · worker-b · 1b3f2a7c · <\/bold><\/fg:dim><fg:error><bold>failed · provider_unavailable<\/bold><\/fg:error>/u,
   );
-  // 成功查询的右侧状态不使用错误色。
+  // 成功查询的前置状态不使用错误色。
   assert.doesNotMatch(surface, /<fg:error>✓<\/fg:error>/u);
-  // 调用失败使用右侧错误状态。
+  // 调用失败使用前置错误状态。
   assert.match(surface, /<fg:error>×<\/fg:error>/u);
 });
 
@@ -1739,8 +1779,8 @@ test("get_agent_tree 成功只显示工具名与成功状态", () => {
   ], { viewport_height: 20 });
   const body = viewer.render(160).slice(1, -1).join("\n");
 
-  assert.match(body, /get_agent_tree ✓\n/u);
-  assert.match(body, /get_agent_tree · agent_unavailable ×\n/u);
+  assert.match(body, /✓ get_agent_tree\n/u);
+  assert.match(body, /× get_agent_tree · agent_unavailable\n/u);
   // revision、scope、节点列表与状态统计不进入显示。
   assert.doesNotMatch(body, /revision|scope|nodes|stats|worker/u);
 });
@@ -1752,7 +1792,7 @@ test("未知来源的等待与控制工具走安全兜底", () => {
   ], { viewport_height: 20 });
   const lines = viewer.render(160).slice(1, -1);
 
-  assert.ok(lines.some((line) => line === "wait_agent ✓"), lines.join("\n"));
-  assert.ok(lines.some((line) => line === "get_agent_status ×"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "✓ wait_agent"), lines.join("\n"));
+  assert.ok(lines.some((line) => line === "× get_agent_status"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /·|1b3f2a7c|worker/u);
 });

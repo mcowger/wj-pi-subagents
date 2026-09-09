@@ -32,6 +32,8 @@ const THINKING_COLLAPSED_TEXT = "Thinking";
 const THINKING_STREAMING_TEXT = "Thinking · streaming";
 /** 冻结流的折叠标题：异常乱序冻结后等待权威完整消息。 */
 const THINKING_FROZEN_TEXT = "Thinking · streaming incomplete";
+/** wait_agent 参数摘要尚未到达时的运行中占位，只表达当前等待事实。 */
+const WAIT_AGENT_RUNNING_TEXT = "…";
 /** 冻结草稿末尾的弱化省略号：实时预览不完整的显示事实。 */
 const FROZEN_DRAFT_ELLIPSIS = "…";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
@@ -83,7 +85,7 @@ export interface AgentActivityViewerPublicState {
   readonly selected_key: string | undefined;
 }
 
-interface ViewerStatusTail {
+interface ViewerStatusIcon {
   readonly text: string;
   readonly style: UiPanelLineStyle;
 }
@@ -95,12 +97,22 @@ interface ViewerSemanticLine {
   readonly selectable_key?: string;
   /** 该行是否为当前选中条目；仅渲染层消费。 */
   readonly selected?: boolean;
-  /** 标题使用粗体强调色；状态尾标仍按自身状态色渲染。 */
+  /** 标题使用粗体；标题颜色由该行 style 决定。 */
   readonly emphasized_title?: boolean;
-  /** 位于标题右侧的工具状态图标及其独立颜色。 */
-  readonly status_tail?: ViewerStatusTail;
+  /** 独立使用 dim 色的可展开标题指示符。 */
+  readonly disclosure_marker?: "▸" | "▾";
+  /** 工具状态图标；位于折叠符之后、标题之前，并使用独立状态色。 */
+  readonly status_icon?: ViewerStatusIcon;
   /** 行尾局部错误片段：仅该片段使用错误色，其余保持行样式。 */
   readonly error_tail?: string;
+}
+
+type SettledLifecycleState = "idle" | "failed" | "terminated";
+
+interface ViewerSettlement {
+  /** 收束发生时查看器已经观察到的规范条目数量。 */
+  readonly entryCount: number;
+  readonly state: SettledLifecycleState;
 }
 
 /**
@@ -126,6 +138,8 @@ interface ToolDisplayEntry {
    * 开始”的忽略规则使每个已确立条目的代次固定为首次发起代。
    */
   readonly generation: number;
+  /** 工具条目首次进入本地回放的序号，用于只读地关联生命周期收束边界。 */
+  readonly startEntryIndex: number;
   toolName: string;
   origin: SafeToolOrigin;
   state: ToolRunState;
@@ -138,7 +152,7 @@ interface ToolDisplayEntry {
 }
 
 /**
- * 标题使用统一展开标记和强调样式，工具状态图标固定在标题右侧。状态视觉为：
+ * 标题使用统一展开标记和强调样式，工具状态图标固定在标题前缀。状态视觉为：
  * 运行中 `↻` 强调色、成功 `✓` 弱化色、失败 `×` 错误色；收束警告与
  * terminated 继续保留各自语义。
  */
@@ -237,8 +251,11 @@ export class AgentActivityViewerModel {
   private scrollOffset = 0;
   private followEnabled = true;
   private projectionRevision = 0;
-  /** 最近一次进入的收束型生命周期事实；收束不可逆，不随 working 回退。 */
-  private settledLifecycle: "idle" | "failed" | "terminated" | undefined;
+  /**
+   * 查看器观察到的收束边界。历史边界只作用于当时已存在的工具条目，避免
+   * 下一工作回合中新开始的工具继承上一回合的 unavailable 显示。
+   */
+  private readonly settlements: ViewerSettlement[] = [];
   private cachedProjection: {
     readonly width: number;
     readonly revision: number;
@@ -255,11 +272,11 @@ export class AgentActivityViewerModel {
     this.templateId = agent.template_id;
     this.name = agent.name;
     this.lifecycleState = agent.state;
-    if (agent.state === "idle" || agent.state === "failed" || agent.state === "terminated") {
-      this.settledLifecycle = agent.state;
-    }
     this.viewportHeight = validViewportHeight(options.viewport_height);
     this.syncFrom(replay);
+    if (agent.state === "idle" || agent.state === "failed" || agent.state === "terminated") {
+      this.settlements.push(Object.freeze({ entryCount: this.entries.length, state: agent.state }));
+    }
     this.setLiveDrafts(options.drafts ?? []);
     this.initializeSelection();
   }
@@ -272,9 +289,9 @@ export class AgentActivityViewerModel {
   updateLifecycle(state: AgentLifecycleState): AgentActivityViewerUpdateOutcome {
     if (state === this.lifecycleState) return "ignored";
     this.lifecycleState = state;
-    // 收束事实一旦发生即不可逆；之后回到 working 也不解除已收束条目。
+    // 记录纯查看器边界，不写回或改变代理的生命周期事实。
     if (state === "idle" || state === "failed" || state === "terminated") {
-      this.settledLifecycle = state;
+      this.settlements.push(Object.freeze({ entryCount: this.entries.length, state }));
     }
     this.touchProjection();
     return "changed";
@@ -358,7 +375,10 @@ export class AgentActivityViewerModel {
         ...(line.emphasized_title === undefined
           ? {}
           : { emphasized_title: line.emphasized_title }),
-        ...(line.status_tail === undefined ? {} : { status_tail: line.status_tail }),
+        ...(line.disclosure_marker === undefined
+          ? {}
+          : { disclosure_marker: line.disclosure_marker }),
+        ...(line.status_icon === undefined ? {} : { status_icon: line.status_icon }),
         ...(line.error_tail === undefined ? {} : { error_tail: line.error_tail }),
       }));
     while (visible.length < this.viewportHeight) {
@@ -535,13 +555,14 @@ export class AgentActivityViewerModel {
   /**
    * 将规范条目重放为显示条目。工具开始/结束按稳定调用身份合并为同一原子
    * 条目：结束先到或开始缺失时自建完成条目；重复与迟到事实幂等；完成态
-   * 不可退回运行中。重放后仍运行中的工具按当前生命周期收束。
+   * 不可退回运行中。重放后仍运行中的工具只按其开始前已经观察到的生命周期
+   * 收束边界结算，避免滞后快照影响随后出现的新活动。
    */
   private projectEntries(): DisplayEntry[] {
     const entries: DisplayEntry[] = [];
     const toolIndex = new Map<string, ToolDisplayEntry>();
 
-    for (const entry of this.entries) {
+    for (const [entryIndex, entry] of this.entries.entries()) {
       const body = entry.body;
       if (body.type === "message") {
         entries.push({ kind: "message", entryId: entry.entry_id, content: body.content });
@@ -565,6 +586,7 @@ export class AgentActivityViewerModel {
           incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
           generation: 1,
+          startEntryIndex: entryIndex,
           toolName: body.toolName,
           origin: body.origin,
           state: { phase: "running" },
@@ -589,6 +611,7 @@ export class AgentActivityViewerModel {
           incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
           generation: 1,
+          startEntryIndex: entryIndex,
           toolName: body.toolName,
           origin: body.origin,
           state,
@@ -611,18 +634,16 @@ export class AgentActivityViewerModel {
     }
 
     if (toolIndex.size > 0) {
-      const settlement = this.settledLifecycle
-        ?? (this.lifecycleState === "idle" || this.lifecycleState === "failed" || this.lifecycleState === "terminated"
-          ? this.lifecycleState
-          : undefined);
-      if (settlement !== undefined) {
-        for (const tool of toolIndex.values()) {
-          if (tool.state.phase !== "running") continue;
-          // 代理进入终态时收束仍运行中的工具；后续匹配结束事实可回填。
-          if (settlement === "idle") tool.state = { phase: "unavailable" };
-          else if (settlement === "failed") tool.state = { phase: "failure" };
-          else tool.state = { phase: "terminated" };
-        }
+      for (const tool of toolIndex.values()) {
+        if (tool.state.phase !== "running") continue;
+        // 收束只覆盖该生命周期事实发生时已经可见的条目；之后追加的开始
+        // 事实代表新的活动，不能被可能滞后的生命周期快照投影为 unavailable。
+        const settlement = this.settlements.find(
+          (candidate) => tool.startEntryIndex < candidate.entryCount,
+        )?.state;
+        if (settlement === "idle") tool.state = { phase: "unavailable" };
+        else if (settlement === "failed") tool.state = { phase: "failure" };
+        else if (settlement === "terminated") tool.state = { phase: "terminated" };
       }
     }
     for (const draft of this.liveDrafts) {
@@ -683,7 +704,8 @@ export class AgentActivityViewerModel {
       }
 
       const visual = toolDisplayVisual(entry);
-      // 工具摘要统一作为标题：可展开项以 ▸/▾ 开头，状态图标位于右侧。
+      // 工具摘要统一作为标题：状态图标位于标题前缀；可展开项顺序为折叠符、
+      // 状态图标、摘要，不可展开项由状态图标占据最左侧。
       // Shell 只展开完整 command；即使收到违约错误正文也不显示输出或退出信息。
       if (entry.summary !== undefined) {
         const shell = entry.summary.tool === "bash" || entry.summary.tool === "powershell";
@@ -696,7 +718,7 @@ export class AgentActivityViewerModel {
             ? toolErrorKey(entry.entryId)
             : toolMessageKey(entry.entryId);
         const expanded = expandable && this.expandedKeys.has(expandKey);
-        // 失败事实的规范稳定错误码与收束事实并列在标题中、状态图标之前。
+        // 失败事实的规范稳定错误码与收束事实保留在标题摘要中。
         const suffix = toolLineSuffix(visual, entry.errorCode);
         const summaryWidth = Math.max(
           1,
@@ -739,14 +761,17 @@ export class AgentActivityViewerModel {
         }
         continue;
       }
-      // 安全兜底只显示工具名与状态，不提供展开入口。
+      // 安全兜底只显示工具名、静态运行提示与状态，不提供展开入口。
       const summary = safeUiFact(entry.toolName);
+      const runningLabel = entry.state.phase === "running" && entry.toolName === "wait_agent"
+        ? `${summary}${SUMMARY_SEPARATOR}${WAIT_AGENT_RUNNING_TEXT}`
+        : summary;
       const suffixParts = [
         ...(visual.suffix === undefined ? [] : [visual.suffix]),
         ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
       ];
       lines.push(toolTitleLine({
-        label: `${summary}${
+        label: `${runningLabel}${
           suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`
         }`,
         visual,
@@ -786,20 +811,25 @@ interface ToolTitleLineOptions {
   readonly errorTail?: string;
 }
 
-/** 工具标题固定为“可选展开标记、摘要、右侧状态图标”。 */
+/** 工具标题固定为“可选折叠符、状态图标、摘要”。 */
 function toolTitleLine(options: ToolTitleLineOptions): ViewerSemanticLine {
-  const marker = options.key === undefined ? "" : `${options.expanded === true ? "▾" : "▸"} `;
-  const iconWidth = displayWidth(options.visual.icon);
-  const headWidth = Math.max(0, options.width - iconWidth - 1);
-  const head = truncateToDisplayWidth(`${marker}${options.label}`, headWidth);
-  const text = head.length === 0
-    ? truncateToDisplayWidth(options.visual.icon, options.width)
-    : `${head} ${options.visual.icon}`;
+  const disclosureMarker = options.key === undefined
+    ? undefined
+    : options.expanded === true ? "▾" as const : "▸" as const;
+  const prefix = disclosureMarker === undefined
+    ? options.visual.icon
+    : `${disclosureMarker} ${options.visual.icon}`;
+  const labelWidth = Math.max(0, options.width - displayWidth(prefix) - 1);
+  const label = truncateToDisplayWidth(options.label, labelWidth);
+  const text = label.length === 0
+    ? truncateToDisplayWidth(prefix, options.width)
+    : `${prefix} ${label}`;
   return Object.freeze({
     text,
-    style: "terminal" as const,
+    style: options.visual.style,
     emphasized_title: true,
-    status_tail: Object.freeze({ text: options.visual.icon, style: options.visual.style }),
+    status_icon: Object.freeze({ text: options.visual.icon, style: options.visual.style }),
+    ...(disclosureMarker === undefined ? {} : { disclosure_marker: disclosureMarker }),
     ...(options.key === undefined ? {} : { selectable_key: options.key }),
     ...(options.errorTail === undefined ? {} : { error_tail: options.errorTail }),
   });
@@ -811,11 +841,13 @@ function disclosureTitleLine(
   key: string,
   expanded: boolean,
 ): ViewerSemanticLine {
+  const marker = expanded ? "▾" as const : "▸" as const;
   return Object.freeze({
-    text: `${expanded ? "▾" : "▸"} ${label}`,
-    style: "terminal" as const,
+    text: `${marker} ${label}`,
+    style: "accent" as const,
     selectable_key: key,
     emphasized_title: true,
+    disclosure_marker: marker,
   });
 }
 
@@ -926,13 +958,13 @@ export function renderAgentActivityViewerSurface(
   ]);
 }
 
-/** 标题和右侧状态需要独立着色；普通正文继续复用共享面板渲染器。 */
+/** 标题和前置状态需要独立着色；普通正文继续复用共享面板渲染器。 */
 function renderViewerFramedPanelLine(
   line: ViewerSemanticLine,
   contentWidth: number,
   theme: unknown,
 ): string {
-  if (line.emphasized_title !== true && line.status_tail === undefined) {
+  if (line.emphasized_title !== true && line.status_icon === undefined) {
     return renderFramedPanelLine(
       line.text,
       contentWidth,
@@ -956,7 +988,7 @@ function renderViewerNarrowPanelLine(
   width: number,
   theme: unknown,
 ): string {
-  if (line.emphasized_title !== true && line.status_tail === undefined) {
+  if (line.emphasized_title !== true && line.status_icon === undefined) {
     return renderNarrowPanelLine(
       line.text,
       width,
@@ -975,19 +1007,21 @@ function renderViewerNarrowPanelLine(
   );
 }
 
-/** 粗体强调标题、局部错误事实与右侧状态图标分别应用主题。 */
+/** 折叠符、工具状态、标题与局部错误事实分别应用主题。 */
 function styleViewerSemanticText(line: ViewerSemanticLine, theme: unknown): string {
   let title = line.text;
-  let status: ViewerStatusTail | undefined;
-  if (line.status_tail !== undefined) {
-    const suffix = ` ${line.status_tail.text}`;
-    if (title.endsWith(suffix)) {
-      title = title.slice(0, -suffix.length);
-      status = line.status_tail;
-    } else if (title === line.status_tail.text) {
-      title = "";
-      status = line.status_tail;
-    }
+  let marker: "▸" | "▾" | undefined;
+  if (line.disclosure_marker !== undefined && title.startsWith(line.disclosure_marker)) {
+    marker = line.disclosure_marker;
+    title = title.slice(marker.length);
+    if (title.startsWith(" ")) title = title.slice(1);
+  }
+
+  let status: ViewerStatusIcon | undefined;
+  if (line.status_icon !== undefined && title.startsWith(line.status_icon.text)) {
+    status = line.status_icon;
+    title = title.slice(status.text.length);
+    if (title.startsWith(" ")) title = title.slice(1);
   }
 
   let errorTail: string | undefined;
@@ -995,9 +1029,11 @@ function styleViewerSemanticText(line: ViewerSemanticLine, theme: unknown): stri
     title = title.slice(0, -line.error_tail.length);
     errorTail = line.error_tail;
   }
-  const styledTitle = line.emphasized_title === true
-    ? themeFg(theme, "accent", themeBold(theme, title))
-    : stylePanelText(title, line.style, theme);
+  const styledTitle = title.length === 0
+    ? ""
+    : line.emphasized_title === true
+      ? stylePanelText(themeBold(theme, title), line.style, theme)
+      : stylePanelText(title, line.style, theme);
   const styledError = errorTail === undefined
     ? ""
     : themeFg(
@@ -1005,10 +1041,13 @@ function styleViewerSemanticText(line: ViewerSemanticLine, theme: unknown): stri
       "error",
       line.emphasized_title === true ? themeBold(theme, errorTail) : errorTail,
     );
-  const styledStatus = status === undefined
-    ? ""
-    : ` ${stylePanelText(status.text, status.style, theme)}`;
-  return `${styledTitle}${styledError}${styledStatus}`;
+  const parts = [
+    ...(marker === undefined ? [] : [stylePanelText(marker, "terminal", theme)]),
+    ...(status === undefined ? [] : [stylePanelText(status.text, status.style, theme)]),
+  ];
+  const styledBody = `${styledTitle}${styledError}`;
+  if (styledBody.length > 0) parts.push(styledBody);
+  return parts.join(" ");
 }
 
 function unavailableViewerLines(width: number): readonly ViewerSemanticLine[] {
@@ -1336,7 +1375,7 @@ function toolMessageBody(summary: SafeToolSummary): string | undefined {
   return isMessageToolSummary(summary) ? summary.message : undefined;
 }
 
-/** 工具行尾收束事实：状态视觉后缀与规范稳定错误码并列。 */
+/** 工具标题中的收束事实：状态视觉后缀与规范稳定错误码并列。 */
 function toolLineSuffix(
   visual: { readonly suffix?: string },
   errorCode: string | undefined,
