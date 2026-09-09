@@ -38,6 +38,7 @@ interface AgentTreeCustomOptions {
   readonly overlay?: boolean;
   readonly overlayOptions?: {
     readonly width?: number | `${number}%`;
+    readonly maxHeight?: number | `${number}%`;
     readonly anchor?: "center";
     readonly margin?: number;
   };
@@ -90,6 +91,8 @@ export interface AgentActivityStreamSource {
 
 interface AgentTreeTui {
   requestRender(): void;
+  /** 宿主终端只读视图；用于响应式正文行数，测试桩可以省略。 */
+  readonly terminal?: { readonly rows?: number };
 }
 
 interface AgentTreeComponent {
@@ -139,12 +142,49 @@ const WORKING_SPINNER_FRAMES = Object.freeze([
 const WORKING_SPINNER_INTERVAL_MS = 80;
 const INITIAL_WORKING_SPINNER_FRAME = WORKING_SPINNER_FRAMES[0] ?? "⠋";
 const DEFAULT_PANEL_VIEWPORT_HEIGHT = 12;
+/** 两个 overlay 共用的固定外边距：四周各保留 2 个终端单元格。 */
+const AGENT_TREE_OVERLAY_MARGIN = 2;
+/** overlay 框线装饰固定行数：上下框线、标题行、两条分隔线与键位提示行。 */
+const PANEL_CHROME_ROWS = 6;
+/** 响应式正文的最低保底行数，仅用于避免极小终端下的空输出。 */
+const MIN_PANEL_BODY_HEIGHT = 1;
+/**
+ * `/agents` 面板与子代理详情查看器共用的外框尺寸策略：宽度与高度都请求
+ * 宿主可用空间（"100%"），由宿主每次渲染按当前终端尺寸扣除四周 2 格边距
+ * 后自动钳制，并保持居中；终端 resize 时随宿主重绘自动适应。
+ */
 const AGENT_TREE_OVERLAY_OPTIONS = Object.freeze({
-  width: 160,
+  width: "100%" as const,
+  maxHeight: "100%" as const,
   anchor: "center" as const,
-  margin: 1,
+  margin: AGENT_TREE_OVERLAY_MARGIN,
 });
 const RENDER_PANEL_LINES = Symbol("renderPanelLines");
+
+/** 读取宿主终端行数；宿主未暴露该视图（如测试桩）时返回 undefined。 */
+function terminalRows(tui: AgentTreeTui): number | undefined {
+  try {
+    const rows = tui.terminal?.rows;
+    return typeof rows === "number" && Number.isSafeInteger(rows) && rows > 0
+      ? rows
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 响应式正文行数：终端行数扣除上下外边距与框线装饰。宿主未暴露终端行数
+ * 时保持 fallback（即模型当前视口行数）；极小终端只保底 1 行避免空输出。
+ */
+function responsiveBodyHeight(tui: AgentTreeTui, fallback: number): number {
+  const rows = terminalRows(tui);
+  if (rows === undefined) return fallback;
+  return Math.max(
+    MIN_PANEL_BODY_HEIGHT,
+    rows - 2 * AGENT_TREE_OVERLAY_MARGIN - PANEL_CHROME_ROWS,
+  );
+}
 
 export type AgentTreePanelInputOutcome = "changed" | "ignored" | "close" | "enter";
 export type AgentTreePanelUpdateOutcome = "changed" | "ignored" | "close" | "error";
@@ -473,6 +513,7 @@ export function bindAgentTreeUi(
         activeViewer = { model, done: finish, scheduleRender: scheduleActivityRender };
         return {
           render: (width) => {
+            model.setViewportHeight(responsiveBodyHeight(tui, model.getViewportHeight()));
             try {
               return [...renderAgentActivityViewerSurface(model, width, theme)];
             } catch {
@@ -536,6 +577,11 @@ export function bindAgentTreeUi(
           activePanel = panel;
           return {
             render: (width) => {
+              if (panel.model !== undefined) {
+                panel.model.setViewportHeight(
+                  responsiveBodyHeight(tui, panel.model.getViewportHeight()),
+                );
+              }
               try {
                 return [...renderAgentTreePanelSurface(panel.model, width, theme)];
               } catch {
@@ -620,7 +666,7 @@ export function renderAgentsWidget(
 export class AgentTreePanelModel {
   private snapshot: ScopedAgentTreeSnapshot;
   private status: "ready" | "error" = "ready";
-  private readonly viewportHeight: number;
+  private viewportHeight: number;
   private readonly expandedAgentIds = new Set<string>();
   private selectedIndex = 0;
   private scrollOffset = 0;
@@ -729,6 +775,14 @@ export class AgentTreePanelModel {
 
   getViewportHeight(): number {
     return this.viewportHeight;
+  }
+
+  /** 响应式调整视口行数；非法输入忽略，选中与滚动收敛到新范围。 */
+  setViewportHeight(height: number): void {
+    if (!Number.isSafeInteger(height) || height <= 0) return;
+    if (height === this.viewportHeight) return;
+    this.viewportHeight = height;
+    this.clampSelection(this.buildRows().length);
   }
 
   getPublicState(): AgentTreePanelPublicState {

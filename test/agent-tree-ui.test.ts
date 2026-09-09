@@ -162,6 +162,36 @@ test("resize 只改变布局宽度，不重置选择、滚动或展开状态", (
   assert.deepEqual(stateBeforeResize.expanded_agent_ids, [TERMINATED_PARENT_ID]);
 });
 
+test("setViewportHeight 响应式扩展或收缩视口并保持选中可见", () => {
+  const panel = new AgentTreePanelModel(treeSnapshot(), { viewport_height: 2 });
+  assert.equal(panel.handleInput("\x1b[D"), "changed");
+  assert.equal(panel.handleInput("\x1b[B"), "changed");
+  assert.equal(panel.handleInput("\x1b[B"), "changed");
+  assert.equal(panel.getPublicState().selected_key, INCOMPLETE_CHILD_ID);
+
+  // 扩展视口：选中节点保持可见，滚动收敛到顶部，正文行数随视口扩展。
+  panel.setViewportHeight(20);
+  const grown = panel.getPublicState();
+  assert.equal(grown.selected_key, INCOMPLETE_CHILD_ID);
+  assert.equal(grown.scroll_offset, 0);
+  const grownSurface = renderAgentTreePanelSurface(panel, 120, undefined);
+  assert.equal(grownSurface.length, 26);
+  assert.ok(grownSurface.some((line) => line.includes("incomplete-child")));
+
+  // 收缩视口：选中节点保持可见并翻页到对应偏移。
+  panel.setViewportHeight(1);
+  const shrunk = panel.getPublicState();
+  assert.equal(shrunk.selected_key, INCOMPLETE_CHILD_ID);
+  assert.equal(shrunk.scroll_offset, 2);
+  const shrunkSurface = renderAgentTreePanelSurface(panel, 120, undefined);
+  assert.equal(shrunkSurface.length, 7);
+  assert.ok(shrunkSurface.some((line) => line.includes("incomplete-child")));
+
+  // 非法输入忽略，不重置当前视口。
+  panel.setViewportHeight(0);
+  assert.equal(panel.getViewportHeight(), 1);
+});
+
 test("未选中的 terminated 与 failed 节点整行使用弱化主题", () => {
   const snapshot: ScopedAgentTreeSnapshot = Object.freeze({
     ...treeSnapshot(),
@@ -295,15 +325,16 @@ test("widget 仍只展示直接且未终止的子代理", () => {
   assert.doesNotMatch(widget.join("\n"), /terminated-parent|completed|incomplete|terminated/);
 });
 
-test("/agents overlay 使用既定布局并经宿主路径渲染生命周期主题", async () => {
+test("/agents overlay 请求响应式尺寸并经宿主路径渲染生命周期主题", async () => {
   let overlayWidth: number | `${number}%` | undefined;
+  let overlayMaxHeight: number | `${number}%` | undefined;
   let overlayAnchor: "center" | undefined;
   let overlayMargin: number | undefined;
   let overlayComponent: { render(width: number): string[] } | undefined;
   const ui = {
     custom: (
       factory: (
-        tui: { requestRender(): void },
+        tui: { requestRender(): void; terminal?: { rows?: number } },
         theme: unknown,
         keybindings: unknown,
         done: (result: undefined) => void,
@@ -311,16 +342,18 @@ test("/agents overlay 使用既定布局并经宿主路径渲染生命周期主�
       options?: {
         overlayOptions?: {
           width?: number | `${number}%`;
+          maxHeight?: number | `${number}%`;
           anchor?: "center";
           margin?: number;
         };
       },
     ) => {
       overlayWidth = options?.overlayOptions?.width;
+      overlayMaxHeight = options?.overlayOptions?.maxHeight;
       overlayAnchor = options?.overlayOptions?.anchor;
       overlayMargin = options?.overlayOptions?.margin;
       overlayComponent = factory(
-        { requestRender: () => {} },
+        { requestRender: () => {}, terminal: { rows: 30 } },
         MARKER_THEME,
         undefined,
         () => {},
@@ -335,10 +368,13 @@ test("/agents overlay 使用既定布局并经宿主路径渲染生命周期主�
   const binding = bindAgentTreeUi(source, { hasUI: true, mode: "tui", ui });
 
   await binding.openPanel();
-  assert.equal(overlayWidth, 160);
+  assert.equal(overlayWidth, "100%");
+  assert.equal(overlayMaxHeight, "100%");
   assert.equal(overlayAnchor, "center");
-  assert.equal(overlayMargin, 1);
+  assert.equal(overlayMargin, 2);
   const surface = overlayComponent?.render(120) ?? [];
+  // 终端 30 行 → 正文 30 - 2×2(边距) - 6(框线装饰) = 20 行，共 26 行。
+  assert.equal(surface.length, 26);
   assert.match(
     surface.find((line) => line.includes("working-child")) ?? "",
     /<fg:customMessageText>.*working-child.*<\/fg:customMessageText>/,

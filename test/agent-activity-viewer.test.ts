@@ -1796,3 +1796,28 @@ test("未知来源的等待与控制工具走安全兜底", () => {
   assert.ok(lines.some((line) => line === "× get_agent_status"), lines.join("\n"));
   assert.doesNotMatch(lines.join("\n"), /·|1b3f2a7c|worker/u);
 });
+
+test("setViewportHeight 响应式扩展或收缩视口，保持跟随与滚动夹紧", () => {
+  const entries = Array.from({ length: 30 }, (_, index) => textMessage(`行 ${index}`));
+  const viewer = new AgentActivityViewerModel(viewerAgent(), entries, { viewport_height: 5 });
+  assert.equal(viewer.getPublicState().scroll_offset, 25);
+
+  // 扩展视口：跟随保持对齐最新条目，正文行数随视口扩展。
+  viewer.setViewportHeight(10);
+  assert.equal(viewer.getPublicState().scroll_offset, 20);
+  const grownBody = viewer.render(80).slice(1, -1);
+  assert.equal(grownBody.length, 10);
+  assert.match(grownBody.at(-1) ?? "", /行 29/u);
+
+  // 收缩视口：跟随保持对齐最新条目，滚动偏移重新夹紧。
+  viewer.setViewportHeight(3);
+  assert.equal(viewer.getPublicState().scroll_offset, 27);
+  assert.equal(viewer.getViewportHeight(), 3);
+  const shrunkBody = viewer.render(80).slice(1, -1);
+  assert.equal(shrunkBody.length, 3);
+  assert.match(shrunkBody.at(-1) ?? "", /行 29/u);
+
+  // 非法输入忽略，不重置当前视口。
+  viewer.setViewportHeight(0);
+  assert.equal(viewer.getViewportHeight(), 3);
+});

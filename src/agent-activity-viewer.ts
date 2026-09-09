@@ -243,7 +243,7 @@ export class AgentActivityViewerModel {
    * 不进入回放、事件数或父端缓存；由 setLiveDrafts 整体替换保持单一事实源。
    */
   private liveDrafts: readonly AgentDisplayDraftView[] = Object.freeze([]);
-  private readonly viewportHeight: number;
+  private viewportHeight: number;
   private readonly expandedKeys = new Set<string>();
   private selectedKey: string | undefined;
   private replayCursor = 0;
@@ -418,6 +418,14 @@ export class AgentActivityViewerModel {
 
   getViewportHeight(): number {
     return this.viewportHeight;
+  }
+
+  /** 响应式调整视口行数；非法输入忽略，跟随与滚动在新范围内收敛。 */
+  setViewportHeight(height: number): void {
+    if (!Number.isSafeInteger(height) || height <= 0) return;
+    if (height === this.viewportHeight) return;
+    this.viewportHeight = height;
+    this.settleFollow();
   }
 
   getPublicState(): AgentActivityViewerPublicState {
