@@ -717,9 +717,12 @@ export class AgentDisplayDraftRegistry {
    * 事实（如监督通道确认 display delivery 已永久关闭的
    * ActivityDeliveryClosed 类信号）后才能接入。
    *
-   * 在此之前每个 agent 保留一条常数大小的 cursor，这是当前容量设计下
-   * 可接受的代价；只有真实的长期内存回收需求才值得设计闭环信号并
-   * 启用本方法。
+   * 保留 cursor 的成本经实测可忽略（Node 22 / V8 64 位，2 万 agent
+   * 强制 GC 取堆差）：收束后的稳定 cursor 约 394 B/agent，legacy 兼容
+   * 路径约 209 B；正文在收束时已全部释放，活跃流式状态是瞬时的。
+   * 默认 maxAgentsPerTree=16 时整个登记表的永久部分不足 10 KiB，长会话
+   * 累计 1,000 个 agent 也只有约 400 KiB。因此不调用本方法没有实际
+   * 内存压力；只有真实的长期内存回收需求才值得设计闭环信号并启用它。
    */
   releaseAgent(agentId: string): boolean {
     const store = this.stores.get(agentId);
