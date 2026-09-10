@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { resolve as resolvePath } from "node:path";
+import { posix as posixPath, resolve as resolvePath, win32 as win32Path } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   AgentController as AgentControllerType,
@@ -681,9 +681,17 @@ export function createToolOriginResolver(
 }
 
 function sameExtensionPath(left: string, right: string): boolean {
+  const windowsLike = (value: string): boolean =>
+    /^[a-zA-Z]:[\\/]/.test(value) || value.includes("\\");
   const normalize = (value: string): string => {
-    const resolved = resolvePath(value).replace(/\\/g, "/");
-    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    // 规范化语义取决于路径自身的形态而非运行平台：盘符、UNC 与反斜杠
+    // 分隔符属于 Windows 形态，按 win32 语义统一分隔符并忽略大小写；
+    // 其余路径按 POSIX 语义保持大小写敏感。win32/posix 规范化都是纯
+    // 字符串操作，同一性判定结果因此与运行平台和路径表示都无关。
+    if (windowsLike(value)) {
+      return win32Path.resolve(value).replace(/\\/g, "/").toLowerCase();
+    }
+    return posixPath.resolve(value);
   };
   return normalize(left) === normalize(right);
 }

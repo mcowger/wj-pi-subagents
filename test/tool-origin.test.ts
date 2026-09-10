@@ -72,6 +72,25 @@ test("路径表示差异不破坏本插件实现的同一性判定", () => {
   );
 });
 
+test("POSIX 风格路径的同一性判定与平台无关且保持大小写敏感", () => {
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "spawn_agent",
+      { path: "/opt/wj-pi-subagents/index.ts", source: "package" },
+      "/opt/wj-pi-subagents/index.ts",
+    ),
+    "plugin",
+  );
+  assert.equal(
+    classifyRegisteredToolOrigin(
+      "spawn_agent",
+      { path: "/opt/WJ-PI-SUBAGENTS/index.ts", source: "package" },
+      "/opt/wj-pi-subagents/index.ts",
+    ),
+    "unknown",
+  );
+});
+
 test("同名覆盖的扩展实现失去专用身份，一律安全兜底", () => {
   // 第三方扩展覆盖 Pi 原生 read。
   assert.equal(
