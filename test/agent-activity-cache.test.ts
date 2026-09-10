@@ -115,6 +115,38 @@ test("修订号随追加单调递增，未知代理回放为空且修订号为 0
   assert.equal(cache.revision(AGENT_A), 3);
 });
 
+test("clear 建立新观察代际，空快照与后续 revision 不会复用旧序列", () => {
+  const cache = new AgentActivityCache();
+  cache.append(AGENT_A, messageEntry(AGENT_A, "清理前"));
+  const before = cache.snapshot(AGENT_A);
+  assert.equal(before.snapshotEpoch, 0);
+  assert.equal(before.revision, 1);
+
+  assert.equal(cache.clear(), true);
+  const cleared = cache.snapshot(AGENT_A);
+  assert.equal(cleared.snapshotEpoch, 1);
+  assert.equal(cleared.revision, 0);
+  assert.deepEqual(cleared.entries, []);
+
+  cache.append(AGENT_A, messageEntry(AGENT_A, "清理后"));
+  const after = cache.snapshot(AGENT_A);
+  assert.equal(after.snapshotEpoch, 1);
+  assert.equal(after.revision, 1);
+  assert.equal(after.entries[0]?.body.type === "message"
+    ? after.entries[0].body.content[0]?.type === "text"
+      ? after.entries[0].body.content[0].text
+      : undefined
+    : undefined, "清理后");
+});
+
+test("空 cache 的 clear 仍推进快照观察代际", () => {
+  const cache = new AgentActivityCache();
+  assert.equal(cache.clear(), false);
+  assert.equal(cache.snapshot(AGENT_A).snapshotEpoch, 1);
+  assert.equal(cache.clear(), false);
+  assert.equal(cache.snapshot(AGENT_A).snapshotEpoch, 2);
+});
+
 test("变更通知携带代理身份，退订后不再接收", () => {
   const cache = new AgentActivityCache();
   const notified: string[] = [];

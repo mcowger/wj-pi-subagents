@@ -47,11 +47,12 @@ import {
   type AgentDisplayDraftView,
 } from "./agent-display-drafts.ts";
 import {
-  parseAgentActivityDisplayEvent,
+  parseCanonicalAgentActivityDisplayEvent,
   sanitizeSafeActivityText,
   DEFAULT_TOOL_EXECUTION_GENERATION,
   isValidToolExecutionGeneration,
   type AgentDisplayStreamUpdate,
+  type DisplayStreamRef,
   type SafeAgentActivityDisplayEvent,
   type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
@@ -928,9 +929,9 @@ export class AgentController {
    * 工具开始与结束是同一条目的状态事实：条目身份由运行实例、工具活动 ID
    * 与执行代次确定性派生，两者在缓存、回放与去重中聚合为同一原子条目；
    * assistant 消息仍是每条独立身份的原子条目，且可携带与实时显示流的
-   * 精确关联身份（displayStreamId），供顶层原地替换对应草稿。
+   * 精确有序关联身份（displayStream），供顶层原地替换对应草稿。
    */
-  recordOwnActivity(event: SafeAgentActivityEvent, displayStreamId?: string): boolean {
+  recordOwnActivity(event: SafeAgentActivityEvent, displayStream?: DisplayStreamRef): boolean {
     if (this.actor.kind !== "agent") return false;
     let body: SafeAgentActivityEvent;
     let entryId: string;
@@ -947,9 +948,15 @@ export class AgentController {
         };
       }
     } else {
-      body = event.type === "message" && displayStreamId !== undefined
-        ? Object.freeze({ ...event, streamId: displayStreamId })
-        : event;
+      const fullDisplayStream = event.type === "message"
+        ? displayStream ?? event.displayStream
+        : undefined;
+      if (event.type === "message" && fullDisplayStream !== undefined) {
+        const { streamId: _legacyStreamId, displayStream: _eventDisplayStream, ...message } = event;
+        body = Object.freeze({ ...message, displayStream: fullDisplayStream });
+      } else {
+        body = event;
+      }
       entryId = randomUUID();
     }
     const candidate: CanonicalAgentActivityEntry = Object.freeze({
@@ -991,7 +998,7 @@ export class AgentController {
       agentId: this.actor.agent_id,
       incarnationId: this.activityIncarnationId,
     });
-    const parsed = parseAgentActivityDisplayEvent(candidate);
+    const parsed = parseCanonicalAgentActivityDisplayEvent(candidate);
     if (parsed.kind !== "event") return false;
     try {
       this.publishUpstreamDisplayActivity?.(
@@ -1109,18 +1116,27 @@ export class AgentController {
   }
 
   /** 语义别名：产生端切换 display epoch，不影响活动缓存。 */
-  resetDisplayDrafts(displayEpoch?: string): boolean {
+  resetDisplayDrafts(
+    displayEpoch?: string,
+    displaySourceGeneration?: number,
+  ): boolean {
     const cleared = this.clearDisplayDrafts();
-    if (displayEpoch === undefined) return cleared;
-    if (!isCanonicalUuid(displayEpoch)) return cleared;
+    if (displayEpoch === undefined && displaySourceGeneration === undefined) return cleared;
+    if (
+      !isCanonicalUuid(displayEpoch)
+      || typeof displaySourceGeneration !== "number"
+      || !Number.isSafeInteger(displaySourceGeneration)
+      || displaySourceGeneration < 1
+    ) return cleared;
     if (this.actor.kind !== "agent") return cleared;
     const candidate = Object.freeze({
       type: "display_reset" as const,
       agentId: this.actor.agent_id,
       incarnationId: this.activityIncarnationId,
       displayEpoch,
+      displaySourceGeneration,
     });
-    const parsed = parseAgentActivityDisplayEvent(candidate);
+    const parsed = parseCanonicalAgentActivityDisplayEvent(candidate);
     if (parsed.kind !== "event" || parsed.event.type !== "display_reset") return cleared;
     try {
       // 这是无状态控制事实：只提交一次，不等待 ACK、不建立重试或历史副本。
@@ -1499,15 +1515,18 @@ export class AgentController {
    * 不进入持久历史、条目计数或父模型上下文。
    */
   private handleDisplayEvent(agentId: string, event: SafeAgentActivityDisplayEvent): void {
+    const parsed = parseCanonicalAgentActivityDisplayEvent(event);
+    if (parsed.kind !== "event") return;
+    const canonicalEvent = parsed.event;
     if (this.actor.kind === "agent") {
       try {
-        this.publishUpstreamDisplayActivity?.(Object.freeze({ agent_id: agentId, event }));
+        this.publishUpstreamDisplayActivity?.(Object.freeze({ agent_id: agentId, event: canonicalEvent }));
       } catch {
         // 上行转发失败静默缺失，不改变节点生命周期。
       }
       return;
     }
-    this.displayDrafts.applyEvent(agentId, event);
+    this.displayDrafts.applyEvent(agentId, canonicalEvent);
   }
 
   /**
@@ -1546,8 +1565,15 @@ export class AgentController {
     if (
       result.accepted
       && entry.body.type === "message"
+      && entry.body.displayStream !== undefined
+    ) {
+      this.displayDrafts.replaceDraft(agentId, entry.incarnation_id, entry.body.displayStream);
+    } else if (
+      result.accepted
+      && entry.body.type === "message"
       && typeof entry.body.streamId === "string"
     ) {
+      // 仅本地兼容路径可能出现旧 streamId；它永不跨 canonical wire。
       this.displayDrafts.replaceDraft(agentId, entry.incarnation_id, entry.body.streamId);
     }
     return result.changed;

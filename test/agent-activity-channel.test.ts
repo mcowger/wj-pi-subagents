@@ -269,6 +269,38 @@ test("重同步窗口内的补齐活动帧静默丢弃：序号前进、无交�
   assert.equal(parent.getPublicState().state, "resyncing");
 });
 
+test("严格 display transport 在发布边界拒绝不完整或无效的有序 identity", () => {
+  const { child, childAgentId } = readyPair();
+  const base = {
+    type: "message_delta" as const,
+    streamId: "message-1",
+    sequence: 1,
+    contentIndex: 0,
+    contentType: "text" as const,
+    delta: "partial",
+    agentId: childAgentId,
+    incarnationId: randomUUID(),
+    displayEpoch: randomUUID(),
+    displaySourceGeneration: 1,
+    streamOrdinal: 1,
+  };
+  const invalidEvents = [
+    (() => {
+      const { streamOrdinal: _streamOrdinal, ...event } = base;
+      return event;
+    })(),
+    { ...base, displayEpoch: "legacy-epoch" },
+    { ...base, displaySourceGeneration: 0 },
+    { ...base, streamOrdinal: Number.MAX_SAFE_INTEGER + 1 },
+  ];
+  for (const event of invalidEvents) {
+    assert.throws(
+      () => child.publishDisplayActivity({ event }),
+      (error: unknown) => error instanceof SupervisorProtocolError && error.code === "invalid_frame",
+    );
+  }
+});
+
 test("重同步窗口内的补齐 display 帧静默丢弃，通道保持重同步状态", () => {
   const { parent, child, childAgentId } = readyPair();
   const displayEvent = {
@@ -278,6 +310,9 @@ test("重同步窗口内的补齐 display 帧静默丢弃，通道保持重同�
     contentIndex: 0,
     contentType: "text" as const,
     delta: "partial",
+    displayEpoch: randomUUID(),
+    displaySourceGeneration: 1,
+    streamOrdinal: 1,
     agentId: childAgentId,
     incarnationId: randomUUID(),
   };
@@ -337,6 +372,8 @@ test("主动 reload 快照边界丢弃未曾见过的旧 activity 与 display �
       agentId: childAgentId,
       incarnationId: randomUUID(),
       displayEpoch: randomUUID(),
+      displaySourceGeneration: 1,
+      streamOrdinal: 1,
     },
   })[0];
   assert.ok(oldActivity && oldDisplay);

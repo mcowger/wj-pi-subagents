@@ -32,6 +32,18 @@ const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const OTHER_AGENT_ID = "660e8400-e29b-41d4-a716-446655440001";
 const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
 const RESTARTED_INCARNATION_ID = "8a0d35f9-6c4e-5a7b-9d2f-8e3c8b5a7f92";
+const DISPLAY_EPOCH = "128c3f70-2d40-4e21-a8b4-1c9d8e7f6a50";
+const RESTARTED_DISPLAY_EPOCH = "2d9e4f61-7c30-4a8b-b5d1-8e6f2c9a4b70";
+
+function defaultStreamOrdinal(streamId: string): number {
+  const match = /-(\d+)$/u.exec(streamId);
+  const ordinal = match === null ? 1 : Number(match[1]);
+  return Number.isSafeInteger(ordinal) && ordinal >= 1 ? ordinal : 1;
+}
+
+function defaultDisplayEpoch(displaySourceGeneration: number): string {
+  return displaySourceGeneration === 1 ? DISPLAY_EPOCH : RESTARTED_DISPLAY_EPOCH;
+}
 
 function delta(
   streamId: string,
@@ -41,6 +53,9 @@ function delta(
   value: string,
   agentId: string = AGENT_ID,
   incarnationId: string = INCARNATION_ID,
+  displaySourceGeneration: number = incarnationId === RESTARTED_INCARNATION_ID ? 2 : 1,
+  streamOrdinal: number = defaultStreamOrdinal(streamId),
+  displayEpoch: string = defaultDisplayEpoch(displaySourceGeneration),
 ): SafeAgentActivityDisplayEvent {
   return Object.freeze({
     type: "message_delta",
@@ -49,6 +64,9 @@ function delta(
     contentIndex,
     contentType,
     delta: value,
+    displayEpoch,
+    displaySourceGeneration,
+    streamOrdinal,
     agentId,
     incarnationId,
   });
@@ -59,8 +77,35 @@ function complete(
   sequence: number,
   agentId: string = AGENT_ID,
   incarnationId: string = INCARNATION_ID,
+  displaySourceGeneration: number = incarnationId === RESTARTED_INCARNATION_ID ? 2 : 1,
+  streamOrdinal: number = defaultStreamOrdinal(streamId),
+  displayEpoch: string = defaultDisplayEpoch(displaySourceGeneration),
 ): SafeAgentActivityDisplayEvent {
-  return Object.freeze({ type: "message_complete", streamId, sequence, agentId, incarnationId });
+  return Object.freeze({
+    type: "message_complete",
+    streamId,
+    sequence,
+    displayEpoch,
+    displaySourceGeneration,
+    streamOrdinal,
+    agentId,
+    incarnationId,
+  });
+}
+
+function displayStreamRef(
+  streamId: string,
+  incarnationId: string = INCARNATION_ID,
+  displaySourceGeneration: number = incarnationId === RESTARTED_INCARNATION_ID ? 2 : 1,
+  streamOrdinal: number = defaultStreamOrdinal(streamId),
+  displayEpoch: string = defaultDisplayEpoch(displaySourceGeneration),
+) {
+  return Object.freeze({
+    streamId,
+    displayEpoch,
+    displaySourceGeneration,
+    streamOrdinal,
+  });
 }
 
 function textValues(views: readonly AgentDisplayDraftView[]): readonly string[] {
@@ -181,7 +226,11 @@ test("冻结后不继续应用 token，等待权威完整消息替换", () => {
   assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["前缀"]);
 
   // 权威完整消息携带可精确关联的身份：到达后原地替换并清除对应草稿。
-  assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), true);
+  assert.equal(registry.replaceDraft(
+    AGENT_ID,
+    INCARNATION_ID,
+    displayStreamRef("message-1"),
+  ), true);
   assert.deepEqual(registry.drafts(AGENT_ID), []);
 });
 
@@ -278,12 +327,43 @@ test("分块累积保持公开 delta 输出等价且连续 thinking 只插入既
   ]);
 });
 
-test("权威消息先到时登记墓碑：后续该流迟到的 delta 与 complete 被忽略", () => {
+test("权威消息先到时封存对应 ordinal：后续该流迟到的 delta 与 complete 被忽略", () => {
   const registry = new AgentDisplayDraftRegistry();
-  assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), false);
+  assert.equal(registry.replaceDraft(
+    AGENT_ID,
+    INCARNATION_ID,
+    displayStreamRef("message-1"),
+  ), false);
   assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "旧流")), false);
   assert.equal(registry.applyEvent(AGENT_ID, complete("message-1", 2)), false);
   assert.deepEqual(registry.drafts(AGENT_ID), []);
+});
+
+test("较高 ordinal 的权威消息清除较低 provisional 草稿并封存整个前缀", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  assert.equal(registry.applyEvent(
+    AGENT_ID,
+    delta("message-1", 1, 0, "text", "旧草稿", AGENT_ID, INCARNATION_ID, 1, 1),
+  ), true);
+  assert.equal(registry.replaceDraft(
+    AGENT_ID,
+    INCARNATION_ID,
+    displayStreamRef("message-2", INCARNATION_ID, 1, 2),
+  ), true);
+  assert.deepEqual(registry.drafts(AGENT_ID), []);
+  assert.equal(registry.applyEvent(
+    AGENT_ID,
+    delta("message-1", 2, 0, "text", "迟到旧流", AGENT_ID, INCARNATION_ID, 1, 1),
+  ), false);
+  assert.equal(registry.applyEvent(
+    AGENT_ID,
+    delta("message-2", 1, 0, "text", "权威后迟到", AGENT_ID, INCARNATION_ID, 1, 2),
+  ), false);
+  assert.equal(registry.applyEvent(
+    AGENT_ID,
+    delta("message-3", 1, 0, "text", "下一条", AGENT_ID, INCARNATION_ID, 1, 3),
+  ), true);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["下一条"]);
 });
 
 test("生命周期收束清除未替换草稿并阻断旧流复活；重启实例与复用 stream ID 不串流", () => {
@@ -306,7 +386,7 @@ test("生命周期收束清除未替换草稿并阻断旧流复活；重启实�
   assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "串流")), false);
 });
 
-test("reload clear 清除草稿但保留旧流墓碑，迟到帧不能复活且新 epoch 可见", () => {
+test("reload clear 关闭当前 source，旧帧不能复活且更高 generation 可见", () => {
   const registry = new AgentDisplayDraftRegistry();
   registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "旧草稿"));
   assert.equal(registry.clear(), true);
@@ -314,22 +394,36 @@ test("reload clear 清除草稿但保留旧流墓碑，迟到帧不能复活且�
   assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 2, 0, "text", "迟到旧帧")), false);
   assert.equal(registry.applyEvent(AGENT_ID, complete("message-1", 2)), false);
 
-  // 新 activator 使用新的 stream epoch；即使仍在同一 incarnation 中也可见。
-  assert.equal(registry.applyEvent(AGENT_ID, delta("message-reload-1", 1, 0, "text", "新草稿")), true);
+  // 新 activator 必须提高 source generation；同一 incarnation 可复用 stream ID。
+  assert.equal(registry.applyEvent(
+    AGENT_ID,
+    delta("message-reload-1", 1, 0, "text", "新草稿", AGENT_ID, INCARNATION_ID, 2, 1),
+  ), true);
   assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["新草稿"]);
 });
 
-
-test("reload 墓碑不设 256 淘汰：长会话最早旧流的迟到帧仍被拒绝", () => {
+test("有序 cursor 在大量流后只接受更高 ordinal，并拒绝封存的旧流", () => {
   const registry = new AgentDisplayDraftRegistry();
-  for (let index = 0; index < 300; index += 1) {
-    const streamId = `epoch-${index}`;
-    registry.applyEvent(AGENT_ID, delta(streamId, 1, 0, "text", `draft-${index}`));
-    assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, streamId), true);
+  for (let ordinal = 1; ordinal <= 1_000; ordinal += 1) {
+    const streamId = `stream-${ordinal}`;
+    assert.equal(registry.applyEvent(
+      AGENT_ID,
+      delta(streamId, 1, 0, "text", `draft-${ordinal}`, AGENT_ID, INCARNATION_ID, 1, ordinal),
+    ), true);
   }
-  // 如果墓碑仍按 256 FIFO 淘汰，epoch-0 会重新创建草稿；永久身份墓碑必须
-  // 让该迟到帧保持静默缺失。
-  assert.equal(registry.applyEvent(AGENT_ID, delta("epoch-0", 2, 0, "text", "迟到旧流")), false);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["draft-1000"]);
+  // 任意已被较高 ordinal 覆盖的 frame 都由 sealed cursor 拒绝，而非查找 tombstone。
+  assert.equal(registry.applyEvent(
+    AGENT_ID,
+    delta("stream-1", 2, 0, "text", "迟到旧流", AGENT_ID, INCARNATION_ID, 1, 1),
+  ), false);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["draft-1000"]);
+
+  assert.equal(registry.replaceDraft(
+    AGENT_ID,
+    INCARNATION_ID,
+    displayStreamRef("stream-1000", INCARNATION_ID, 1, 1_000),
+  ), true);
   assert.deepEqual(registry.drafts(AGENT_ID), []);
 });
 test("查看器关闭期间持续组装：重新打开立即显示当前连续前缀", () => {
@@ -476,7 +570,7 @@ test("监督通道 display 帧端到端交付，事件身份与外层身份绑�
 });
 
 test("display 帧属于固定协议版本与帧 kind 闭集", () => {
-  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/26");
+  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/27");
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("display"), true);
   // 闭集校验：身份不完整的显示事件在通道边界前即被拒绝。
   assert.equal(
@@ -552,17 +646,46 @@ test("中断的消息由下一条 message_start 收束，streamId 仍逐消息�
   assert.deepEqual(outputs.map((update) => [update.type, update.sequence]), [["message_delta", 1]]);
 });
 
-test("产生端跟踪器 reset 切换 stream epoch，避免复用 message-1 身份", () => {
-  const tracker = new OwnDisplayStreamTracker("message-old");
+test("产生端跟踪器 reset 切换 stream epoch 与 source generation，避免复用旧有序身份", () => {
+  const tracker = new OwnDisplayStreamTracker("message-old", DISPLAY_EPOCH, 7);
   const start = { type: "message_start", message: { role: "assistant", content: [] } };
+  const assistantEnd = { type: "message_end", message: { role: "assistant", content: [] } };
+  const textDelta = {
+    type: "message_update",
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "正文" },
+  };
+  const done = { type: "message_update", assistantMessageEvent: { type: "done" } };
   const first = tracker.observe(start);
   assert.equal(first.length, 0);
-  assert.equal(tracker.latestStreamId, "message-old-1");
-  tracker.reset("message-new");
+  assert.deepEqual(tracker.latestDisplayStream, {
+    streamId: "message-old-1",
+    displayEpoch: DISPLAY_EPOCH,
+    displaySourceGeneration: 7,
+    streamOrdinal: 1,
+  });
+  tracker.observe(textDelta);
+  // done 先收束草稿时，随后的 message_end 仍要把同一完整 identity 附给权威正文。
+  assert.equal(tracker.observe(done)[0]?.type, "message_complete");
+  tracker.observe(assistantEnd);
+  assert.deepEqual(tracker.latestDisplayStream, {
+    streamId: "message-old-1",
+    displayEpoch: DISPLAY_EPOCH,
+    displaySourceGeneration: 7,
+    streamOrdinal: 1,
+  });
+  // 没有对应 message_start 的另一条 end 不得错误复用上一条 identity。
+  tracker.observe(assistantEnd);
+  assert.equal(tracker.latestDisplayStream, undefined);
+
+  tracker.reset("message-new", RESTARTED_DISPLAY_EPOCH, 8);
   const second = tracker.observe(start);
   assert.equal(second.length, 0);
-  assert.equal(tracker.latestStreamId, "message-new-1");
-  assert.notEqual("message-old-1", tracker.latestStreamId);
+  assert.deepEqual(tracker.latestDisplayStream, {
+    streamId: "message-new-1",
+    displayEpoch: RESTARTED_DISPLAY_EPOCH,
+    displaySourceGeneration: 8,
+    streamOrdinal: 1,
+  });
 });
 
 

@@ -175,8 +175,10 @@ function activitySnapshot(
   entries: readonly CanonicalAgentActivityEntry[],
   revision: number,
   olderActivityOmitted = false,
+  snapshotEpoch = 0,
 ): AgentActivitySnapshot {
   return Object.freeze({
+    snapshotEpoch,
     entries: Object.freeze([...entries]),
     revision,
     olderActivityOmitted,
@@ -242,6 +244,36 @@ test("snapshot 同槽位把工具 start 原地更新为 end，并按 revision �
   // 同一 revision 即使携带旧内容也必须 no-op，不能把完成态回退。
   assert.equal(viewer.syncSnapshot(activitySnapshot([start], 2)), "ignored");
   assert.match(viewer.render(120).join("\n"), /✓ bash/u);
+});
+
+test("新 snapshot epoch 接纳清空并重置存活查看器的交互状态", () => {
+  const start = toolStart("epoch-tool", "bash", "pi_native", INCARNATION_ID, {
+    tool: "bash", command: "echo before",
+  });
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot([start], 8, false, 4),
+    { viewport_height: 3 },
+  );
+  const selected = viewer.getSelectedKey();
+  assert.ok(selected !== undefined);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.deepEqual(viewer.getExpandedKeys(), [selected]);
+  assert.equal(viewer.getPublicState().follow_enabled, false);
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot([], 0, false, 5)), "changed");
+  assert.equal(viewer.getPublicState().event_count, 0);
+  assert.equal(viewer.getSelectedKey(), undefined);
+  assert.deepEqual(viewer.getExpandedKeys(), []);
+  assert.equal(viewer.getPublicState().follow_enabled, true);
+  assert.equal(viewer.getPublicState().scroll_offset, 0);
+
+  const after = textMessage("新观察代际");
+  assert.equal(viewer.syncSnapshot(activitySnapshot([after], 1, false, 5)), "changed");
+  assert.match(viewer.render(120).join("\n"), /新观察代际/u);
+  // 旧代际即使携带更高 revision 也绝不能回退当前显示。
+  assert.equal(viewer.syncSnapshot(activitySnapshot([start], 99, false, 4)), "ignored");
+  assert.match(viewer.render(120).join("\n"), /新观察代际/u);
 });
 
 test("snapshot 100 条窗口滑动不会被同长度游标忽略，follow 始终贴尾", () => {
@@ -1255,6 +1287,52 @@ test("权威消息落地替换草稿后，已展开的 streaming thinking 保持
   viewer.setLiveDrafts(registry.drafts(AGENT_ID));
 
   // 展开状态跨草稿→权威替换保持：正文可见且标题不再标记 streaming。
+  const body = viewer.render(120).join("\n");
+  assert.match(body, /完整思考/u);
+  assert.doesNotMatch(body, /streaming/u);
+});
+
+test("完整有序 displayStream 在草稿替换后保持 thinking 展开状态", () => {
+  const displayStream = Object.freeze({
+    streamId: "message-1",
+    displayEpoch: randomUUID(),
+    displaySourceGeneration: 1,
+    streamOrdinal: 1,
+  });
+  const registry = new AgentDisplayDraftRegistry();
+  assert.equal(registry.applyEvent(AGENT_ID, Object.freeze({
+    type: "message_delta" as const,
+    ...displayStream,
+    sequence: 1,
+    contentIndex: 0,
+    contentType: "thinking" as const,
+    delta: "流式思考",
+    agentId: AGENT_ID,
+    incarnationId: INCARNATION_ID,
+  })), true);
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot([], 0),
+    { drafts: registry.drafts(AGENT_ID), viewport_height: 20 },
+  );
+  assert.equal(viewer.handleInput("\t"), "changed");
+  assert.equal(viewer.handleInput("\r"), "changed");
+
+  const authority: CanonicalAgentActivityEntry = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: INCARNATION_ID,
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "message" as const,
+      content: Object.freeze([Object.freeze({ type: "thinking" as const, thinking: "完整思考" })]),
+      displayStream,
+    }),
+  });
+  assert.equal(viewer.syncSnapshot(activitySnapshot([authority], 1)), "changed");
+  assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, displayStream), true);
+  viewer.setLiveDrafts(registry.drafts(AGENT_ID));
+
   const body = viewer.render(120).join("\n");
   assert.match(body, /完整思考/u);
   assert.doesNotMatch(body, /streaming/u);

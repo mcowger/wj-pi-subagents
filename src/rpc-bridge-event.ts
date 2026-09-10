@@ -19,13 +19,20 @@ const MAX_ACTIVITY_CONTENT_BLOCKS = 64;
 const MAX_TOOL_ID_BYTES = 256;
 const MAX_ACTIVITY_STREAM_ID_BYTES = 128;
 
-/** display epoch 是不透明的有界代际 token；产生端默认使用 UUID，测试/协议可用固定 token。 */
+/** display epoch 是 canonical UUID；实时 wire 不接受任意 opaque token。 */
 export function isValidDisplayEpoch(value: unknown): value is string {
-  return validBoundedText(value, MAX_ACTIVITY_STREAM_ID_BYTES);
+  return isCanonicalUuid(value);
 }
 
+/** display source generation 从 1 开始，跨 reload 单调前进。 */
+export function isValidDisplaySourceGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
 
-
+/** 同一 display source 内的 assistant stream ordinal 从 1 开始单调前进。 */
+export function isValidDisplayStreamOrdinal(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
 /** 缺省工具代次：仅本地兼容输入使用，严格 canonical wire 必须显式携带。 */
 export const DEFAULT_TOOL_EXECUTION_GENERATION = 1;
 
@@ -345,16 +352,26 @@ export function sanitizeSafeActivityText(value: string): string {
     .replace(ACTIVITY_UNSAFE_PATTERN, " ");
 }
 
+/** 一条实时 assistant stream 的完整有序身份。 */
+export interface DisplayStreamRef {
+  readonly streamId: string;
+  readonly displayEpoch: string;
+  readonly displaySourceGeneration: number;
+  readonly streamOrdinal: number;
+}
+
 /** 加宽后的子代理会话活动事件闭集；监督通道活动流帧承载同一闭集。 */
 export type SafeAgentActivityEvent =
   | {
       readonly type: "message";
       readonly content: readonly SafeAgentActivityContentBlock[];
       /**
-       * 与实时显示流的精确关联身份；由同一运行实例的扩展在产生端携带。
-       * 缺省表示该消息没有可关联的实时流（例如启动前已存在的消息）。
+       * `streamId` 仅保留给本地 raw-Pi 兼容调用；跨进程 canonical 消息必须
+       * 使用携带 epoch/generation/ordinal 的 displayStream。
        */
       readonly streamId?: string;
+      /** 与实时显示流的完整有序关联身份。 */
+      readonly displayStream?: DisplayStreamRef;
     }
   | {
       /** 接收侧实际接纳的父代理输入；未接纳输入不产生该事件。 */
@@ -397,8 +414,10 @@ export type AgentDisplayStreamUpdate =
       readonly type: "message_delta";
       readonly streamId: string;
       readonly sequence: number;
-      /** 同一产生端 reload 代际；旧本地调用可省略。 */
+      /** 旧本地调用可省略整个有序身份，canonical wire 必须全部携带。 */
       readonly displayEpoch?: string;
+      readonly displaySourceGeneration?: number;
+      readonly streamOrdinal?: number;
       readonly contentIndex: number;
       readonly contentType: "text" | "thinking";
       readonly delta: string;
@@ -407,8 +426,10 @@ export type AgentDisplayStreamUpdate =
       readonly type: "message_complete";
       readonly streamId: string;
       readonly sequence: number;
-      /** 同一产生端 reload 代际；旧本地调用可省略。 */
+      /** 旧本地调用可省略整个有序身份，canonical wire 必须全部携带。 */
       readonly displayEpoch?: string;
+      readonly displaySourceGeneration?: number;
+      readonly streamOrdinal?: number;
     };
 
 /** 显示源 reload 的无状态控制事实；不等待确认、不重放、不进入历史。 */
@@ -417,19 +438,14 @@ export interface SafeAgentActivityDisplayReset {
   readonly agentId: string;
   readonly incarnationId: string;
   readonly displayEpoch: string;
+  /** wire 必填，本地兼容调用可省略。 */
+  readonly displaySourceGeneration?: number;
 }
-
-export type AgentDisplayStreamUpdateNormalization =
-  | { readonly kind: "event"; readonly event: AgentDisplayStreamUpdate }
-  | { readonly kind: "ignored" }
-  | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
-  | { readonly kind: "invalid" };
 
 /**
  * 仅供已打开查看器使用的短暂 assistant 增量；它绝不进入活动缓存。
- * 实时流身份至少包含 agentId、incarnationId、displayEpoch 与 streamId，且
- * delta 与 complete 携带该身份及严格递增 sequence。旧本地调用可省略
- * displayEpoch；跨进程产生端必须由 reset barrier 先建立当前代际。
+ * canonical wire 的 delta/complete 必须携带完整的 ordered identity；旧本地
+ * 调用可省略整个 ordered identity，但不得作为跨进程帧发布。
  */
 export type SafeAgentActivityDisplayEvent =
   | (AgentDisplayStreamUpdate & {
@@ -438,9 +454,53 @@ export type SafeAgentActivityDisplayEvent =
     })
   | SafeAgentActivityDisplayReset;
 
+/** 已通过 canonical wire 校验的显示事件，身份字段均不可省略。 */
+export type CanonicalAgentActivityDisplayEvent =
+  | ({
+      readonly type: "message_delta";
+      readonly streamId: string;
+      readonly sequence: number;
+      readonly displayEpoch: string;
+      readonly displaySourceGeneration: number;
+      readonly streamOrdinal: number;
+      readonly contentIndex: number;
+      readonly contentType: "text" | "thinking";
+      readonly delta: string;
+      readonly agentId: string;
+      readonly incarnationId: string;
+    })
+  | ({
+      readonly type: "message_complete";
+      readonly streamId: string;
+      readonly sequence: number;
+      readonly displayEpoch: string;
+      readonly displaySourceGeneration: number;
+      readonly streamOrdinal: number;
+      readonly agentId: string;
+      readonly incarnationId: string;
+    })
+  | ({
+      readonly type: "display_reset";
+      readonly agentId: string;
+      readonly incarnationId: string;
+      readonly displayEpoch: string;
+      readonly displaySourceGeneration: number;
+    });
+
+export type AgentDisplayStreamUpdateNormalization =
+  | { readonly kind: "event"; readonly event: AgentDisplayStreamUpdate }
+  | { readonly kind: "ignored" }
+  | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
+  | { readonly kind: "invalid" };
+
 export type AgentActivityDisplayEventNormalization =
   | { readonly kind: "event"; readonly event: SafeAgentActivityDisplayEvent }
   | { readonly kind: "ignored" }
+  | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
+  | { readonly kind: "invalid" };
+
+export type CanonicalAgentActivityDisplayEventNormalization =
+  | { readonly kind: "event"; readonly event: CanonicalAgentActivityDisplayEvent }
   | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
   | { readonly kind: "invalid" };
 
@@ -494,11 +554,11 @@ type AgentDisplayStreamRejection =
   | { readonly kind: "ignored" }
   | { readonly kind: "rejected"; readonly reason: "reply_too_large" }
   | { readonly kind: "invalid" };
-const INVALID_ACTIVITY_DISPLAY_EVENT: AgentDisplayStreamRejection = Object.freeze({ kind: "invalid" });
-const IGNORED_ACTIVITY_DISPLAY_EVENT: AgentDisplayStreamRejection = Object.freeze({ kind: "ignored" });
-const ACTIVITY_DISPLAY_REJECTED: AgentDisplayStreamRejection = Object.freeze({
-  kind: "rejected",
-  reason: "reply_too_large",
+const INVALID_ACTIVITY_DISPLAY_EVENT = Object.freeze({ kind: "invalid" as const });
+const IGNORED_ACTIVITY_DISPLAY_EVENT = Object.freeze({ kind: "ignored" as const });
+const ACTIVITY_DISPLAY_REJECTED = Object.freeze({
+  kind: "rejected" as const,
+  reason: "reply_too_large" as const,
 });
 const REPLY_TOO_LARGE_EVENT: RpcBridgeEventNormalization = Object.freeze({
   kind: "rejected",
@@ -642,20 +702,31 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
     case "parent_message": {
       const content = normalizeActivityContent(value.content);
       if (content === undefined || content.length === 0) return INVALID_ACTIVITY_EVENT;
-      // streamId 是 assistant 消息与实时显示流的精确关联身份；只有 message
-      // 事件可携带，必须是产生端约定内的有界文本。
+      // `streamId` 是旧本地 raw-Pi 兼容形状；跨进程 activity 以完整
+      // displayStream 关联权威消息与临时显示流，两种形状不可混用。
       let messageStreamId: string | undefined;
-      if (value.type === "message" && value.streamId !== undefined) {
-        if (!validBoundedText(value.streamId, MAX_ACTIVITY_STREAM_ID_BYTES)) {
+      let displayStream: DisplayStreamRef | undefined;
+      if (value.type === "message") {
+        if (value.streamId !== undefined && value.displayStream !== undefined) {
           return INVALID_ACTIVITY_EVENT;
         }
-        messageStreamId = value.streamId;
+        if (value.streamId !== undefined) {
+          if (!validBoundedText(value.streamId, MAX_ACTIVITY_STREAM_ID_BYTES)) {
+            return INVALID_ACTIVITY_EVENT;
+          }
+          messageStreamId = value.streamId;
+        }
+        if (value.displayStream !== undefined) {
+          displayStream = parseDisplayStreamRef(value.displayStream);
+          if (displayStream === undefined) return INVALID_ACTIVITY_EVENT;
+        }
       }
       const event: SafeAgentActivityEvent = value.type === "message"
         ? Object.freeze({
           type: "message",
           content,
           ...(messageStreamId === undefined ? {} : { streamId: messageStreamId }),
+          ...(displayStream === undefined ? {} : { displayStream }),
         })
         : Object.freeze({ type: "parent_message", content });
       return Object.freeze({ kind: "event", event });
@@ -771,7 +842,10 @@ export function parseCanonicalAgentActivityEvent(
     case "message":
       if (
         !hasExactObjectKeys(value, ["type", "content"])
-        && !hasExactObjectKeys(value, ["type", "content", "streamId"])
+        && !(
+          hasExactObjectKeys(value, ["type", "content", "displayStream"])
+          && isStrictCanonicalDisplayStreamRef(value.displayStream)
+        )
       ) return INVALID_ACTIVITY_EVENT;
       if (!isStrictCanonicalActivityContent(value.content)) return INVALID_ACTIVITY_EVENT;
       return parseAgentActivityEvent(value);
@@ -805,6 +879,29 @@ export function parseCanonicalAgentActivityEvent(
     default:
       return INVALID_ACTIVITY_EVENT;
   }
+}
+
+function parseDisplayStreamRef(value: unknown): DisplayStreamRef | undefined {
+  if (
+    !isRecord(value)
+    || !hasExactObjectKeys(value, [
+      "streamId", "displayEpoch", "displaySourceGeneration", "streamOrdinal",
+    ])
+    || !validBoundedText(value.streamId, MAX_ACTIVITY_STREAM_ID_BYTES)
+    || !isValidDisplayEpoch(value.displayEpoch)
+    || !isValidDisplaySourceGeneration(value.displaySourceGeneration)
+    || !isValidDisplayStreamOrdinal(value.streamOrdinal)
+  ) return undefined;
+  return Object.freeze({
+    streamId: value.streamId,
+    displayEpoch: value.displayEpoch,
+    displaySourceGeneration: value.displaySourceGeneration,
+    streamOrdinal: value.streamOrdinal,
+  });
+}
+
+function isStrictCanonicalDisplayStreamRef(value: unknown): value is DisplayStreamRef {
+  return parseDisplayStreamRef(value) !== undefined;
 }
 
 /**
@@ -909,13 +1006,20 @@ export function parseAgentActivityDisplayEvent(
   if (!isRecord(value) || typeof value.type !== "string") return INVALID_ACTIVITY_DISPLAY_EVENT;
 
   if (value.type === "display_reset") {
-    if (!hasExactObjectKeys(value, ["type", "agentId", "incarnationId", "displayEpoch"])) {
-      return INVALID_ACTIVITY_DISPLAY_EVENT;
-    }
+    if (
+      !hasExactObjectKeys(value, ["type", "agentId", "incarnationId", "displayEpoch"])
+      && !hasExactObjectKeys(value, [
+        "type", "agentId", "incarnationId", "displayEpoch", "displaySourceGeneration",
+      ])
+    ) return INVALID_ACTIVITY_DISPLAY_EVENT;
     if (
       !isCanonicalUuid(value.agentId)
       || !isCanonicalUuid(value.incarnationId)
-      || !isCanonicalUuid(value.displayEpoch)
+      || !isValidDisplayEpoch(value.displayEpoch)
+      || (
+        value.displaySourceGeneration !== undefined
+        && !isValidDisplaySourceGeneration(value.displaySourceGeneration)
+      )
     ) return INVALID_ACTIVITY_DISPLAY_EVENT;
     return Object.freeze({
       kind: "event",
@@ -924,6 +1028,9 @@ export function parseAgentActivityDisplayEvent(
         agentId: value.agentId,
         incarnationId: value.incarnationId,
         displayEpoch: value.displayEpoch,
+        ...(value.displaySourceGeneration === undefined
+          ? {}
+          : { displaySourceGeneration: value.displaySourceGeneration }),
       }),
     });
   }
@@ -936,17 +1043,15 @@ export function parseAgentActivityDisplayEvent(
   if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= 0) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
   }
-  // 实时流身份：代理与运行实例必须是规范 UUID，delta 与 complete 携带同一
-  // 身份；不同代理、重启实例或复用 stream ID 不会关联到同一草稿。
   if (!isCanonicalUuid(value.agentId) || !isCanonicalUuid(value.incarnationId)) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
   }
-  if (value.displayEpoch !== undefined && !isCanonicalUuid(value.displayEpoch)) {
-    return INVALID_ACTIVITY_DISPLAY_EVENT;
-  }
+  const identity = parseOptionalDisplayOrdering(value);
+  if (identity === null) return INVALID_ACTIVITY_DISPLAY_EVENT;
   const commonRequiredKeys = ["type", "streamId", "sequence", "agentId", "incarnationId"];
+  const orderedIdentityKeys = ["displayEpoch", "displaySourceGeneration", "streamOrdinal"];
   if (value.type === "message_complete") {
-    if (!hasExactKeysWithOptional(value, commonRequiredKeys, ["displayEpoch"])) {
+    if (!hasExactKeysWithOptional(value, commonRequiredKeys, orderedIdentityKeys)) {
       return INVALID_ACTIVITY_DISPLAY_EVENT;
     }
     return Object.freeze({
@@ -955,7 +1060,7 @@ export function parseAgentActivityDisplayEvent(
         type: "message_complete" as const,
         streamId,
         sequence,
-        ...(value.displayEpoch === undefined ? {} : { displayEpoch: value.displayEpoch }),
+        ...(identity === undefined ? {} : identity),
         agentId: value.agentId,
         incarnationId: value.incarnationId,
       }),
@@ -965,7 +1070,7 @@ export function parseAgentActivityDisplayEvent(
   if (!hasExactKeysWithOptional(
     value,
     [...commonRequiredKeys, "contentIndex", "contentType", "delta"],
-    ["displayEpoch"],
+    orderedIdentityKeys,
   )) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
   }
@@ -990,13 +1095,86 @@ export function parseAgentActivityDisplayEvent(
       type: "message_delta" as const,
       streamId,
       sequence,
-      ...(value.displayEpoch === undefined ? {} : { displayEpoch: value.displayEpoch }),
+      ...(identity === undefined ? {} : identity),
       contentIndex,
       contentType,
       delta,
       agentId: value.agentId,
       incarnationId: value.incarnationId,
     }),
+  });
+}
+
+/**
+ * canonical display wire 只接受完整有序身份。局部 raw-Pi 兼容入口仍可接受
+ * 缺省 identity 的旧调用，但那些对象不能经监督通道发布。
+ */
+export function parseCanonicalAgentActivityDisplayEvent(
+  value: unknown,
+): CanonicalAgentActivityDisplayEventNormalization {
+  if (!isStrictWireJsonValue(value) || !isRecord(value) || typeof value.type !== "string") {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
+  if (value.type === "display_reset") {
+    if (!hasExactObjectKeys(value, [
+      "type", "agentId", "incarnationId", "displayEpoch", "displaySourceGeneration",
+    ])) return INVALID_ACTIVITY_DISPLAY_EVENT;
+  } else if (value.type === "message_complete") {
+    if (!hasExactObjectKeys(value, [
+      "type", "streamId", "sequence", "displayEpoch", "displaySourceGeneration", "streamOrdinal",
+      "agentId", "incarnationId",
+    ])) return INVALID_ACTIVITY_DISPLAY_EVENT;
+  } else if (value.type === "message_delta") {
+    if (!hasExactObjectKeys(value, [
+      "type", "streamId", "sequence", "displayEpoch", "displaySourceGeneration", "streamOrdinal",
+      "contentIndex", "contentType", "delta", "agentId", "incarnationId",
+    ])) return INVALID_ACTIVITY_DISPLAY_EVENT;
+  } else return INVALID_ACTIVITY_DISPLAY_EVENT;
+
+  const parsed = parseAgentActivityDisplayEvent(value);
+  if (parsed.kind === "rejected") return parsed;
+  if (parsed.kind !== "event") return INVALID_ACTIVITY_DISPLAY_EVENT;
+  const event = parsed.event;
+  if (
+    event.type === "display_reset"
+    && event.displaySourceGeneration !== undefined
+  ) return Object.freeze({
+    kind: "event",
+    event: event as CanonicalAgentActivityDisplayEvent,
+  });
+  if (
+    event.type !== "display_reset"
+    && event.displayEpoch !== undefined
+    && event.displaySourceGeneration !== undefined
+    && event.streamOrdinal !== undefined
+  ) return Object.freeze({
+    kind: "event",
+    event: event as CanonicalAgentActivityDisplayEvent,
+  });
+  return INVALID_ACTIVITY_DISPLAY_EVENT;
+}
+
+interface DisplayOrdering {
+  readonly displayEpoch: string;
+  readonly displaySourceGeneration: number;
+  readonly streamOrdinal: number;
+}
+
+/** undefined 表示完整缺省的本地兼容形状；null 表示部分或非法 ordered identity。 */
+function parseOptionalDisplayOrdering(value: Record<string, unknown>): DisplayOrdering | null | undefined {
+  const keys = ["displayEpoch", "displaySourceGeneration", "streamOrdinal"] as const;
+  const present = keys.filter((key) => Object.prototype.hasOwnProperty.call(value, key));
+  if (present.length === 0) return undefined;
+  if (
+    present.length !== keys.length
+    || !isValidDisplayEpoch(value.displayEpoch)
+    || !isValidDisplaySourceGeneration(value.displaySourceGeneration)
+    || !isValidDisplayStreamOrdinal(value.streamOrdinal)
+  ) return null;
+  return Object.freeze({
+    displayEpoch: value.displayEpoch,
+    displaySourceGeneration: value.displaySourceGeneration,
+    streamOrdinal: value.streamOrdinal,
   });
 }
 
@@ -1010,6 +1188,8 @@ export function normalizeAssistantMessageUpdate(
   streamId: string,
   sequence: number,
   displayEpoch?: string,
+  displaySourceGeneration?: number,
+  streamOrdinal?: number,
 ): AgentDisplayStreamUpdateNormalization {
   if (!isRecord(value) || value.type !== "message_update" || !isRecord(value.assistantMessageEvent)) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
@@ -1030,6 +1210,12 @@ export function normalizeAssistantMessageUpdate(
     || contentIndex < 0
     || contentIndex >= MAX_ACTIVITY_CONTENT_BLOCKS
   ) return INVALID_ACTIVITY_DISPLAY_EVENT;
+  const identity = normalizeLocalDisplayOrdering(
+    displayEpoch,
+    displaySourceGeneration,
+    streamOrdinal,
+  );
+  if (identity === null) return INVALID_ACTIVITY_DISPLAY_EVENT;
   const event: AgentDisplayStreamUpdate = Object.freeze({
     type: "message_delta",
     streamId,
@@ -1037,7 +1223,7 @@ export function normalizeAssistantMessageUpdate(
     contentIndex,
     contentType: update.type === "text_delta" ? "text" : "thinking",
     delta,
-    ...(displayEpoch === undefined ? {} : { displayEpoch }),
+    ...(identity === undefined ? {} : identity),
   });
   if (encodedJsonLength(delta) > ACTIVITY_MAX_TEXT_BYTES) {
     return ACTIVITY_DISPLAY_REJECTED;
@@ -1050,13 +1236,38 @@ export function buildDisplayStreamComplete(
   streamId: string,
   sequence: number,
   displayEpoch?: string,
+  displaySourceGeneration?: number,
+  streamOrdinal?: number,
 ): AgentDisplayStreamUpdate {
+  const identity = normalizeLocalDisplayOrdering(
+    displayEpoch,
+    displaySourceGeneration,
+    streamOrdinal,
+  );
   return Object.freeze({
     type: "message_complete",
     streamId,
     sequence,
-    ...(displayEpoch === undefined ? {} : { displayEpoch }),
+    ...(identity === undefined || identity === null ? {} : identity),
   });
+}
+
+function normalizeLocalDisplayOrdering(
+  displayEpoch: string | undefined,
+  displaySourceGeneration: number | undefined,
+  streamOrdinal: number | undefined,
+): DisplayOrdering | null | undefined {
+  if (
+    displayEpoch === undefined
+    && displaySourceGeneration === undefined
+    && streamOrdinal === undefined
+  ) return undefined;
+  if (
+    !isValidDisplayEpoch(displayEpoch)
+    || !isValidDisplaySourceGeneration(displaySourceGeneration)
+    || !isValidDisplayStreamOrdinal(streamOrdinal)
+  ) return null;
+  return Object.freeze({ displayEpoch, displaySourceGeneration, streamOrdinal });
 }
 
 /**

@@ -266,6 +266,9 @@ test("监督通道 display 帧只作为携带代理身份的 activity_display �
       contentIndex: 0,
       contentType: "text" as const,
       delta: "partial",
+      displayEpoch: randomUUID(),
+      displaySourceGeneration: 1,
+      streamOrdinal: 1,
       agentId: CHILD_ID,
       incarnationId: randomUUID(),
     };

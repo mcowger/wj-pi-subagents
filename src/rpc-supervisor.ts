@@ -1,6 +1,6 @@
 import type { ChildReplyEnvelope } from "./child-reply-envelope.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
-import type { SafeAgentActivityDisplayEvent } from "./rpc-bridge-event.ts";
+import type { CanonicalAgentActivityDisplayEvent } from "./rpc-bridge-event.ts";
 import {
   ManagedRpcCommandRejectedError,
   ManagedRpcStartupError,
@@ -310,7 +310,7 @@ export type RpcSupervisorEvent =
       readonly kind: "activity_display";
       /** 实时流身份所属代理；由监督通道 display 帧的外层身份保证。 */
       readonly agent_id: string;
-      readonly event: SafeAgentActivityDisplayEvent;
+      readonly event: CanonicalAgentActivityDisplayEvent;
     }
   | {
       readonly kind: "reply";

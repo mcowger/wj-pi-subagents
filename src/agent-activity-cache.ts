@@ -26,6 +26,8 @@ export type AgentActivityRecordDisposition =
 
 /** 顶层活动缓存的可回放快照。正文本身不按大小截断。 */
 export interface AgentActivitySnapshot {
+  /** cache clear 后递增的本地观察代际；不属于跨进程活动身份。 */
+  readonly snapshotEpoch: number;
   readonly entries: readonly CanonicalAgentActivityEntry[];
   readonly revision: number;
   readonly olderActivityOmitted: boolean;
@@ -104,6 +106,7 @@ type ToolActivityBody = Extract<
 
 const EMPTY_ENTRIES: readonly CanonicalAgentActivityEntry[] = Object.freeze([]);
 const EMPTY_SNAPSHOT: AgentActivitySnapshot = Object.freeze({
+  snapshotEpoch: 0,
   entries: EMPTY_ENTRIES,
   revision: 0,
   olderActivityOmitted: false,
@@ -117,6 +120,8 @@ const EMPTY_SNAPSHOT: AgentActivitySnapshot = Object.freeze({
 export class AgentActivityCache {
   private readonly records = new Map<string, AgentActivityRecord>();
   private readonly listeners = new Set<(agentId: string) => void>();
+  /** clear() 将此前 revision 序列整体作废；同一 cache 实例内严格递增。 */
+  private snapshotEpoch = 0;
 
   /**
    * 旧兼容入口。旧调用方只依赖 void 返回值；实际裁决统一走 record。
@@ -217,7 +222,7 @@ export class AgentActivityCache {
     }
     const record = this.records.get(agentId);
     if (record === undefined) {
-      return makeResult(true, false, "duplicate", EMPTY_SNAPSHOT);
+      return makeResult(true, false, "duplicate", this.emptySnapshot());
     }
     const before = visibleState(record);
     let settled = false;
@@ -252,12 +257,12 @@ export class AgentActivityCache {
     return this.settleAgent(agentId, state);
   }
 
-  /** 返回该代理的当前原子窗口；未知代理返回空快照。 */
+  /** 返回该代理的当前原子窗口；未知代理返回当前观察代际的空快照。 */
   snapshot(agentId: unknown): AgentActivitySnapshot {
     if (!isCanonicalUuid(agentId)) return EMPTY_SNAPSHOT;
     const record = this.records.get(agentId);
-    if (record === undefined) return EMPTY_SNAPSHOT;
-    return makeSnapshot(record);
+    if (record === undefined) return this.emptySnapshot();
+    return makeSnapshot(record, this.snapshotEpoch);
   }
 
   /** snapshot 的读取别名，便于 controller/查看器适配而不破坏旧 API。 */
@@ -300,6 +305,10 @@ export class AgentActivityCache {
       if (record.atoms.length > 0 || record.olderActivityOmitted) changedAgentIds.push(agentId);
     }
     this.records.clear();
+    if (this.snapshotEpoch >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError("activity snapshot epoch exhausted");
+    }
+    this.snapshotEpoch += 1;
     for (const agentId of changedAgentIds) this.notify(agentId);
     return changedAgentIds.length > 0;
   }
@@ -308,6 +317,16 @@ export class AgentActivityCache {
   onChange(listener: (agentId: string) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  private emptySnapshot(): AgentActivitySnapshot {
+    if (this.snapshotEpoch === 0) return EMPTY_SNAPSHOT;
+    return Object.freeze({
+      snapshotEpoch: this.snapshotEpoch,
+      entries: EMPTY_ENTRIES,
+      revision: 0,
+      olderActivityOmitted: false,
+    });
   }
 
   private recordMessageFact(
@@ -406,7 +425,7 @@ export class AgentActivityCache {
   ): AgentActivityRecordResult {
     const changed = visibleStateChanged(before, record);
     if (changed) record.revision += 1;
-    const snapshot = makeSnapshot(record);
+    const snapshot = makeSnapshot(record, this.snapshotEpoch);
     if (changed) this.notify(agentId);
     return makeResult(true, changed, disposition, snapshot);
   }
@@ -590,8 +609,12 @@ function visibleStateChanged(
   return false;
 }
 
-function makeSnapshot(record: AgentActivityRecord): AgentActivitySnapshot {
+function makeSnapshot(
+  record: AgentActivityRecord,
+  snapshotEpoch: number,
+): AgentActivitySnapshot {
   return Object.freeze({
+    snapshotEpoch,
     entries: Object.freeze(record.atoms.map((atom) => atom.entry)),
     revision: record.revision,
     olderActivityOmitted: record.olderActivityOmitted,

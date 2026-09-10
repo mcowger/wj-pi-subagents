@@ -21,7 +21,7 @@ import {
   type CanonicalAgentActivityEntry,
 } from "../src/canonical-activity.ts";
 import type {
-  SafeAgentActivityDisplayEvent,
+  CanonicalAgentActivityDisplayEvent,
   SafeAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
 import {
@@ -35,6 +35,27 @@ const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const GRANDCHILD_ID = "660e8400-e29b-41d4-a716-446655440001";
 const GREAT_GRANDCHILD_ID = "770e8400-e29b-41d4-a716-446655440002";
 const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+const DISPLAY_EPOCH = "128c3f70-2d40-4e21-a8b4-1c9d8e7f6a50";
+const RELOAD_DISPLAY_EPOCH = "2d9e4f61-7c30-4a8b-b5d1-8e6f2c9a4b70";
+
+function streamOrdinal(streamId: string): number {
+  const match = /-(\d+)$/u.exec(streamId);
+  const value = match === null ? 1 : Number(match[1]);
+  return Number.isSafeInteger(value) && value >= 1 ? value : 1;
+}
+
+function displayStream(
+  streamId: string,
+  displaySourceGeneration = 1,
+  ordinal = streamOrdinal(streamId),
+) {
+  return Object.freeze({
+    streamId,
+    displayEpoch: displaySourceGeneration === 1 ? DISPLAY_EPOCH : RELOAD_DISPLAY_EPOCH,
+    displaySourceGeneration,
+    streamOrdinal: ordinal,
+  });
+}
 
 function displayDelta(
   streamId: string,
@@ -44,14 +65,16 @@ function displayDelta(
   delta: string,
   agentId: string = AGENT_ID,
   incarnationId: string = INCARNATION_ID,
-): SafeAgentActivityDisplayEvent {
+  displaySourceGeneration = 1,
+  ordinal = streamOrdinal(streamId),
+): CanonicalAgentActivityDisplayEvent {
   return Object.freeze({
     type: "message_delta",
-    streamId,
     sequence,
     contentIndex,
     contentType,
     delta,
+    ...displayStream(streamId, displaySourceGeneration, ordinal),
     agentId,
     incarnationId,
   });
@@ -169,7 +192,7 @@ function messageEntry(agentId: string, text: string): CanonicalAgentActivityEntr
   });
 }
 
-/** 权威条目携带与实时流精确关联的身份：运行实例身份 + streamId。 */
+/** 权威条目携带完整有序 display stream identity。 */
 function messageEntryWithStream(
   agentId: string,
   text: string,
@@ -184,7 +207,7 @@ function messageEntryWithStream(
     body: Object.freeze({
       type: "message",
       content: Object.freeze([Object.freeze({ type: "text", text })]),
-      streamId,
+      displayStream: displayStream(streamId),
     }),
   });
 }
@@ -314,6 +337,7 @@ test("reload 清空活动状态并拒绝已捕获的旧 activity/display 回调"
   assert.equal(controller.resetActivityForReload(), true);
   assert.equal(fake.activityDeliveryResetCount, 1);
   assert.deepEqual(controller.getActivitySnapshot(AGENT_ID), {
+    snapshotEpoch: 1,
     entries: [],
     revision: 0,
     olderActivityOmitted: false,
@@ -336,6 +360,7 @@ test("reload 清空活动状态并拒绝已捕获的旧 activity/display 回调"
       agentId: AGENT_ID,
       incarnationId: nextIncarnation,
       displayEpoch: nextEpoch,
+      displaySourceGeneration: 2,
     }),
   });
   fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, "新历史") });
@@ -349,6 +374,8 @@ test("reload 清空活动状态并拒绝已捕获的旧 activity/display 回调"
       contentType: "text" as const,
       delta: "新草稿",
       displayEpoch: nextEpoch,
+      displaySourceGeneration: 2,
+      streamOrdinal: 1,
       agentId: AGENT_ID,
       incarnationId: nextIncarnation,
     }),
@@ -462,6 +489,15 @@ test("子模式 recordOwnDisplayEvent 登记完整流身份并沿上游转发", 
   // 顶层收到同身份草稿；与 recordOwnActivity 的权威条目身份一致。
   const rootDrafts = root.getDisplayDrafts(AGENT_ID);
   assert.deepEqual(rootDrafts[0]?.blocks.map((block) => block.value), ["自身"]);
+
+  assert.equal(child.resetDisplayDrafts(RELOAD_DISPLAY_EPOCH, 2), true);
+  const reset = upstream[1];
+  assert.equal(reset?.event.type, "display_reset");
+  assert.equal(reset?.event.type === "display_reset"
+    ? reset.event.displaySourceGeneration
+    : undefined, 2);
+  assert.match(reset?.event.type === "display_reset" ? reset.event.incarnationId : "", /^[0-9a-f-]{36}$/u);
+  assert.deepEqual(root.getDisplayDrafts(AGENT_ID), []);
   // 根没有可上行的自身代理身份。
   assert.equal(root.recordOwnDisplayEvent(displayDelta("message-1", 1, 0, "text", "根")), false);
 });

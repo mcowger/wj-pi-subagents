@@ -626,6 +626,7 @@ test("活动查看器优先消费一致 snapshot，并按 revision 忽略重复�
     }),
   });
   let currentActivity: AgentActivitySnapshot = Object.freeze({
+    snapshotEpoch: 0,
     entries: Object.freeze([start]),
     revision: 1,
     olderActivityOmitted: false,
@@ -660,6 +661,7 @@ test("活动查看器优先消费一致 snapshot，并按 revision 忽略重复�
   assert.match(viewer.render(120).join("\n"), /↻.*read_file/u);
 
   currentActivity = Object.freeze({
+    snapshotEpoch: 0,
     entries: Object.freeze([end]),
     revision: 2,
     olderActivityOmitted: true,
@@ -674,6 +676,7 @@ test("活动查看器优先消费一致 snapshot，并按 revision 忽略重复�
 
   // 同 revision 的冲突载荷是 stale 快照：读取一次，但模型与重绘都 no-op。
   currentActivity = Object.freeze({
+    snapshotEpoch: 0,
     entries: Object.freeze([start]),
     revision: 2,
     olderActivityOmitted: false,

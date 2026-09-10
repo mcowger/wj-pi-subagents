@@ -15,6 +15,7 @@ import {
   SUPERVISOR_PROTOCOL_VERSION,
   SupervisorRequestIdRegistry,
   type SupervisorActivityDelivery,
+  type SupervisorDisplayDelivery,
 } from "../src/supervisor-channel.ts";
 import { createWjPiSubagentsRuntimeActivator } from "../src/wj-pi-subagents-runtime.ts";
 
@@ -23,10 +24,33 @@ const ROOT_ID = "activity-aggregation-root";
 const LOCAL_CREDENTIAL = "local-activity-aggregation-credential-0001";
 const SUPERVISOR_CREDENTIAL = "supervisor-activity-aggregation-credential-0001";
 
+class FakeReloadEventBus {
+  private readonly handlers = new Map<string, Set<(data: unknown) => void>>();
+
+  emit(channel: string, data: unknown): void {
+    for (const handler of this.handlers.get(channel) ?? []) handler(data);
+  }
+
+  on(channel: string, handler: (data: unknown) => void): () => void {
+    const handlers = this.handlers.get(channel) ?? new Set<(data: unknown) => void>();
+    handlers.add(handler);
+    this.handlers.set(channel, handlers);
+    return () => {
+      handlers.delete(handler);
+      if (handlers.size === 0) this.handlers.delete(channel);
+    };
+  }
+}
+
 class FakeExtensionApi {
+  readonly events: FakeReloadEventBus;
   private readonly handlers = new Map<string, Array<(event: unknown, context: unknown) => unknown>>();
   private readonly tools: unknown[] = [];
   private activeTools: string[] = ["read"];
+
+  constructor(events = new FakeReloadEventBus()) {
+    this.events = events;
+  }
 
   on(event: string, handler: (event: unknown, context: unknown) => unknown): void {
     const handlers = this.handlers.get(event) ?? [];
@@ -86,6 +110,17 @@ async function waitForCount(values: readonly unknown[], count: number): Promise<
   while (values.length < count && Date.now() < deadline) {
     await new Promise<void>((resolve) => setTimeout(resolve, 5));
   }
+}
+
+async function waitForMatch<T>(
+  values: readonly T[],
+  matches: (value: T) => boolean,
+): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!values.some(matches) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(values.some(matches));
 }
 
 test("子模式扩展把本进程完整活动规范化上行且不在本层缓存", async () => {
@@ -214,21 +249,31 @@ test("子模式扩展把本进程完整活动规范化上行且不在本层缓�
   }
 });
 
-test("子模式扩展 reload 后重置本地工具代次并轮换活动身份", async () => {
+test("子模式扩展跨实例 reload 后恢复 display source generation 并轮换活动身份", async () => {
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const listener = await transportAdapter.listen({
     agentId: CHILD_ID,
     credential: LOCAL_CREDENTIAL,
   });
-  const api = new FakeExtensionApi();
+  const reloadEventBus = new FakeReloadEventBus();
+  const api = new FakeExtensionApi(reloadEventBus);
+  let activeApi = api;
   const context = {
     cwd: process.cwd(),
     mode: "print",
     hasUI: false,
     isProjectTrusted: () => true,
   };
+  const hostCapabilities = {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.85.1",
+    platform: process.platform,
+    processTreeAdapter: {} as never,
+  } as AvailableHostCapabilities;
   let parentChannel: StreamSupervisorChannel | undefined;
   const delivered: SupervisorActivityDelivery[] = [];
+  const displays: SupervisorDisplayDelivery[] = [];
   const activator = createWjPiSubagentsRuntimeActivator({
     environment: childEnvironment(listener.endpoint),
     localSupervisorTransportAdapter: transportAdapter,
@@ -255,23 +300,34 @@ test("子模式扩展 reload 后重置本地工具代次并轮换活动身份", 
     });
     parentChannel = channel;
     channel.onActivity((activity) => delivered.push(activity));
+    channel.onDisplay((display) => displays.push(display));
     const signal = AbortSignal.timeout(2_000);
     await channel.bind(signal);
     await channel.waitForReady(signal);
   })();
 
   try {
-    await activator(api as unknown as ExtensionApiSurface, {
-      ok: true,
-      nodeVersion: process.versions.node,
-      piVersion: "0.85.1",
-      platform: process.platform,
-      processTreeAdapter: {} as never,
-    } as AvailableHostCapabilities);
+    await activator(api as unknown as ExtensionApiSurface, hostCapabilities);
     await Promise.all([
       api.emit("session_start", { type: "session_start", reason: "startup" }, context),
       parentReady,
     ]);
+
+    await api.emit("message_start", {
+      type: "message_start",
+      message: { role: "assistant", content: [] },
+    }, context);
+    await api.emit("message_update", {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "reload 前草稿" },
+    }, context);
+    await waitForMatch(displays, (display) =>
+      display.event.type === "message_delta" && display.event.delta === "reload 前草稿");
+    const beforeDisplay = displays.find((display) =>
+      display.event.type === "message_delta" && display.event.delta === "reload 前草稿");
+    assert.equal(beforeDisplay?.event.type === "message_delta"
+      ? beforeDisplay.event.displaySourceGeneration
+      : undefined, 1);
 
     await api.emit("tool_execution_start", {
       type: "tool_execution_start",
@@ -283,8 +339,33 @@ test("子模式扩展 reload 后重置本地工具代次并轮换活动身份", 
     const before = delivered[0]?.entry;
     assert.ok(before);
 
-    await api.emit("session_start", { type: "session_start", reason: "reload" }, context);
-    await api.emit("tool_execution_start", {
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+    const reloadedApi = new FakeExtensionApi(reloadEventBus);
+    await activator(reloadedApi as unknown as ExtensionApiSurface, hostCapabilities);
+    activeApi = reloadedApi;
+    await reloadedApi.emit("session_start", { type: "session_start", reason: "reload" }, context);
+    await waitForMatch(displays, (display) =>
+      display.event.type === "display_reset" && display.event.displaySourceGeneration === 2);
+    await reloadedApi.emit("message_start", {
+      type: "message_start",
+      message: { role: "assistant", content: [] },
+    }, context);
+    await reloadedApi.emit("message_update", {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "reload 后草稿" },
+    }, context);
+    await waitForMatch(displays, (display) =>
+      display.event.type === "message_delta" && display.event.delta === "reload 后草稿");
+    const afterDisplay = displays.find((display) =>
+      display.event.type === "message_delta" && display.event.delta === "reload 后草稿");
+    assert.equal(afterDisplay?.event.type === "message_delta"
+      ? afterDisplay.event.displaySourceGeneration
+      : undefined, 2);
+    assert.equal(afterDisplay?.event.type === "message_delta"
+      ? afterDisplay.event.streamOrdinal
+      : undefined, 1);
+
+    await reloadedApi.emit("tool_execution_start", {
       type: "tool_execution_start",
       toolCallId: "reused-call",
       toolName: "read",
@@ -310,7 +391,7 @@ test("子模式扩展 reload 后重置本地工具代次并轮换活动身份", 
       executionGeneration: 1,
     });
   } finally {
-    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+    await activeApi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
     await parentChannel?.release().catch(() => {});
     await listener.close().catch(() => {});
   }

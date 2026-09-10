@@ -46,14 +46,14 @@ function validEntry(overrides: Partial<CanonicalAgentActivityEntry> = {}): Canon
 }
 
 test("规范条目契约版本是固定字符串，解析器只接受当前版本", () => {
-  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/8");
+  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/9");
   assert.equal(parseCanonicalAgentActivityEntry(validEntry()).kind, "entry");
 
   const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/7" });
   assert.equal(parseCanonicalAgentActivityEntry(legacy).kind, "invalid");
 });
 
-test("/8 canonical wire 与本地兼容规范化的工具代次边界分离", () => {
+test("/9 canonical wire 与本地兼容规范化的工具代次边界分离", () => {
   const localLegacy = {
     type: "tool_execution_start",
     toolCallId: "call_legacy",
@@ -79,7 +79,7 @@ test("/8 canonical wire 与本地兼容规范化的工具代次边界分离", ()
   }).kind, "invalid");
 });
 
-test("/8 canonical wire 严格拒绝 message 与 parent_message 的附加字段", () => {
+test("/9 canonical wire 严格拒绝 message 与 parent_message 的附加字段", () => {
   assert.equal(parseCanonicalAgentActivityEvent({
     type: "message",
     content: [{ type: "text", text: "完整正文", unexpected: true }],
@@ -117,7 +117,7 @@ test("/8 canonical wire 严格拒绝 message 与 parent_message 的附加字段"
   }).kind, "invalid");
 });
 
-test("/8 canonical wire 遵循 JSON 图语义并拒绝非 JSON 附加状态", () => {
+test("/9 canonical wire 遵循 JSON 图语义并拒绝非 JSON 附加状态", () => {
   const sharedBlock = { type: "text", text: "可共享的正文块" };
   // JSON.stringify 会将同一引用在两个位置分别展开；它不是循环。
   assert.equal(parseCanonicalAgentActivityEvent({
@@ -142,24 +142,45 @@ test("/8 canonical wire 遵循 JSON 图语义并拒绝非 JSON 附加状态", ()
   }).kind, "invalid");
 });
 
-test("assistant 消息正文可携带与实时流精确关联的 streamId，身份违约被拒绝", () => {
+test("assistant 消息的 canonical 关联必须携带完整有序 displayStream", () => {
+  const displayEpoch = randomUUID();
   const correlated = parseCanonicalAgentActivityEntry(validEntry({
     body: Object.freeze({
       type: "message",
       content: Object.freeze([Object.freeze({ type: "text", text: "回复正文" })]),
-      streamId: "message-1",
+      displayStream: Object.freeze({
+        streamId: "message-1",
+        displayEpoch,
+        displaySourceGeneration: 1,
+        streamOrdinal: 1,
+      }),
     }),
   }));
   assert.equal(correlated.kind, "entry");
-  if (correlated.kind === "entry") {
-    assert.equal(correlated.entry.body.type === "message" ? correlated.entry.body.streamId : undefined, "message-1");
+  if (correlated.kind === "entry" && correlated.entry.body.type === "message") {
+    assert.equal(correlated.entry.body.displayStream?.streamId, "message-1");
   }
+
+  // bare streamId 仍可由本地 raw-Pi 兼容 normalizer 接收，但不能跨 canonical wire。
+  const legacy = {
+    type: "message" as const,
+    content: [{ type: "text" as const, text: "回复正文" }],
+    streamId: "message-1",
+  };
+  assert.equal(parseAgentActivityEvent(legacy).kind, "event");
+  assert.equal(parseCanonicalAgentActivityEvent(legacy).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEntry(validEntry({ body: legacy as never })).kind, "invalid");
 
   assert.equal(parseCanonicalAgentActivityEntry(validEntry({
     body: Object.freeze({
       type: "message",
       content: Object.freeze([Object.freeze({ type: "text", text: "回复正文" })]),
-      streamId: "",
+      displayStream: Object.freeze({
+        streamId: "message-1",
+        displayEpoch,
+        displaySourceGeneration: 0,
+        streamOrdinal: 1,
+      }),
     }),
   })).kind, "invalid");
 });

@@ -7,11 +7,13 @@ import {
   normalizeAssistantMessageUpdate,
   normalizeRpcBridgeEvent,
   parseAgentActivityDisplayEvent,
+  parseCanonicalAgentActivityDisplayEvent,
   parseAgentActivityEvent,
 } from "../src/rpc-bridge-event.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+const DISPLAY_EPOCH = "128c3f70-2d40-4e21-a8b4-1c9d8e7f6a50";
 
 test("真正 child 回复端点只公开文本，明确丢弃 thinking、toolCall 和图片内容", () => {
   const result = normalizeAssistantMessageEnd({
@@ -202,6 +204,56 @@ test("显示层 message_update 只提取有序文本与 thinking delta，不进�
     agentId: AGENT_ID,
     incarnationId: INCARNATION_ID,
   }), { kind: "invalid" });
+});
+
+test("canonical display wire 要求 UUID epoch 与完整有序 stream identity", () => {
+  const canonical = {
+    type: "message_delta" as const,
+    streamId: "message-1",
+    sequence: 1,
+    displayEpoch: DISPLAY_EPOCH,
+    displaySourceGeneration: 1,
+    streamOrdinal: 1,
+    contentIndex: 0,
+    contentType: "text" as const,
+    delta: "正文",
+    agentId: AGENT_ID,
+    incarnationId: INCARNATION_ID,
+  };
+  assert.equal(parseCanonicalAgentActivityDisplayEvent(canonical).kind, "event");
+
+  const { streamOrdinal: _ordinal, ...missingOrdinal } = canonical;
+  assert.equal(parseCanonicalAgentActivityDisplayEvent(missingOrdinal).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityDisplayEvent({
+    ...canonical,
+    displayEpoch: "opaque-legacy-token",
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityDisplayEvent({
+    ...canonical,
+    displaySourceGeneration: 0,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityDisplayEvent({
+    ...canonical,
+    displaySourceGeneration: Number.MAX_SAFE_INTEGER + 1,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityDisplayEvent({
+    ...canonical,
+    streamOrdinal: 0,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityDisplayEvent({
+    ...canonical,
+    streamOrdinal: Number.MAX_SAFE_INTEGER + 1,
+  }).kind, "invalid");
+
+  // local raw-Pi compatibility may omit the entire ordered identity, but cannot
+  // smuggle a partial identity across either parser.
+  const { displayEpoch, displaySourceGeneration, streamOrdinal, ...legacy } = canonical;
+  assert.equal(parseAgentActivityDisplayEvent(legacy).kind, "event");
+  assert.equal(parseCanonicalAgentActivityDisplayEvent(legacy).kind, "invalid");
+  assert.equal(parseAgentActivityDisplayEvent({
+    ...legacy,
+    displayEpoch,
+  }).kind, "invalid");
 });
 
 test("任务桥接忽略非 assistant 的 message_end；活动路径逐块忽略未知内容块，回复路径仍拒绝", () => {

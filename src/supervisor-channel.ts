@@ -10,7 +10,8 @@ import {
   type CanonicalAgentActivityEntry,
 } from "./canonical-activity.ts";
 import {
-  parseAgentActivityDisplayEvent,
+  parseCanonicalAgentActivityDisplayEvent,
+  type CanonicalAgentActivityDisplayEvent,
   type SafeAgentActivityDisplayEvent,
 } from "./rpc-bridge-event.ts";
 import {
@@ -39,7 +40,7 @@ import {
 } from "./tree-controller.ts";
 
 /** 父子监督通道与 Pi 任务 RPC 完全隔离的固定协议版本。 */
-export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/26";
+export const SUPERVISOR_PROTOCOL_VERSION = "wj-pi-subagents/27";
 
 export const SUPERVISOR_FRAME_KINDS = Object.freeze([
   "hello",
@@ -210,7 +211,7 @@ export interface SupervisorActivityDelivery {
  */
 export interface SupervisorDisplayDelivery {
   readonly agent_id: string;
-  readonly event: SafeAgentActivityDisplayEvent;
+  readonly event: CanonicalAgentActivityDisplayEvent;
 }
 
 /** 监督器向直接父/子控制器传播的脱敏生命周期事实。 */
@@ -1354,7 +1355,7 @@ export class SupervisorChannel {
     const agentId = input.agent_id ?? this.localAgentId;
     if (!isCanonicalUuid(agentId)) throw new SupervisorProtocolError("identity_mismatch");
     if (!this.eventAgentIsInScope(agentId)) throw new SupervisorProtocolError("identity_mismatch");
-    const parsed = parseAgentActivityDisplayEvent(input.event);
+    const parsed = parseCanonicalAgentActivityDisplayEvent(input.event);
     if (parsed.kind === "invalid") throw new SupervisorProtocolError("invalid_frame");
     if (parsed.kind !== "event" || parsed.event.agentId !== agentId) {
       throw new SupervisorProtocolError("identity_mismatch");
@@ -1871,7 +1872,7 @@ export class SupervisorChannel {
       frameError("invalid_frame");
     }
     const agentId = this.resolveInScopeActivityAgentId(payload.agent_id);
-    const parsed = parseAgentActivityDisplayEvent(payload.event);
+    const parsed = parseCanonicalAgentActivityDisplayEvent(payload.event);
     if (parsed.kind !== "event") frameError("invalid_frame");
     if (parsed.event.agentId !== agentId) frameError("invalid_frame");
     return Object.freeze({ agent_id: agentId, event: parsed.event });

@@ -34,6 +34,7 @@ import {
   normalizeRpcBridgeEvent,
   type AgentActivityEventNormalization,
   type AgentDisplayStreamUpdate,
+  type DisplayStreamRef,
   type OwnToolActivityNormalizerState,
   type SafeAgentActivityEvent,
   type SafeToolOrigin,
@@ -250,6 +251,8 @@ interface RuntimeTransfer {
   readonly replyInbox: ParentReplyInbox;
   readonly bindings: RuntimeBindings;
   readonly createSupervisor: AgentSupervisorFactory;
+  /** 逻辑 display source 的最后一代，reload 后必须从其后一代继续。 */
+  readonly displaySourceGeneration: number;
 }
 
 const SYSTEM_TOOL_NAMES = new Set<string>([
@@ -307,7 +310,10 @@ function isRuntimeTransfer(value: unknown): value is RuntimeTransfer {
       && typeof value.replyCoordinator.normalReply === "function"
       && typeof value.replyCoordinator.settle === "function"
     ))
-    && typeof value.createSupervisor === "function";
+    && typeof value.createSupervisor === "function"
+    && typeof value.displaySourceGeneration === "number"
+    && Number.isSafeInteger(value.displaySourceGeneration)
+    && value.displaySourceGeneration >= 1;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -798,11 +804,11 @@ function observeOwnActivity(
   current: ActiveRuntime | undefined,
   event: unknown,
   normalizeOwnActivity: (event: unknown) => AgentActivityEventNormalization,
-  displayStreamId?: string,
+  displayStream?: DisplayStreamRef,
 ): void {
   if (current === undefined || !current.isChild || current.handoffPending === true) return;
   const activity = readOwnActivityEvent(event, normalizeOwnActivity);
-  if (activity !== undefined) current.controller.recordOwnActivity(activity, displayStreamId);
+  if (activity !== undefined) current.controller.recordOwnActivity(activity, displayStream);
 }
 
 /** 产生端显示事实逐层 fire-and-forget 转发；recordOwnDisplayEvent 自身吞掉转发失败。 */
@@ -818,6 +824,7 @@ function observeOwnDisplayEvent(
 
 interface ActiveOwnDisplayStream {
   readonly streamId: string;
+  readonly displayStream?: DisplayStreamRef;
   nextSequence: number;
   hasDelta: boolean;
 }
@@ -834,29 +841,51 @@ interface ActiveOwnDisplayStream {
 export class OwnDisplayStreamTracker {
   private streamPrefix: string;
   private displayEpoch: string | undefined;
-  private nextStreamId = 0;
+  private displaySourceGeneration: number | undefined;
+  private nextStreamOrdinal = 0;
   private active: ActiveOwnDisplayStream | undefined;
+  /** 当前 assistant 消息的 identity；流已 complete 后仍保留到 message_end 以关联权威正文。 */
+  private currentMessage: ActiveOwnDisplayStream | undefined;
   private discarding = false;
-  /** 最近一条 assistant 消息流身份；message_end 生成权威条目时携带。 */
+  /** 最近一条 assistant streamId 的本地兼容视图。 */
   latestStreamId: string | undefined;
+  /** 最近一条 assistant 消息的完整有序身份；权威条目生成时携带。 */
+  latestDisplayStream: DisplayStreamRef | undefined;
 
-  constructor(streamPrefix = "message", displayEpoch?: string) {
+  constructor(
+    streamPrefix = "message",
+    displayEpoch?: string,
+    displaySourceGeneration: number | undefined = displayEpoch === undefined ? undefined : 1,
+  ) {
     this.streamPrefix = streamPrefix;
     this.displayEpoch = displayEpoch;
+    this.displaySourceGeneration = displaySourceGeneration;
   }
 
   get currentDisplayEpoch(): string | undefined {
     return this.displayEpoch;
   }
 
-  /** reload 时切换显示 epoch，避免新 activator 复用旧 streamId。 */
-  reset(streamPrefix = "message", displayEpoch?: string): void {
+  /** reload 时切换有序 display source identity，避免新 activator 复用旧流。 */
+  reset(
+    streamPrefix = "message",
+    displayEpoch?: string,
+    displaySourceGeneration?: number,
+  ): void {
+    const nextDisplaySourceGeneration = displaySourceGeneration ?? (
+      displayEpoch === undefined
+        ? undefined
+        : (this.displaySourceGeneration ?? 0) + 1
+    );
     this.streamPrefix = streamPrefix;
     this.displayEpoch = displayEpoch;
-    this.nextStreamId = 0;
+    this.displaySourceGeneration = nextDisplaySourceGeneration;
+    this.nextStreamOrdinal = 0;
     this.active = undefined;
+    this.currentMessage = undefined;
     this.discarding = false;
     this.latestStreamId = undefined;
+    this.latestDisplayStream = undefined;
   }
 
   observe(event: unknown): readonly AgentDisplayStreamUpdate[] {
@@ -865,13 +894,19 @@ export class OwnDisplayStreamTracker {
       const previous = this.completeActive();
       this.discarding = false;
       this.active = this.newStream();
+      this.currentMessage = this.active;
       return previous === undefined ? [] : [previous];
     }
     if (event.type === "message_update" && isRecord(event.assistantMessageEvent)) {
       return this.observeUpdate(event.assistantMessageEvent);
     }
     if (event.type === "message_end" && isAssistantMessage(event)) {
+      const ending = this.currentMessage;
       const completed = this.completeActive();
+      // 缺失 message_start 时绝不能把上一条消息的 identity 附给当前权威正文。
+      this.latestStreamId = ending?.streamId;
+      this.latestDisplayStream = ending?.displayStream;
+      this.currentMessage = undefined;
       this.discarding = false;
       return completed === undefined ? [] : [completed];
     }
@@ -886,12 +921,19 @@ export class OwnDisplayStreamTracker {
       return completed === undefined ? [] : [completed];
     }
     if (this.discarding) return [];
-    const active = this.active ?? this.newStream();
+    let active = this.active;
+    if (active === undefined) {
+      active = this.newStream();
+      this.active = active;
+      this.currentMessage = active;
+    }
     const normalized = normalizeAssistantMessageUpdate(
       { type: "message_update", assistantMessageEvent: update },
       active.streamId,
       active.nextSequence,
-      this.displayEpoch,
+      active.displayStream?.displayEpoch,
+      active.displayStream?.displaySourceGeneration,
+      active.displayStream?.streamOrdinal,
     );
     if (normalized.kind === "rejected") {
       // 单帧超预算：收束可见草稿并丢弃该消息的后续增量，等待权威消息。
@@ -902,15 +944,29 @@ export class OwnDisplayStreamTracker {
     if (normalized.kind !== "event") return [];
     active.nextSequence += 1;
     active.hasDelta = true;
-    this.active ??= active;
     return [normalized.event];
   }
 
   private newStream(): ActiveOwnDisplayStream {
-    this.nextStreamId += 1;
-    const streamId = `${this.streamPrefix}-${this.nextStreamId}`;
+    this.nextStreamOrdinal += 1;
+    const streamId = `${this.streamPrefix}-${this.nextStreamOrdinal}`;
+    const displayStream = this.displayEpoch !== undefined
+      && this.displaySourceGeneration !== undefined
+      ? Object.freeze({
+        streamId,
+        displayEpoch: this.displayEpoch,
+        displaySourceGeneration: this.displaySourceGeneration,
+        streamOrdinal: this.nextStreamOrdinal,
+      })
+      : undefined;
     this.latestStreamId = streamId;
-    return { streamId, nextSequence: 1, hasDelta: false };
+    this.latestDisplayStream = displayStream;
+    return {
+      streamId,
+      ...(displayStream === undefined ? {} : { displayStream }),
+      nextSequence: 1,
+      hasDelta: false,
+    };
   }
 
   private completeActive(): AgentDisplayStreamUpdate | undefined {
@@ -920,7 +976,9 @@ export class OwnDisplayStreamTracker {
     return buildDisplayStreamComplete(
       active.streamId,
       active.nextSequence,
-      this.displayEpoch,
+      active.displayStream?.displayEpoch,
+      active.displayStream?.displaySourceGeneration,
+      active.displayStream?.streamOrdinal,
     );
   }
 }
@@ -949,21 +1007,31 @@ export function createWjPiSubagentsRuntimeActivator(
       (agentId) => readDirectChildDisplayName(active, agentId, false),
       ownToolActivityNormalizerState,
     );
-    // 产生端实时显示流跟踪器：与权威 assistant 消息共享同一运行实例身份，
-    // 使顶层草稿可以被完整消息精确替换；epoch 随 reload 轮换。
+    // 使顶层草稿可以被完整消息精确替换；epoch 与 source generation 都随
+    // reload 轮换，后者是 receiver 可压缩旧流元数据的顺序屏障。
     let ownDisplayEpoch = randomUUID();
+    let ownDisplaySourceGeneration = 1;
     const ownDisplayTracker = new OwnDisplayStreamTracker(
       `message-${ownDisplayEpoch}`,
       ownDisplayEpoch,
+      ownDisplaySourceGeneration,
     );
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
 
     const rotateOwnDisplayEpoch = (current?: ActiveRuntime): void => {
+      if (ownDisplaySourceGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new RangeError("display source generation exhausted");
+      }
+      ownDisplaySourceGeneration += 1;
       ownDisplayEpoch = randomUUID();
-      ownDisplayTracker.reset(`message-${ownDisplayEpoch}`, ownDisplayEpoch);
-      current?.controller.resetDisplayDrafts(ownDisplayEpoch);
+      ownDisplayTracker.reset(
+        `message-${ownDisplayEpoch}`,
+        ownDisplayEpoch,
+        ownDisplaySourceGeneration,
+      );
+      current?.controller.resetDisplayDrafts(ownDisplayEpoch, ownDisplaySourceGeneration);
     };
     const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
@@ -1137,7 +1205,7 @@ export function createWjPiSubagentsRuntimeActivator(
       if (current === undefined || !current.isChild || current.handoffPending === true) return;
       // 先收束当前流，再让权威条目携带同一实时流身份，使顶层可以原地替换。
       observeOwnDisplayEvent(current, ownDisplayTracker.observe(event));
-      observeOwnActivity(current, event, normalizeOwnActivity, ownDisplayTracker.latestStreamId);
+      observeOwnActivity(current, event, normalizeOwnActivity, ownDisplayTracker.latestDisplayStream);
       current.replyCoordinator?.observeAssistantMessageEnd(event);
       refreshContextUsage(current, rawContext);
     });
@@ -1169,6 +1237,7 @@ export function createWjPiSubagentsRuntimeActivator(
     });
 
     const makeState = (transfer: RuntimeTransfer, context: RuntimeContextView): ActiveRuntime => {
+      ownDisplaySourceGeneration = transfer.displaySourceGeneration;
       transfer.bindings.api = api;
       transfer.bindings.context = context;
       return {
@@ -1568,9 +1637,9 @@ export function createWjPiSubagentsRuntimeActivator(
         throw error instanceof Error ? error : new Error("子树发布器启动失败");
       }
       active = state;
-      // child 冷启动先登记当前 display epoch，再允许后续 token 上行；该事实
+      // child 冷启动先登记当前有序 display source，再允许后续 token 上行；该事实
       // 仍是一次无状态 fire-and-forget，不阻塞 session_start。
-      state.controller.resetDisplayDrafts(ownDisplayEpoch);
+      state.controller.resetDisplayDrafts(ownDisplayEpoch, ownDisplaySourceGeneration);
       if (bootstrap === undefined) {
         runtimeAuthorities.set(rootId, Object.freeze({
           tree,
@@ -1658,6 +1727,7 @@ export function createWjPiSubagentsRuntimeActivator(
         replyInbox: current.replyInbox,
         bindings: current.bindings,
         createSupervisor: current.createSupervisor,
+        displaySourceGeneration: ownDisplaySourceGeneration,
       }),
       restoreTransfer: (transfer) => makeState(transfer, transfer.bindings.context),
       getActive: () => active,

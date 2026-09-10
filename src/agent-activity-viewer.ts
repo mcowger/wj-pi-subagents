@@ -15,7 +15,10 @@ import {
   type SafeToolOrigin,
   type SafeToolSummary,
 } from "./rpc-bridge-event.ts";
-import type { AgentDisplayDraftView } from "./agent-display-drafts.ts";
+import {
+  agentDisplayDraftKey,
+  type AgentDisplayDraftView,
+} from "./agent-display-drafts.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
   displayWidth,
@@ -503,13 +506,12 @@ function liveThinkingKey(draftKey: string, contentIndex: number): string {
  */
 function messageThinkingKey(
   entryId: string,
-  incarnationId: string,
-  streamId: string | undefined,
+  displayDraftKey: string | undefined,
   blockIndex: number,
 ): string {
-  return streamId === undefined
+  return displayDraftKey === undefined
     ? thinkingKey(entryId, blockIndex)
-    : liveThinkingKey(`${incarnationId}|${streamId}`, blockIndex);
+    : liveThinkingKey(displayDraftKey, blockIndex);
 }
 
 /**
@@ -533,7 +535,9 @@ export class AgentActivityViewerModel {
   private readonly expandedKeys = new Set<string>();
   private selectedKey: string | undefined;
   private replayCursor = 0;
-  /** 最近接纳的权威快照修订；undefined 表示当前仍在旧 replay 兼容模式。 */
+  /** 最近接纳的权威快照观察代际；undefined 表示当前仍在旧 replay 兼容模式。 */
+  private snapshotEpoch: number | undefined;
+  /** 同一观察代际中最近接纳的权威快照修订。 */
   private snapshotRevision: number | undefined;
   private olderActivityOmitted = false;
   private layoutWidth = DEFAULT_LAYOUT_WIDTH;
@@ -612,6 +616,7 @@ export class AgentActivityViewerModel {
 
   /** 追加一条规范活动条目；保留给旧 append-only 调用方。 */
   appendEntry(entry: CanonicalAgentActivityEntry): AgentActivityViewerUpdateOutcome {
+    this.snapshotEpoch = undefined;
     this.snapshotRevision = undefined;
     this.entries.push(entry);
     this.touchProjection();
@@ -644,17 +649,26 @@ export class AgentActivityViewerModel {
   }
 
   /**
-   * 以权威有界快照完整对账。revision 未前进时严格 no-op；前进后按规范
-   * 原子身份重建顺序，因此同槽位替换、窗口缩短和 100 条滑动都不会依赖
-   * append-only 游标。
+   * 以权威有界快照完整对账。同一观察代际中 revision 未前进时严格 no-op；
+   * 新观察代际无条件接纳，从而允许 cache clear 后 revision 从 0 重新开始。
+   * 前进后按规范原子身份重建顺序，因此同槽位替换、窗口缩短和 100 条滑动
+   * 都不会依赖 append-only 游标。
    */
   syncSnapshot(snapshot: AgentActivitySnapshot): AgentActivityViewerUpdateOutcome {
     if (!isValidActivitySnapshot(snapshot)) return "ignored";
-    if (this.snapshotRevision !== undefined && snapshot.revision <= this.snapshotRevision) {
-      return "ignored";
-    }
+    const epochChanged = this.snapshotEpoch !== undefined
+      && snapshot.snapshotEpoch > this.snapshotEpoch;
+    if (
+      this.snapshotEpoch !== undefined
+      && (
+        snapshot.snapshotEpoch < this.snapshotEpoch
+        || (!epochChanged && snapshot.revision <= (this.snapshotRevision ?? -1))
+      )
+    ) return "ignored";
 
-    const reconcileInteraction = !this.initializing
+    if (epochChanged) this.resetForSnapshotEpoch();
+    const reconcileInteraction = !epochChanged
+      && !this.initializing
       && (this.selectedKey !== undefined || this.expandedKeys.size > 0);
     const previousKeys = reconcileInteraction ? this.selectableKeys() : Object.freeze([]);
     const previousSelectedKey = this.selectedKey;
@@ -662,13 +676,16 @@ export class AgentActivityViewerModel {
 
     this.entries.splice(0, this.entries.length, ...reconciled);
     this.olderActivityOmitted = snapshot.olderActivityOmitted;
+    this.snapshotEpoch = snapshot.snapshotEpoch;
     this.snapshotRevision = snapshot.revision;
     this.replayCursor = snapshot.entries.length;
     this.retainVisibleToolSettlements();
     this.touchProjection();
 
     if (!this.initializing) {
-      if (reconcileInteraction) {
+      if (epochChanged) {
+        this.initializeSelection();
+      } else if (reconcileInteraction) {
         const currentKeys = this.selectableKeys();
         const currentKeySet = new Set(currentKeys);
         let removedExpansion = false;
@@ -917,6 +934,18 @@ export class AgentActivityViewerModel {
     this.cachedLineCount = undefined;
   }
 
+  private resetForSnapshotEpoch(): void {
+    this.expandedKeys.clear();
+    this.selectedKey = undefined;
+    this.liveDrafts = Object.freeze([]);
+    this.scrollOffset = 0;
+    this.followEnabled = true;
+    this.settledTools.clear();
+    this.bodyBlockCache.clear();
+    this.cachedLayout = undefined;
+    this.cachedLineCount = undefined;
+  }
+
   /** 打开时只检查尾部视口，选择其中最新的可展开项。 */
   private initializeSelection(): void {
     const lines = this.visibleEventLines(this.layoutWidth);
@@ -1053,11 +1082,15 @@ export class AgentActivityViewerModel {
     for (const entry of this.entries) {
       const body = entry.body;
       if (body.type === "message") {
+        const streamId = body.displayStream?.streamId ?? body.streamId;
+        const displayDraftKey = body.displayStream === undefined
+          ? (streamId === undefined ? undefined : agentDisplayDraftKey(entry.incarnation_id, streamId))
+          : agentDisplayDraftKey(entry.incarnation_id, body.displayStream);
         entries.push({
           kind: "message",
           entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
-          ...(body.streamId === undefined ? {} : { streamId: body.streamId }),
+          ...(displayDraftKey === undefined ? {} : { displayDraftKey }),
           content: body.content,
         });
         continue;
@@ -1263,17 +1296,16 @@ export class AgentActivityViewerModel {
           for (const block of entry.content) {
             if (block.type === "text") {
               addCached(
-                entry.streamId === undefined
+                entry.displayDraftKey === undefined
                   ? `message-text:${entry.incarnationId}:${entry.entryId}:${blockIndex}`
-                  : `live-text:${entry.incarnationId}|${entry.streamId}:${blockIndex}`,
+                  : `live-text:${entry.displayDraftKey}:${blockIndex}`,
                 "markdown-body",
                 block.text,
               );
             } else {
               const key = messageThinkingKey(
                 entry.entryId,
-                entry.incarnationId,
-                entry.streamId,
+                entry.displayDraftKey,
                 blockIndex,
               );
               const expanded = this.expandedKeys.has(key);
@@ -1283,9 +1315,9 @@ export class AgentActivityViewerModel {
               );
               addMaybeExpandedCached(
                 expanded,
-                entry.streamId === undefined
+                entry.displayDraftKey === undefined
                   ? `message-thinking:${entry.incarnationId}:${entry.entryId}:${blockIndex}`
-                  : `live-thinking:${entry.incarnationId}|${entry.streamId}:${blockIndex}`,
+                  : `live-thinking:${entry.displayDraftKey}:${blockIndex}`,
                 "guided-markdown-terminal",
                 block.thinking,
               );
@@ -1532,10 +1564,10 @@ type DisplayEntry =
   | {
       readonly kind: "message";
       readonly entryId: string;
-      /** 运行实例身份；与 streamId 共同构成实时显示流的草稿身份。 */
+      /** 运行实例身份。 */
       readonly incarnationId: string;
       /** 与实时显示流的精确关联身份；缺省表示没有可关联的实时流。 */
-      readonly streamId?: string;
+      readonly displayDraftKey?: string;
       readonly content: readonly SafeAgentActivityContentBlock[];
     }
   | {
@@ -2521,7 +2553,9 @@ function nearestSurvivingKey(
 }
 
 function isValidActivitySnapshot(value: AgentActivitySnapshot): boolean {
-  return Number.isSafeInteger(value.revision)
+  return Number.isSafeInteger(value.snapshotEpoch)
+    && value.snapshotEpoch >= 0
+    && Number.isSafeInteger(value.revision)
     && value.revision >= 0
     && Array.isArray(value.entries)
     && typeof value.olderActivityOmitted === "boolean";
