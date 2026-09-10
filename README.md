@@ -2,6 +2,8 @@
 
 # 🌳 wj-pi-subagents
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 **A multi-level subagent orchestration plugin for [Pi](https://github.com/earendil-works/pi-mono)**
 
 No built-in templates · No preset workflows · Everything is yours to shape
@@ -31,6 +33,7 @@ No built-in templates · No preset workflows · Everything is yours to shape
 | ♻️ | **Context reuse** | The same subagent can take on tasks consecutively while keeping its own session context |
 | 🎛️ | **Controlled management** | A parent agent can only manage its direct children, supporting wait, status query, interrupt, reuse, and termination |
 | 👁️ | **Visible status** | The TUI shows the status of direct subagents; `/agents` shows the full agent tree within the current session scope |
+| 🔭 | **Live activity viewer** | Press `Enter` on any agent in the tree to watch it work in real time |
 | 🗜️ | **Native context compaction** | Relies on the post-tool compaction flow of Pi `>= 0.85.1`; each root session and subagent manages its own context through its independent Pi session |
 
 ## 📦 Requirements
@@ -131,13 +134,97 @@ After adding or modifying templates, run:
 
 ## 👀 View Agent Status
 
-The `Agents` area in the TUI shows the direct subagents of the current session. Run the following command to view the agent tree:
+Whenever the current session has subagents, a persistent `Agents` area sits above the input box. Each direct subagent that has not been terminated yet gets one line there: a live status icon (an animated spinner while working) followed by template, name, state, activity phase, context usage, and elapsed time. The area disappears when no subagent is left:
+
+```text
+● Agents
+├─ ⠋ researcher · explore-auth · working · processing · 12.3%/200k · 2m 14s
+└─ ○ worker · fix-tests · idle · 0s
+```
+
+Run the following command to open the agent tree panel:
 
 ```text
 /agents
 ```
 
 The root session can view the entire agent tree; a subagent can only view its own subtree. A parent agent can only operate on its direct children.
+
+Inside the tree panel:
+
+```text
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ AGENT TREE                                 REV 7 ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ › ▾ worker · fix-tests · working · processing    ┃
+┃     · reviewer · review-pr · idle                ┃
+┃   ▸ researcher · explore-auth · idle             ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ ↑↓ scroll · ←→ fold · Home/End jump · Esc close  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move the selection |
+| `←` / `→` | Fold / unfold a branch |
+| `Home` / `End` | Jump to the first / last row |
+| `Enter` | Open the live activity viewer of the selected agent |
+| `Esc` | Close the panel |
+
+Mouse input works in Pi's fullscreen TUI mode (`--tui-mode fullscreen` at startup, or switch TUI mode in `/settings`): wheel scrolls, click selects a row, and clicking the selected row again folds or unfolds its children. In regular mode the terminal owns the mouse, so use the keyboard.
+
+## 🔭 Live Activity Viewer
+
+Wondering what a subagent is actually doing behind its `working` status? Select any agent in the tree — a direct child, a grandchild, or any deeper descendant — and press `Enter` to open its live activity viewer: a read-only, full-screen view of that agent's work, rendered much like your main session.
+
+Opening the viewer first replays the agent's recent activity, then keeps appending new events live while the agent works. You can watch:
+
+- **Assistant replies** rendered as Markdown, streamed in real time while they are being written
+- **Thinking** collapsed into a single `Thinking` line — marked `streaming` while still being generated, and expandable to follow the reasoning live
+- **Tool activity** as color-coded one-line summaries: which files were read or written, what was searched, which agents were spawned or messaged — with shell commands shown in full
+- **Parent messages** and submitted replies/reports, expandable to their full Markdown body
+
+The whole view looks like this:
+
+```text
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ AGENT ACTIVITY · worker · fix-tests · working                              ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ ▸ Parent message                                                           ┃
+┃ ▸ Thinking                                                                 ┃
+┃ The failing test expects unclosed brackets to be rejected — checking       ┃
+┃ the parser implementation first.                                           ┃
+┃ ↻ read · test/parser.test.ts                                               ┃
+┃ ▸ ✓ bash · timeout 120s                                                    ┃
+┃ ✓ edit · src/parser.ts                                                     ┃
+┃ ▸ ✓ final_report                                                           ┃
+┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+┃ ↑↓ scroll · Tab/Shift+Tab select · Enter expand · Home/End jump · Esc back ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+```
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Scroll |
+| `Home` / `End` | Jump to the top / bottom |
+| `Tab` / `Shift+Tab` | Select the next / previous expandable entry |
+| `Enter` or `Space` | Expand / collapse the selected entry |
+| `→` / `←` | Expand only / collapse only |
+| `Esc` | Back to the tree panel |
+
+The mouse works here too: wheel scrolls, and clicking an expandable line expands or collapses it.
+
+The viewer follows the newest activity automatically. Scrolling up pauses following; scrolling back to the bottom (or pressing `End`) resumes it.
+
+A few things worth knowing:
+
+- The viewer is **read-only**: browsing never sends anything to the agent.
+- Activity is display-only: it never enters your main conversation and never consumes the parent agent's context or tokens.
+- Each agent keeps its most recent 100 activity entries in memory for the current session; older entries are dropped with an `Older activity omitted` notice.
+- Activity lives in memory only: exiting Pi or running `/reload` clears it.
+- Terminated agents can still be replayed within the current session, so you can review what they did after they are gone.
+- The viewer is available in TUI mode only.
 
 ## 🧩 Agent Templates
 
