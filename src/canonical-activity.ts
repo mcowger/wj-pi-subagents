@@ -1,5 +1,5 @@
 import {
-  parseAgentActivityEvent,
+  parseCanonicalAgentActivityEvent,
   type SafeAgentActivityEvent,
 } from "./rpc-bridge-event.ts";
 import { createHash } from "node:crypto";
@@ -9,12 +9,12 @@ import { isCanonicalUuid } from "./tree-controller.ts";
  * 规范活动条目契约版本。版本字符串随原子正文或身份语义的不兼容变化递增；
  * 旧版本条目不得与当前运行实例混用，接收端按协议故障处理。
  */
-export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/7";
+export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/8";
 
 /**
  * 工具活动条目身份的派生命名空间。工具开始与结束是同一条目的状态事实，
- * 产生端用固定命名空间从运行实例身份与工具活动 ID 确定性派生同一条目
- * 身份，使两者在缓存、回放与去重中聚合为同一原子条目。
+ * 产生端用固定命名空间从运行实例身份、工具活动 ID 与执行代次确定性派生
+ * 同一条目身份，使两者在缓存、回放与去重中聚合为同一原子。
  */
 export const TOOL_ACTIVITY_ENTRY_NAMESPACE = "9f6d2c14-8a47-4b8e-9d31-2c5a7f0b4e68";
 
@@ -40,7 +40,7 @@ export type CanonicalActivityBody = SafeAgentActivityEvent;
  * 一条规范活动条目。条目是活动的最小权威单元：代理身份、运行实例身份与
  * 条目身份共同承担跨进程、跨层转发时的关联、幂等与回填职责；显示用短 ID
  * 不参与协议身份。一条完整 assistant 消息是一个条目，工具开始与结束共享
- * 同一条目身份（由产生端分配）。
+ * 同一条目身份（由产生端按运行实例、toolCallId 与执行代次分配）。
  */
 export interface CanonicalAgentActivityEntry {
   readonly contract_version: typeof CANONICAL_ACTIVITY_CONTRACT_VERSION;
@@ -116,7 +116,7 @@ export function parseCanonicalAgentActivityEntry(value: unknown): CanonicalActiv
   if (!isCanonicalUuid(value.agent_id)) return INVALID_ENTRY;
   if (!isCanonicalUuid(value.incarnation_id)) return INVALID_ENTRY;
   if (!isCanonicalUuid(value.entry_id)) return INVALID_ENTRY;
-  const body = parseAgentActivityEvent(value.body);
+  const body = parseCanonicalAgentActivityEvent(value.body);
   if (body.kind !== "event") return INVALID_ENTRY;
   const agentId = value.agent_id;
   const incarnationId = value.incarnation_id;

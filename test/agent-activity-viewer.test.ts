@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
-import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Markdown, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
   AgentActivityViewerModel,
   displayWidth,
@@ -22,6 +22,7 @@ import {
   type CanonicalAgentActivityEntry,
 } from "../src/canonical-activity.ts";
 import type { AgentLifecycleState } from "../src/agent-snapshot-codec.ts";
+import type { AgentActivitySnapshot } from "../src/agent-activity-cache.ts";
 
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440002";
 const INCARNATION_ID = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
@@ -63,17 +64,20 @@ function toolStart(
   origin: SafeToolOrigin = "unknown",
   incarnationId: string = INCARNATION_ID,
   summary?: SafeToolSummary,
+  entryId: string = randomUUID(),
+  executionGeneration?: number,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
     incarnation_id: incarnationId,
-    entry_id: randomUUID(),
+    entry_id: entryId,
     body: Object.freeze({
       type: "tool_execution_start",
       toolCallId,
       toolName,
       origin,
+      ...(executionGeneration === undefined ? {} : { executionGeneration }),
       ...(summary === undefined ? {} : { summary }),
     }),
   });
@@ -88,17 +92,20 @@ function toolEnd(
   summary?: SafeToolSummary,
   errorText?: string,
   errorCode?: string,
+  entryId: string = randomUUID(),
+  executionGeneration?: number,
 ): CanonicalAgentActivityEntry {
   return Object.freeze({
     contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
     agent_id: AGENT_ID,
     incarnation_id: incarnationId,
-    entry_id: randomUUID(),
+    entry_id: entryId,
     body: Object.freeze({
       type: "tool_execution_end",
       toolCallId,
       toolName,
       origin,
+      ...(executionGeneration === undefined ? {} : { executionGeneration }),
       isError,
       ...(summary === undefined ? {} : { summary }),
       ...(errorText === undefined ? {} : { errorText }),
@@ -147,6 +154,35 @@ function assembledDrafts(
   return registry.drafts(agentId);
 }
 
+/** 构造独立对象的 thinking 草稿快照，用于验证查看器的快照等价与状态切换。 */
+function thinkingDraftSnapshot(
+  state: AgentDisplayDraftView["state"],
+  key = `${INCARNATION_ID}|message-1`,
+  value = "流式思考",
+): readonly AgentDisplayDraftView[] {
+  return Object.freeze([
+    Object.freeze({
+      key,
+      state,
+      blocks: Object.freeze([
+        Object.freeze({ contentIndex: 0, contentType: "thinking" as const, value }),
+      ]),
+    }),
+  ]);
+}
+
+function activitySnapshot(
+  entries: readonly CanonicalAgentActivityEntry[],
+  revision: number,
+  olderActivityOmitted = false,
+): AgentActivitySnapshot {
+  return Object.freeze({
+    entries: Object.freeze([...entries]),
+    revision,
+    olderActivityOmitted,
+  });
+}
+
 /** 4 行正文消息 + 一条完成工具 = 6 行事件正文。 */
 function replayFixture(): readonly CanonicalAgentActivityEntry[] {
   return Object.freeze([
@@ -165,6 +201,179 @@ test("打开即回放全部规范条目历史", () => {
   assert.ok(lines.some((line) => line.includes("line4")));
   assert.ok(lines.some((line) => line.includes("read_file")), lines.join("\n"));
   assert.equal(viewer.getPublicState().event_count, 3);
+});
+
+test("snapshot 同槽位把工具 start 原地更新为 end，并按 revision 幂等", () => {
+  const entryId = randomUUID();
+  const summary = { tool: "bash", command: "npm test", timeout: 5 } as const;
+  const start = toolStart("snapshot-tool", "bash", "pi_native", INCARNATION_ID, summary, entryId);
+  const end = toolEnd(
+    "snapshot-tool",
+    "bash",
+    false,
+    "pi_native",
+    INCARNATION_ID,
+    summary,
+    undefined,
+    undefined,
+    entryId,
+  );
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot([start], 1),
+    { viewport_height: 20 },
+  );
+  const selected = viewer.getSelectedKey();
+  assert.match(selected ?? "", /^tool-command:/u);
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.deepEqual(viewer.getExpandedKeys(), [selected]);
+  assert.match(viewer.render(120).join("\n"), /↻ bash.*npm test/us);
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot([end], 2)), "changed");
+  const completed = viewer.render(120).slice(1, -1);
+  assert.ok(completed.some((line) => line.includes("✓ bash")), completed.join("\n"));
+  assert.ok(completed.includes("│ npm test"), completed.join("\n"));
+  assert.doesNotMatch(completed.join("\n"), /↻/u);
+  assert.equal(completed.filter((line) => line.includes("bash")).length, 1);
+  assert.equal(viewer.getPublicState().event_count, 1);
+  assert.equal(viewer.getSelectedKey(), selected);
+  assert.deepEqual(viewer.getExpandedKeys(), [selected]);
+
+  // 同一 revision 即使携带旧内容也必须 no-op，不能把完成态回退。
+  assert.equal(viewer.syncSnapshot(activitySnapshot([start], 2)), "ignored");
+  assert.match(viewer.render(120).join("\n"), /✓ bash/u);
+});
+
+test("snapshot 100 条窗口滑动不会被同长度游标忽略，follow 始终贴尾", () => {
+  const initial = Array.from({ length: 100 }, (_, index) => textMessage(`activity-${index}`));
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot(initial, 1),
+    { viewport_height: 3 },
+  );
+  assert.equal(viewer.getPublicState().scroll_offset, 97);
+
+  const next = [...initial.slice(1), textMessage("activity-100")];
+  assert.equal(viewer.syncSnapshot(activitySnapshot(next, 2, true)), "changed");
+  const state = viewer.getPublicState();
+  assert.equal(state.event_count, 100);
+  assert.equal(state.follow_enabled, true);
+  assert.equal(state.scroll_offset, state.max_scroll_offset);
+  assert.match(viewer.render(120).join("\n"), /activity-100/u);
+
+  assert.equal(viewer.handleInput("\x1b[H"), "changed");
+  const top = viewer.render(120).slice(1, -1);
+  assert.equal(top[0], "Older activity omitted");
+  assert.match(top[1] ?? "", /activity-1/u);
+  assert.doesNotMatch(top.join("\n"), /activity-0/u);
+});
+
+test("omission-only snapshot 显示固定 dim 提示且不计数、不参与选择", () => {
+  const thinking = messageEntry([{ type: "thinking", thinking: "保留思考" }]);
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot([thinking], 4),
+    { viewport_height: 20 },
+  );
+  const selected = viewer.getSelectedKey();
+  assert.ok(selected !== undefined);
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot([thinking], 5, true)), "changed");
+  assert.equal(viewer.render(120).slice(1, -1)[0], "Older activity omitted");
+  assert.equal(viewer.getPublicState().event_count, 1);
+  assert.equal(viewer.getSelectedKey(), selected);
+  assert.deepEqual(viewer.getExpandedKeys(), []);
+
+  const surface = renderAgentActivityViewerSurface(viewer, 120, Object.freeze({
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  })).join("\n");
+  assert.match(surface, /<fg:dim>Older activity omitted/u);
+});
+
+test("snapshot 淘汰选中项时优先选择其后 survivor，再选其前并清理展开键", () => {
+  const [first, selectedEntry, after, last, appended] = [
+    "first", "selected", "after", "last", "appended",
+  ].map((label) => messageEntry([{ type: "thinking", thinking: label }]));
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot([first!, selectedEntry!, after!, last!], 1),
+    { viewport_height: 2 },
+  );
+
+  assert.equal(viewer.handleInput("\t"), "changed");
+  const firstKey = viewer.getSelectedKey();
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.equal(viewer.handleInput("\t"), "changed");
+  const removedKey = viewer.getSelectedKey();
+  assert.equal(viewer.handleInput("\r"), "changed");
+  assert.deepEqual(new Set(viewer.getExpandedKeys()), new Set([firstKey, removedKey]));
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot([
+    first!, after!, last!, appended!,
+  ], 2, true)), "changed");
+  assert.equal(viewer.getSelectedKey(), `thinking:${after!.entry_id}:0`);
+  assert.deepEqual(viewer.getExpandedKeys(), [firstKey]);
+
+  // 没有其后 survivor 时回退到其前；没有任何候选时清空选择与展开。
+  assert.equal(viewer.syncSnapshot(activitySnapshot([first!], 3, true)), "changed");
+  assert.equal(viewer.getSelectedKey(), firstKey);
+  assert.deepEqual(viewer.getExpandedKeys(), [firstKey]);
+  assert.equal(viewer.syncSnapshot(activitySnapshot([textMessage("only text")], 4, true)), "changed");
+  assert.equal(viewer.getSelectedKey(), undefined);
+  assert.deepEqual(viewer.getExpandedKeys(), []);
+  const state = viewer.getPublicState();
+  assert.ok(state.scroll_offset >= 0 && state.scroll_offset <= state.max_scroll_offset);
+});
+
+test("snapshot 缩短时暂停位置保持并 clamp，恢复增长后不擅自 follow", () => {
+  const entries = Array.from({ length: 8 }, (_, index) => textMessage(`scroll-${index}`));
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot(entries, 1),
+    { viewport_height: 3 },
+  );
+  assert.equal(viewer.handleInput("\x1b[H"), "changed");
+  assert.equal(viewer.handleInput("j"), "changed");
+  assert.equal(viewer.handleInput("j"), "changed");
+  assert.equal(viewer.getPublicState().scroll_offset, 2);
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot(entries.slice(0, 4), 2)), "changed");
+  let state = viewer.getPublicState();
+  assert.equal(state.follow_enabled, false);
+  assert.equal(state.scroll_offset, 1);
+  assert.equal(state.max_scroll_offset, 1);
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot(entries, 3)), "changed");
+  state = viewer.getPublicState();
+  assert.equal(state.follow_enabled, false);
+  assert.equal(state.scroll_offset, 1);
+  assert.ok(state.scroll_offset <= state.max_scroll_offset);
+});
+
+test("snapshot 窗口移动不改变既有工具收束，也不让后来工具继承旧 settlement", () => {
+  const settledId = randomUUID();
+  const settled = toolStart("settled", "read_file", "unknown", INCARNATION_ID, undefined, settledId);
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent("idle"),
+    activitySnapshot([textMessage("older"), settled], 1),
+    { viewport_height: 20 },
+  );
+  assert.match(viewer.render(120).join("\n"), /read_file · result unavailable/u);
+
+  assert.equal(viewer.syncSnapshot(activitySnapshot([settled], 2, true)), "changed");
+  assert.match(viewer.render(120).join("\n"), /read_file · result unavailable/u);
+
+  const later = toolStart("later", "wait_agent", "plugin");
+  assert.equal(viewer.syncSnapshot(activitySnapshot([settled, later], 3, true)), "changed");
+  const body = viewer.render(120).join("\n");
+  assert.match(body, /read_file · result unavailable/u);
+  assert.match(body, /↻ wait_agent · …/u);
+  assert.doesNotMatch(
+    body.split("\n").find((line) => line.includes("wait_agent")) ?? "",
+    /result unavailable/u,
+  );
 });
 
 test("工具开始立即建立运行中条目，结束原地更新同一条目且不产生独立结果行", () => {
@@ -197,6 +406,20 @@ test("工具开始立即建立运行中条目，结束原地更新同一条目�
   assert.match(lines, /✓ read_file/u);
   assert.match(lines, /× run_cmd/u);
 });
+
+test("查看器按 executionGeneration 分离同 toolCallId 的复用执行", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolStart("reused", "read_file", "unknown", INCARNATION_ID, undefined, "11111111-1111-4111-8111-111111111111", 1),
+    toolEnd("reused", "read_file", false, "unknown", INCARNATION_ID, undefined, undefined, undefined, "11111111-1111-4111-8111-111111111111", 1),
+    toolStart("reused", "read_file", "unknown", INCARNATION_ID, undefined, "22222222-2222-4222-8222-222222222222", 2),
+    toolEnd("reused", "read_file", true, "unknown", INCARNATION_ID, undefined, undefined, undefined, "22222222-2222-4222-8222-222222222222", 2),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1).filter((line) => line.includes("read_file"));
+  assert.equal(lines.length, 2);
+  assert.match(lines[0] ?? "", /✓ read_file/u);
+  assert.match(lines[1] ?? "", /× read_file/u);
+});
+
 
 test("工具状态图标前置，标题颜色跟随状态，折叠指示符始终为 dim", () => {
   const theme = {
@@ -463,6 +686,77 @@ test("超长 text 仍完整渲染，不按长度折叠", () => {
   assert.doesNotMatch(body, /collapsed|省略|truncated/u);
 });
 
+test("3 MB ASCII 正文尾部惰性布局后仍完整保留，并精确响应 End", () => {
+  const markers = Array.from({ length: 30_000 }, (_, index) => (
+    `marker-${String(index).padStart(5, "0")} ${"x".repeat(89)}`
+  ));
+  const finalLine = "z".repeat(43);
+  const expected = [...markers, finalLine];
+  const source = expected.join("\n");
+  assert.equal(Buffer.byteLength(source), 3_090_043);
+
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(source)], {
+    viewport_height: 3,
+  });
+  assert.deepEqual(viewer.render(120).slice(1, -1), expected.slice(-3));
+
+  let state = viewer.getPublicState();
+  assert.equal(state.max_scroll_offset, expected.length - 3);
+  assert.equal(state.scroll_offset, state.max_scroll_offset);
+  assert.equal(viewer.handleInput("\x1b[H"), "changed");
+  assert.deepEqual(viewer.render(120).slice(1, -1), expected.slice(0, 3));
+  for (let index = 0; index < 15_000; index += 1) viewer.handleInput("\x1b[B");
+  assert.deepEqual(viewer.render(120).slice(1, -1), expected.slice(15_000, 15_003));
+  assert.equal(viewer.handleInput("\x1b[F"), "changed");
+  state = viewer.getPublicState();
+  assert.equal(state.scroll_offset, state.max_scroll_offset);
+  assert.deepEqual(viewer.render(120).slice(1, -1), expected.slice(-3));
+});
+
+test("长单行正文的尾部窗口保持自然软换行顺序", () => {
+  const segments = Array.from({ length: 1_000 }, (_, index) => `part-${String(index).padStart(4, "0")}`);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(segments.join(" "))], {
+    viewport_height: 3,
+  });
+
+  assert.deepEqual(viewer.render(10).slice(1, -1), segments.slice(-3));
+});
+
+test("长简单 CJK 正文的尾部窗口保持字素宽度与自然顺序", () => {
+  const segments = Array.from(
+    { length: 1_000 },
+    (_, index) => `${index % 2 === 0 ? "你" : "𠀀"}${String(index).padStart(4, "0")}`,
+  );
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(segments.join(" "))], {
+    viewport_height: 3,
+  });
+
+  assert.deepEqual(viewer.render(12).slice(1, -1), segments.slice(-3));
+  const state = viewer.getPublicState();
+  assert.equal(state.max_scroll_offset, segments.length - 3);
+});
+
+test("长 Markdown 缩进代码与 Setext 标题仍走 Markdown 解析", () => {
+  const source = `${"    const retained = true;\n".repeat(180)}Heading\n=======`;
+  assert.ok(source.length > 4_096);
+  const originalRender = Markdown.prototype.render;
+  let markdownRenderCount = 0;
+  Markdown.prototype.render = function renderWithCount(width: number): string[] {
+    markdownRenderCount += 1;
+    return originalRender.call(this, width);
+  };
+
+  try {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage(source)], {
+      viewport_height: 3,
+    });
+    viewer.render(80);
+    assert.ok(markdownRenderCount > 0);
+  } finally {
+    Markdown.prototype.render = originalRender;
+  }
+});
+
 test("thinking 默认以统一折叠标题显示，不包含行数或正文预览", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     messageEntry([
@@ -706,6 +1000,184 @@ test("选中条目使用整行选中背景渲染", () => {
   const selectedLines = surface.filter((line) => line.includes("<bg:selectedBg>"));
   assert.equal(selectedLines.length, 1, surface.join("\n"));
   assert.match(selectedLines[0] ?? "", /Thinking/u);
+});
+
+test("构造时只布局尾部，公开状态收敛后复用默认宽度 Markdown 布局", () => {
+  const originalRender = Markdown.prototype.render;
+  let markdownRenderCount = 0;
+  Markdown.prototype.render = function renderWithCount(width: number): string[] {
+    markdownRenderCount += 1;
+    return originalRender.call(this, width);
+  };
+
+  try {
+    const viewer = new AgentActivityViewerModel(viewerAgent("idle"), [
+      textMessage("历史正文"),
+      toolStart("settled-tool", "read_file"),
+      messageEntry([{ type: "thinking", thinking: "最近思考" }]),
+    ], { drafts: Object.freeze([]), viewport_height: 2 });
+
+    assert.equal(markdownRenderCount, 0);
+    const state = viewer.getPublicState();
+    assert.equal(state.follow_enabled, true);
+    assert.equal(state.scroll_offset, state.max_scroll_offset);
+    assert.match(state.selected_key ?? "", /^thinking:/u);
+    assert.equal(markdownRenderCount, 1);
+    assert.match(viewer.render(80).join("\n"), /read_file · result unavailable/u);
+    assert.equal(markdownRenderCount, 1);
+  } finally {
+    Markdown.prototype.render = originalRender;
+  }
+});
+
+test("等价实时草稿快照返回 ignored 且复用现有 Markdown 投影", () => {
+  const key = `${INCARNATION_ID}|message-1`;
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [textMessage("历史正文")], {
+    drafts: thinkingDraftSnapshot("streaming", key),
+    viewport_height: 20,
+  });
+  assert.match(viewer.render(80).join("\n"), /Thinking · streaming/u);
+  const stateBefore = viewer.getPublicState();
+  const originalRender = Markdown.prototype.render;
+  let markdownRenderCount = 0;
+  Markdown.prototype.render = function renderWithCount(width: number): string[] {
+    markdownRenderCount += 1;
+    return originalRender.call(this, width);
+  };
+
+  try {
+    assert.equal(viewer.setLiveDrafts(thinkingDraftSnapshot("streaming", key)), "ignored");
+    assert.deepEqual(viewer.getPublicState(), stateBefore);
+    assert.match(viewer.render(80).join("\n"), /Thinking · streaming/u);
+    assert.equal(markdownRenderCount, 0);
+  } finally {
+    Markdown.prototype.render = originalRender;
+  }
+
+  assert.equal(
+    viewer.setLiveDrafts(thinkingDraftSnapshot("streaming", `${INCARNATION_ID}|message-2`)),
+    "changed",
+  );
+});
+
+test("实时草稿增长只重渲染变化草稿块，不重解析大历史", () => {
+  const history = Array.from({ length: 40 }, (_, index) => textMessage(
+    `## 历史 ${index}\n\n${"不变 Markdown 正文 ".repeat(30)}`,
+  ));
+  const draft = (value: string): readonly AgentDisplayDraftView[] => Object.freeze([
+    Object.freeze({
+      key: `${INCARNATION_ID}|streaming-text`,
+      state: "streaming" as const,
+      blocks: Object.freeze([
+        Object.freeze({ contentIndex: 0, contentType: "text" as const, value }),
+      ]),
+    }),
+  ]);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), history, {
+    drafts: draft("draft one"),
+    viewport_height: 4,
+  });
+  viewer.render(120);
+
+  const originalRender = Markdown.prototype.render;
+  let markdownRenderCount = 0;
+  Markdown.prototype.render = function renderWithCount(width: number): string[] {
+    markdownRenderCount += 1;
+    return originalRender.call(this, width);
+  };
+
+  try {
+    assert.equal(viewer.setLiveDrafts(draft("draft one grows")), "changed");
+    const body = viewer.render(120).slice(1, -1).join("\n");
+    assert.match(body, /draft one grows/u);
+    assert.equal(markdownRenderCount, 1);
+  } finally {
+    Markdown.prototype.render = originalRender;
+  }
+});
+
+test("snapshot 原地替换不重解析未变化的 Markdown 历史", () => {
+  const history = Array.from({ length: 40 }, (_, index) => textMessage(
+    `## 历史 ${index}\n\n${"不变 Markdown 正文 ".repeat(30)}`,
+  ));
+  const entryId = randomUUID();
+  const summary = { tool: "bash", command: "echo snapshot" } as const;
+  const start = toolStart("snapshot-cache", "bash", "pi_native", INCARNATION_ID, summary, entryId);
+  const end = toolEnd(
+    "snapshot-cache",
+    "bash",
+    false,
+    "pi_native",
+    INCARNATION_ID,
+    summary,
+    undefined,
+    undefined,
+    entryId,
+  );
+  const viewer = new AgentActivityViewerModel(
+    viewerAgent(),
+    activitySnapshot([...history, start], 1),
+    { viewport_height: 4 },
+  );
+  viewer.render(120);
+
+  const originalRender = Markdown.prototype.render;
+  let markdownRenderCount = 0;
+  Markdown.prototype.render = function renderWithCount(width: number): string[] {
+    markdownRenderCount += 1;
+    return originalRender.call(this, width);
+  };
+
+  try {
+    assert.equal(viewer.syncSnapshot(activitySnapshot([...history, end], 2)), "changed");
+    assert.match(viewer.render(120).join("\n"), /✓ bash/u);
+    assert.equal(markdownRenderCount, 0);
+  } finally {
+    Markdown.prototype.render = originalRender;
+  }
+});
+
+test("首次打开只布局尾部视口，公开滚动范围按需精确收敛", () => {
+  const history = Array.from({ length: 60 }, (_, index) => textMessage(`History ${index}`));
+  const originalRender = Markdown.prototype.render;
+  let markdownRenderCount = 0;
+  Markdown.prototype.render = function renderWithCount(width: number): string[] {
+    markdownRenderCount += 1;
+    return originalRender.call(this, width);
+  };
+
+  try {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), history, { viewport_height: 3 });
+    const body = viewer.render(120).slice(1, -1).join("\n");
+    assert.match(body, /History 59/u);
+    assert.ok(markdownRenderCount <= 6, `expected tail-only layout, got ${markdownRenderCount}`);
+
+    const beforeExactState = markdownRenderCount;
+    const state = viewer.getPublicState();
+    assert.equal(state.max_scroll_offset, 57);
+    assert.ok(markdownRenderCount > beforeExactState);
+  } finally {
+    Markdown.prototype.render = originalRender;
+  }
+});
+
+test("草稿内容不变时 streaming、complete 与 frozen 状态仍更新标题", () => {
+  const key = `${INCARNATION_ID}|message-1`;
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [], {
+    drafts: thinkingDraftSnapshot("streaming", key),
+    viewport_height: 20,
+  });
+  assert.ok(viewer.render(80).slice(1, -1).includes("▸ Thinking · streaming"));
+
+  assert.equal(viewer.setLiveDrafts(thinkingDraftSnapshot("complete", key)), "changed");
+  let body = viewer.render(80).slice(1, -1);
+  assert.ok(body.includes("▸ Thinking"), body.join("\n"));
+  assert.doesNotMatch(body.join("\n"), /streaming/u);
+
+  assert.equal(viewer.setLiveDrafts(thinkingDraftSnapshot("frozen", key)), "changed");
+  body = viewer.render(80).slice(1, -1);
+  assert.ok(body.includes("▸ Thinking · streaming incomplete"), body.join("\n"));
+  assert.equal(viewer.setLiveDrafts(thinkingDraftSnapshot("frozen", key)), "ignored");
 });
 
 test("实时草稿驻留查看器投影，complete 后保持显示并被权威条目原地替换", () => {

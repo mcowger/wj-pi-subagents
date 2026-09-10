@@ -7,6 +7,7 @@ import {
   type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import type { AgentLifecycleState } from "./agent-snapshot-codec.ts";
+import type { AgentActivitySnapshot } from "./agent-activity-cache.ts";
 import {
   isMessageToolSummary,
   sanitizeSafeActivityText,
@@ -18,6 +19,7 @@ import type { AgentDisplayDraftView } from "./agent-display-drafts.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
 import {
   displayWidth,
+  graphemeWidth,
   renderFramedPanelLine,
   renderNarrowPanelLine,
   renderPanelRule,
@@ -44,6 +46,7 @@ const WAIT_AGENT_RUNNING_TEXT = "…";
 /** 冻结草稿末尾的弱化省略号：实时预览不完整的显示事实。 */
 const FROZEN_DRAFT_ELLIPSIS = "…";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
+const OLDER_ACTIVITY_OMITTED_TEXT = "Older activity omitted";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
 const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Home/End jump · Esc back";
 const RENDER_VIEWER_LINES = Symbol("renderViewerLines");
@@ -114,13 +117,274 @@ interface ViewerSemanticLine {
   readonly error_tail?: string;
 }
 
-type SettledLifecycleState = "idle" | "failed" | "terminated";
+const BODY_LAYOUT_WIDTH_CACHE_LIMIT = 2;
 
-interface ViewerSettlement {
-  /** 收束发生时查看器已经观察到的规范条目数量。 */
-  readonly entryCount: number;
-  readonly state: SettledLifecycleState;
+type CachedBodyKind =
+  | "markdown-body"
+  | "markdown-terminal"
+  | "guided-markdown-body"
+  | "guided-markdown-terminal"
+  | "guided-tool-error"
+  | "guided-shell-command";
+
+interface CachedBodySpec {
+  readonly key: string;
+  readonly kind: CachedBodyKind;
+  readonly source: string;
 }
+
+interface CachedBodyWidthLayout {
+  readonly lineCount: () => number;
+  readonly renderWindow: (start: number, limit: number) => readonly ViewerSemanticLine[];
+  readonly renderTail: (limit: number) => readonly ViewerSemanticLine[];
+}
+
+interface ViewerLayoutBlock {
+  /** 当前块内按视觉顺序出现的可选择条目，不依赖正文已经布局。 */
+  readonly selectableKeys: readonly string[];
+  /** 当前宽度下的精确行数；不得以估算值参与公开滚动状态。 */
+  readonly lineCount: (width: number) => number;
+  /** 只物化块内与绝对窗口相交的行。 */
+  readonly renderWindow: (
+    width: number,
+    start: number,
+    limit: number,
+  ) => readonly ViewerSemanticLine[];
+  /** 从块尾部只物化请求的行数。 */
+  readonly renderTail: (width: number, limit: number) => readonly ViewerSemanticLine[];
+}
+
+interface ViewerLayout {
+  readonly blocks: readonly ViewerLayoutBlock[];
+  readonly selectableKeys: readonly string[];
+}
+
+/**
+ * 纯文本正文的按需布局器。它只保留精确行数和请求窗口，不创建整块行数组；
+ * 每一行仍按现有 Markdown 的软换行规则处理，复杂语法则交给完整 Markdown
+ * 渲染器，避免为了性能牺牲 Markdown 语义。
+ */
+class PlainTextBodyLayout {
+  private readonly source: string;
+  private readonly width: number;
+  private readonly style: UiPanelLineStyle;
+  private readonly guided: boolean;
+  private readonly outerWidth: number;
+  private readonly trimTrailing: boolean;
+  private cachedLineCount: number | undefined;
+
+  constructor(
+    source: string,
+    width: number,
+    style: UiPanelLineStyle,
+    guided: boolean,
+    outerWidth: number,
+    trimTrailing: boolean,
+  ) {
+    this.source = source;
+    this.width = Math.max(1, width);
+    this.style = style;
+    this.guided = guided;
+    this.outerWidth = outerWidth;
+    this.trimTrailing = trimTrailing;
+  }
+
+  lineCount(): number {
+    if (this.cachedLineCount !== undefined) return this.cachedLineCount;
+    if (this.source.length === 0) {
+      this.cachedLineCount = 0;
+      return 0;
+    }
+    let total = 0;
+    this.forEachPhysicalLine((line) => {
+      total += countWrappedPlainLine(line, this.width, this.trimTrailing);
+      return false;
+    });
+    this.cachedLineCount = total;
+    return total;
+  }
+
+  renderWindow(start: number, limit: number): readonly ViewerSemanticLine[] {
+    const first = Math.max(0, start);
+    const last = first + Math.max(0, limit);
+    if (last <= first || this.source.length === 0) return Object.freeze([]);
+
+    const result: ViewerSemanticLine[] = [];
+    let position = 0;
+    this.forEachPhysicalLine((line) => {
+      const lineStart = position;
+      const lineCount = countWrappedPlainLine(line, this.width, this.trimTrailing);
+      if (lineStart < last && lineStart + lineCount > first) {
+        let emitted = 0;
+        const stopped = visitWrappedPlainLine(line, this.width, this.trimTrailing, (wrapped) => {
+          const absolute = lineStart + emitted;
+          emitted += 1;
+          if (absolute >= first && absolute < last) {
+            result.push(this.decorate(wrapped));
+          }
+          return absolute + 1 >= last;
+        });
+        if (stopped && result.length >= last - first) return true;
+      }
+      position += lineCount;
+      return position >= last;
+    });
+    return Object.freeze(result);
+  }
+
+  renderTail(limit: number): readonly ViewerSemanticLine[] {
+    const requested = Math.max(0, limit);
+    if (requested === 0 || this.source.length === 0) return Object.freeze([]);
+
+    const result: ViewerSemanticLine[] = [];
+    let end = this.source.length;
+    let remaining = requested;
+    while (remaining > 0) {
+      const newline = this.source.lastIndexOf("\n", end - 1);
+      const start = newline + 1;
+      const line = this.source.slice(start, end);
+      // 固定环缓冲只保留本物理行最后的可见窗口，避免长单行在每个
+      // 软换行处 shift() 造成 viewport 倍数的数组搬移。
+      const localTail = new Array<string>(remaining);
+      let localCount = 0;
+      visitWrappedPlainLine(line, this.width, this.trimTrailing, (wrapped) => {
+        localTail[localCount % remaining] = wrapped;
+        localCount += 1;
+        return false;
+      });
+      const take = Math.min(localCount, remaining);
+      const first = Math.max(0, localCount - take);
+      const renderedTail: ViewerSemanticLine[] = [];
+      for (let index = first; index < localCount; index += 1) {
+        const item = localTail[index % remaining];
+        if (item !== undefined) renderedTail.push(this.decorate(item));
+      }
+      // 当前物理行的软换行顺序必须保持自然顺序；再作为一个整体放到更早
+      // 的物理行之后，避免长单行的尾部窗口被逐项 unshift 反转。
+      result.unshift(...renderedTail);
+      remaining -= take;
+      if (newline < 0) break;
+      end = newline;
+    }
+    return Object.freeze(result);
+  }
+
+  private decorate(value: string): ViewerSemanticLine {
+    const text = this.trimTrailing ? value.replace(/[ \t]+$/u, "") : value;
+    if (!this.guided) return Object.freeze({ text, style: this.style });
+    if (this.outerWidth <= 1) return Object.freeze({ text: "│", style: this.style });
+    return Object.freeze({ text: `│ ${text}`, style: this.style });
+  }
+
+  private forEachPhysicalLine(callback: (line: string) => boolean): void {
+    let start = 0;
+    while (true) {
+      const newline = this.source.indexOf("\n", start);
+      const end = newline < 0 ? this.source.length : newline;
+      if (callback(this.source.slice(start, end))) return;
+      if (newline < 0) return;
+      start = newline + 1;
+    }
+  }
+}
+
+/**
+ * 同一正文块只在内容、布局方式或宽度变化时重新生成行。纯文本块只保存精确
+ * 计数和按需窗口；复杂 Markdown 在第一次需要该宽度时完整解析并缓存，保证
+ * 标题、列表、链接、代码块等语义不被快速路径改写。
+ */
+class CachedViewerBodyBlock {
+  private kind: CachedBodyKind | undefined;
+  private source: string | undefined;
+  private safeSource: string | undefined;
+  private readonly layoutsByWidth = new Map<number, CachedBodyWidthLayout>();
+
+  update(spec: CachedBodySpec): void {
+    if (this.kind === spec.kind && this.source === spec.source) return;
+    this.kind = spec.kind;
+    this.source = spec.source;
+    this.safeSource = undefined;
+    this.layoutsByWidth.clear();
+  }
+
+  lineCount(width: number): number {
+    return this.layout(width).lineCount();
+  }
+
+  renderWindow(width: number, start: number, limit: number): readonly ViewerSemanticLine[] {
+    return this.layout(width).renderWindow(start, limit);
+  }
+
+  renderTail(width: number, limit: number): readonly ViewerSemanticLine[] {
+    return this.layout(width).renderTail(limit);
+  }
+
+  render(width: number): readonly ViewerSemanticLine[] {
+    return this.layout(width).renderWindow(0, Number.MAX_SAFE_INTEGER);
+  }
+
+  private layout(width: number): CachedBodyWidthLayout {
+    const cached = this.layoutsByWidth.get(width);
+    if (cached !== undefined) {
+      this.layoutsByWidth.delete(width);
+      this.layoutsByWidth.set(width, cached);
+      return cached;
+    }
+
+    const kind = this.kind!;
+    const source = this.source!;
+    const safe = this.getSafeSource();
+    const preformatted = kind === "guided-tool-error" || kind === "guided-shell-command";
+    const guided = kind.startsWith("guided-");
+    const style: UiPanelLineStyle = kind === "guided-tool-error"
+      ? "error"
+      : kind.includes("terminal")
+        ? "terminal"
+        : "body";
+    let layout: CachedBodyWidthLayout;
+    if (preformatted || isPlainMarkdownSource(safe)) {
+      const plain = new PlainTextBodyLayout(
+        safe,
+        guided ? Math.max(1, width - 2) : width,
+        style,
+        guided,
+        width,
+        !preformatted,
+      );
+      layout = {
+        lineCount: () => plain.lineCount(),
+        renderWindow: (start, limit) => plain.renderWindow(start, limit),
+        renderTail: (limit) => plain.renderTail(limit),
+      };
+    } else {
+      const lines = renderCachedBodyBlock(kind, source, width);
+      layout = {
+        lineCount: () => lines.length,
+        renderWindow: (start, limit) => Object.freeze(
+          lines.slice(Math.max(0, start), Math.max(0, start) + Math.max(0, limit)),
+        ),
+        renderTail: (limit) => Object.freeze(
+          lines.slice(Math.max(0, lines.length - Math.max(0, limit))),
+        ),
+      };
+    }
+
+    this.layoutsByWidth.set(width, layout);
+    while (this.layoutsByWidth.size > BODY_LAYOUT_WIDTH_CACHE_LIMIT) {
+      const oldestWidth = this.layoutsByWidth.keys().next().value;
+      if (oldestWidth === undefined) break;
+      this.layoutsByWidth.delete(oldestWidth);
+    }
+    return layout;
+  }
+
+  private getSafeSource(): string {
+    if (this.safeSource === undefined) this.safeSource = sanitizeViewerMarkup(this.source!);
+    return this.safeSource;
+  }
+}
+
+type SettledLifecycleState = "idle" | "failed" | "terminated";
 
 /**
  * 工具活动的运行状态。完成态不可退回运行中；unavailable/terminated 是生命
@@ -145,8 +409,8 @@ interface ToolDisplayEntry {
    * 开始”的忽略规则使每个已确立条目的代次固定为首次发起代。
    */
   readonly generation: number;
-  /** 工具条目首次进入本地回放的序号，用于只读地关联生命周期收束边界。 */
-  readonly startEntryIndex: number;
+  /** 工具首次出现时的规范原子身份；生命周期收束不依赖易变的窗口下标。 */
+  readonly settlementKey: string;
   toolName: string;
   origin: SafeToolOrigin;
   state: ToolRunState;
@@ -269,25 +533,45 @@ export class AgentActivityViewerModel {
   private readonly expandedKeys = new Set<string>();
   private selectedKey: string | undefined;
   private replayCursor = 0;
+  /** 最近接纳的权威快照修订；undefined 表示当前仍在旧 replay 兼容模式。 */
+  private snapshotRevision: number | undefined;
+  private olderActivityOmitted = false;
   private layoutWidth = DEFAULT_LAYOUT_WIDTH;
   private scrollOffset = 0;
   private followEnabled = true;
   private projectionRevision = 0;
   /**
-   * 查看器观察到的收束边界。历史边界只作用于当时已存在的工具条目，避免
-   * 下一工作回合中新开始的工具继承上一回合的 unavailable 显示。
+   * 查看器实际观察到生命周期收束时仍运行的工具。按规范原子身份记录，
+   * 因此前缀淘汰和窗口重排不会改变边界，后来出现的工具也不会继承它。
    */
-  private readonly settlements: ViewerSettlement[] = [];
-  private cachedProjection: {
+  private readonly settledTools = new Map<string, SettledLifecycleState>();
+  /** 正文块缓存按稳定显示身份持有；窗口滑动或草稿替换后由投影重建时清理。 */
+  private readonly bodyBlockCache = new Map<string, CachedViewerBodyBlock>();
+  private cachedLayout: {
+    readonly revision: number;
+    readonly layout: ViewerLayout;
+  } | undefined;
+  private cachedLineCount: {
     readonly width: number;
     readonly revision: number;
-    readonly lines: readonly ViewerSemanticLine[];
+    readonly count: number;
   } | undefined;
   private batching = false;
+  private initializing = true;
 
   constructor(
     agent: AgentActivityViewerAgent,
     replay: readonly CanonicalAgentActivityEntry[],
+    options?: AgentActivityViewerOptions,
+  );
+  constructor(
+    agent: AgentActivityViewerAgent,
+    snapshot: AgentActivitySnapshot,
+    options?: AgentActivityViewerOptions,
+  );
+  constructor(
+    agent: AgentActivityViewerAgent,
+    initialActivity: readonly CanonicalAgentActivityEntry[] | AgentActivitySnapshot,
     options: AgentActivityViewerOptions = {},
   ) {
     this.agentId = agent.agent_id;
@@ -295,12 +579,21 @@ export class AgentActivityViewerModel {
     this.name = agent.name;
     this.lifecycleState = agent.state;
     this.viewportHeight = validViewportHeight(options.viewport_height);
-    this.syncFrom(replay);
-    if (agent.state === "idle" || agent.state === "failed" || agent.state === "terminated") {
-      this.settlements.push(Object.freeze({ entryCount: this.entries.length, state: agent.state }));
+    this.batching = true;
+    try {
+      if (Array.isArray(initialActivity)) {
+        this.syncFrom(initialActivity as readonly CanonicalAgentActivityEntry[]);
+      } else {
+        this.syncSnapshot(initialActivity as AgentActivitySnapshot);
+      }
+      if (isSettledLifecycleState(agent.state)) this.recordRunningToolSettlement(agent.state);
+      this.setLiveDrafts(options.drafts ?? []);
+    } finally {
+      this.batching = false;
+      this.initializing = false;
     }
-    this.setLiveDrafts(options.drafts ?? []);
     this.initializeSelection();
+    this.settleFollow();
   }
 
   get agent_id(): string {
@@ -311,32 +604,31 @@ export class AgentActivityViewerModel {
   updateLifecycle(state: AgentLifecycleState): AgentActivityViewerUpdateOutcome {
     if (state === this.lifecycleState) return "ignored";
     this.lifecycleState = state;
-    // 记录纯查看器边界，不写回或改变代理的生命周期事实。
-    if (state === "idle" || state === "failed" || state === "terminated") {
-      this.settlements.push(Object.freeze({ entryCount: this.entries.length, state }));
-    }
+    // 只标记此刻已经观察到的 running 工具；后到活动不继承旧收束。
+    if (isSettledLifecycleState(state)) this.recordRunningToolSettlement(state);
     this.touchProjection();
     return "changed";
   }
 
-  /** 追加一条规范活动条目；条目身份与正文闭集由上游 seam 保证。 */
+  /** 追加一条规范活动条目；保留给旧 append-only 调用方。 */
   appendEntry(entry: CanonicalAgentActivityEntry): AgentActivityViewerUpdateOutcome {
+    this.snapshotRevision = undefined;
     this.entries.push(entry);
-    this.projectionRevision += 1;
-    this.cachedProjection = undefined;
+    this.touchProjection();
     if (!this.batching) this.settleFollow();
     return "changed";
   }
 
   /**
-   * 以缓存全量回放对齐本地条目；只追加尚未落地的新到达部分。
-   * 回放游标独立于条目数，因此被拒绝的输入不会跳过后续合法条目。
+   * 以旧式全量回放对齐本地条目；仅用于没有 snapshot 能力的 append-only
+   * source。游标独立于条目数，因此被拒绝的输入不会跳过后续合法条目。
    */
   syncFrom(replay: readonly CanonicalAgentActivityEntry[]): AgentActivityViewerUpdateOutcome {
     if (replay.length < this.replayCursor) return "ignored";
     let start = this.replayCursor;
     if (this.entries.length > start && this.replayPrefixMatches(replay)) start = this.entries.length;
     let outcome: AgentActivityViewerUpdateOutcome = "ignored";
+    const wasBatching = this.batching;
     this.batching = true;
     try {
       for (let index = start; index < replay.length; index += 1) {
@@ -344,11 +636,64 @@ export class AgentActivityViewerModel {
         if (entry !== undefined && this.appendEntry(entry) === "changed") outcome = "changed";
       }
     } finally {
-      this.batching = false;
+      this.batching = wasBatching;
     }
-    if (outcome === "changed") this.settleFollow();
+    if (outcome === "changed" && !this.batching) this.settleFollow();
     this.replayCursor = replay.length;
     return outcome;
+  }
+
+  /**
+   * 以权威有界快照完整对账。revision 未前进时严格 no-op；前进后按规范
+   * 原子身份重建顺序，因此同槽位替换、窗口缩短和 100 条滑动都不会依赖
+   * append-only 游标。
+   */
+  syncSnapshot(snapshot: AgentActivitySnapshot): AgentActivityViewerUpdateOutcome {
+    if (!isValidActivitySnapshot(snapshot)) return "ignored";
+    if (this.snapshotRevision !== undefined && snapshot.revision <= this.snapshotRevision) {
+      return "ignored";
+    }
+
+    const reconcileInteraction = !this.initializing
+      && (this.selectedKey !== undefined || this.expandedKeys.size > 0);
+    const previousKeys = reconcileInteraction ? this.selectableKeys() : Object.freeze([]);
+    const previousSelectedKey = this.selectedKey;
+    const reconciled = reconcileCanonicalEntries(this.entries, snapshot.entries);
+
+    this.entries.splice(0, this.entries.length, ...reconciled);
+    this.olderActivityOmitted = snapshot.olderActivityOmitted;
+    this.snapshotRevision = snapshot.revision;
+    this.replayCursor = snapshot.entries.length;
+    this.retainVisibleToolSettlements();
+    this.touchProjection();
+
+    if (!this.initializing) {
+      if (reconcileInteraction) {
+        const currentKeys = this.selectableKeys();
+        const currentKeySet = new Set(currentKeys);
+        let removedExpansion = false;
+        for (const key of [...this.expandedKeys]) {
+          if (currentKeySet.has(key)) continue;
+          this.expandedKeys.delete(key);
+          removedExpansion = true;
+        }
+        if (removedExpansion) this.touchProjection();
+        if (previousSelectedKey !== undefined && !currentKeySet.has(previousSelectedKey)) {
+          this.selectedKey = nearestSurvivingKey(
+            previousKeys,
+            previousSelectedKey,
+            currentKeys,
+          );
+        }
+      }
+      if (this.followEnabled) {
+        this.settleFollow();
+      } else {
+        const maxOffset = this.maxScrollOffset();
+        this.scrollOffset = clamp(this.scrollOffset, 0, maxOffset);
+      }
+    }
+    return "changed";
   }
 
   render(width: number): readonly string[] {
@@ -361,6 +706,7 @@ export class AgentActivityViewerModel {
    * 再以快照形式到达这里。草稿增长与普通追加一样服从 follow 规则。
    */
   setLiveDrafts(drafts: readonly AgentDisplayDraftView[]): AgentActivityViewerUpdateOutcome {
+    if (sameLiveDraftSnapshot(this.liveDrafts, drafts)) return "ignored";
     this.liveDrafts = Object.freeze([...drafts]);
     this.touchProjection();
     if (!this.batching) this.settleFollow();
@@ -380,29 +726,38 @@ export class AgentActivityViewerModel {
   [RENDER_VIEWER_LINES](width: number): readonly ViewerSemanticLine[] {
     const contentWidth = validRenderWidth(width);
     this.layoutWidth = contentWidth;
-    const bodyLines = this.eventLines(contentWidth);
-    const maxOffset = Math.max(0, bodyLines.length - this.viewportHeight);
-    this.settleFollow(maxOffset);
-    this.scrollOffset = clamp(this.scrollOffset, 0, maxOffset);
+    const bodyLines = this.visibleEventLines(contentWidth);
+    const cached = this.cachedLineCount;
+    if (!this.followEnabled || (
+      cached !== undefined
+      && cached.width === contentWidth
+      && cached.revision === this.projectionRevision
+    )) {
+      const maxOffset = this.maxScrollOffset();
+      this.settleFollow(maxOffset);
+      this.scrollOffset = clamp(this.scrollOffset, 0, maxOffset);
+    } else {
+      // 跟随尾部时允许首次渲染只物化视口；公开精确滚动范围由
+      // getPublicState/交互路径按需收敛，不能在这里提前布局整段历史。
+      this.settleFollow();
+    }
     const identity = truncateToDisplayWidth(
       `${VIEWER_HEADER_TEXT} · ${safeUiFact(this.templateId)} · ${safeUiFact(this.name)} · ${this.lifecycleState}`,
       contentWidth,
     );
-    const visible = bodyLines
-      .slice(this.scrollOffset, this.scrollOffset + this.viewportHeight)
-      .map((line) => Object.freeze({
-        text: truncateToDisplayWidth(line.text, contentWidth),
-        style: line.style,
-        selected: line.selectable_key !== undefined && line.selectable_key === this.selectedKey,
-        ...(line.emphasized_title === undefined
-          ? {}
-          : { emphasized_title: line.emphasized_title }),
-        ...(line.disclosure_marker === undefined
-          ? {}
-          : { disclosure_marker: line.disclosure_marker }),
-        ...(line.status_icon === undefined ? {} : { status_icon: line.status_icon }),
-        ...(line.error_tail === undefined ? {} : { error_tail: line.error_tail }),
-      }));
+    const visible = bodyLines.map((line) => Object.freeze({
+      text: truncateToDisplayWidth(line.text, contentWidth),
+      style: line.style,
+      selected: line.selectable_key !== undefined && line.selectable_key === this.selectedKey,
+      ...(line.emphasized_title === undefined
+        ? {}
+        : { emphasized_title: line.emphasized_title }),
+      ...(line.disclosure_marker === undefined
+        ? {}
+        : { disclosure_marker: line.disclosure_marker }),
+      ...(line.status_icon === undefined ? {} : { status_icon: line.status_icon }),
+      ...(line.error_tail === undefined ? {} : { error_tail: line.error_tail }),
+    }));
     while (visible.length < this.viewportHeight) {
       visible.push(Object.freeze({ text: "", style: "body" as const, selected: false }));
     }
@@ -467,7 +822,7 @@ export class AgentActivityViewerModel {
     if (event.type === "click" && event.button === "left") {
       const bodyIndex = event.y - (framed ? 3 : 1);
       if (bodyIndex >= 0 && bodyIndex < this.viewportHeight) {
-        const line = this.eventLines(this.layoutWidth)[this.scrollOffset + bodyIndex];
+        const line = this.visibleEventLines(this.layoutWidth)[bodyIndex];
         const key = line?.selectable_key;
         if (key !== undefined && this.isExpandableKey(key)) {
           this.setKeyExpanded(key, !this.expandedKeys.has(key));
@@ -514,25 +869,58 @@ export class AgentActivityViewerModel {
     });
   }
 
-  /** 跟随时视口始终对齐最新条目；暂停时保持用户当前回看位置。 */
-  private settleFollow(maxOffset = this.maxScrollOffset()): void {
-    if (this.followEnabled) this.scrollOffset = Math.max(0, maxOffset);
+  /** 跟随尾部时优先保持惰性；需要绝对滚动几何的调用方显式传入精确范围。 */
+  private settleFollow(maxOffset?: number): void {
+    if (!this.followEnabled) return;
+    if (maxOffset !== undefined) {
+      this.scrollOffset = Math.max(0, maxOffset);
+      return;
+    }
+    const cached = this.cachedLineCount;
+    if (
+      cached !== undefined
+      && cached.width === validRenderWidth(this.layoutWidth)
+      && cached.revision === this.projectionRevision
+    ) {
+      this.scrollOffset = Math.max(0, cached.count - this.viewportHeight);
+    }
   }
 
+  /** 所有块的精确总行数；结果按投影修订与宽度缓存。 */
+  private exactEventLineCount(width = this.layoutWidth): number {
+    const contentWidth = validRenderWidth(width);
+    const cached = this.cachedLineCount;
+    if (
+      cached !== undefined
+      && cached.width === contentWidth
+      && cached.revision === this.projectionRevision
+    ) return cached.count;
+
+    let total = 0;
+    for (const block of this.layout().blocks) total += block.lineCount(contentWidth);
+    this.cachedLineCount = {
+      width: contentWidth,
+      revision: this.projectionRevision,
+      count: total,
+    };
+    return total;
+  }
+
+  /** 公开滚动几何始终建立在精确布局上。 */
   private maxScrollOffset(): number {
-    return Math.max(0, this.eventLines(this.layoutWidth).length - this.viewportHeight);
+    return Math.max(0, this.exactEventLineCount() - this.viewportHeight);
   }
 
   private touchProjection(): void {
     this.projectionRevision += 1;
-    this.cachedProjection = undefined;
+    this.cachedLayout = undefined;
+    this.cachedLineCount = undefined;
   }
 
-  /** 打开时选择当前视口中最新的可展开项；没有可展开项时不建立虚假选择。 */
+  /** 打开时只检查尾部视口，选择其中最新的可展开项。 */
   private initializeSelection(): void {
-    const lines = this.eventLines(this.layoutWidth);
-    const viewportStart = Math.max(0, lines.length - this.viewportHeight);
-    for (let index = lines.length - 1; index >= viewportStart; index -= 1) {
+    const lines = this.visibleEventLines(this.layoutWidth);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
       const key = lines[index]?.selectable_key;
       if (key !== undefined) {
         this.selectedKey = key;
@@ -556,35 +944,37 @@ export class AgentActivityViewerModel {
     }
     if (next === undefined) return "ignored";
     this.selectedKey = next;
-    this.followEnabled = next === latest;
-    this.ensureLineVisible(next);
+    if (next === latest) {
+      this.followEnabled = true;
+      this.settleFollow();
+    } else {
+      this.followEnabled = false;
+      this.ensureLineVisible(next);
+    }
     return "changed";
   }
 
   private selectableKeys(): readonly string[] {
-    const lines = this.eventLines(this.layoutWidth);
-    const seen = new Set<string>();
-    const keys: string[] = [];
-    for (const line of lines) {
-      if (line.selectable_key !== undefined && !seen.has(line.selectable_key)) {
-        seen.add(line.selectable_key);
-        keys.push(line.selectable_key);
-      }
-    }
-    return keys;
+    return this.layout().selectableKeys;
   }
 
   /** 视口外目标只触发使其刚好可见的最小滚动。 */
   private ensureLineVisible(key: string): void {
-    const lines = this.eventLines(this.layoutWidth);
-    const index = lines.findIndex((line) => line.selectable_key === key);
-    if (index < 0) return;
-    if (index < this.scrollOffset) {
-      this.scrollOffset = index;
-      return;
-    }
-    if (index >= this.scrollOffset + this.viewportHeight) {
-      this.scrollOffset = index - this.viewportHeight + 1;
+    const width = validRenderWidth(this.layoutWidth);
+    const maxOffset = this.maxScrollOffset();
+    this.scrollOffset = clamp(this.scrollOffset, 0, maxOffset);
+    let position = 0;
+    for (const block of this.layout().blocks) {
+      const count = block.lineCount(width);
+      if (block.selectableKeys.includes(key)) {
+        const index = position;
+        if (index < this.scrollOffset) this.scrollOffset = index;
+        else if (index >= this.scrollOffset + this.viewportHeight) {
+          this.scrollOffset = index - this.viewportHeight + 1;
+        }
+        return;
+      }
+      position += count;
     }
   }
 
@@ -602,6 +992,8 @@ export class AgentActivityViewerModel {
   private setKeyExpanded(key: string, expanded: boolean): AgentActivityViewerInputOutcome {
     if (!this.isExpandableKey(key)) return "ignored";
     if (expanded) {
+      // 从跟随尾部改为暂停前先收敛已有布局，保证展开标题仍停留在同一屏幕行。
+      if (this.followEnabled) this.scrollOffset = this.maxScrollOffset();
       this.expandedKeys.add(key);
       // 展开保持当前屏幕位置并暂停自动跟随；折叠不自动恢复。
       this.followEnabled = false;
@@ -632,6 +1024,22 @@ export class AgentActivityViewerModel {
     return true;
   }
 
+  /** 记录当前仍运行工具的稳定身份；已有收束采用首次观察到的状态。 */
+  private recordRunningToolSettlement(state: SettledLifecycleState): void {
+    for (const key of runningToolSettlementKeys(this.entries)) {
+      if (!this.settledTools.has(key)) this.settledTools.set(key, state);
+    }
+  }
+
+  /** 快照淘汰后移除已不可见的边界，避免查看器本地状态无界增长。 */
+  private retainVisibleToolSettlements(): void {
+    if (this.settledTools.size === 0) return;
+    const visibleRunning = new Set(runningToolSettlementKeys(this.entries));
+    for (const key of [...this.settledTools.keys()]) {
+      if (!visibleRunning.has(key)) this.settledTools.delete(key);
+    }
+  }
+
   /**
    * 将规范条目重放为显示条目。工具开始/结束按稳定调用身份合并为同一原子
    * 条目：结束先到或开始缺失时自建完成条目；重复与迟到事实幂等；完成态
@@ -642,7 +1050,7 @@ export class AgentActivityViewerModel {
     const entries: DisplayEntry[] = [];
     const toolIndex = new Map<string, ToolDisplayEntry>();
 
-    for (const [entryIndex, entry] of this.entries.entries()) {
+    for (const entry of this.entries) {
       const body = entry.body;
       if (body.type === "message") {
         entries.push({
@@ -657,22 +1065,27 @@ export class AgentActivityViewerModel {
 
       if (body.type === "parent_message") {
         // 接收侧实际接纳的父代理输入；未接纳输入不产生该条目。
-        entries.push({ kind: "parent_message", entryId: entry.entry_id, content: body.content });
+        entries.push({
+          kind: "parent_message",
+          entryId: entry.entry_id,
+          incarnationId: entry.incarnation_id,
+          content: body.content,
+        });
         continue;
       }
 
       if (body.type === "tool_execution_start") {
-        // 关联身份 = 运行实例 + 工具活动 ID + 执行代次：重复开始与完成后
-        // 迟到开始都幂等忽略；完成态不退回运行中。
-        const identity = `${entry.incarnation_id}:${body.toolCallId}`;
+        // 旧 replay 可包含 start/end 两个事实，按运行实例、toolCallId 与
+        // executionGeneration 合并；缺省代次 1 保持旧条目兼容。
+        const identity = toolProjectionIdentity(entry);
         if (toolIndex.has(identity)) continue;
         const tool: ToolDisplayEntry = {
           kind: "tool",
           entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
-          generation: 1,
-          startEntryIndex: entryIndex,
+          generation: body.executionGeneration ?? 1,
+          settlementKey: canonicalEntryIdentity(entry),
           toolName: body.toolName,
           origin: body.origin,
           state: { phase: "running" },
@@ -687,7 +1100,7 @@ export class AgentActivityViewerModel {
 
       // 结束事实自包含状态与摘要：开始缺失时仍建立完成条目。只有运行实例、
       // 活动 ID 与代次都匹配的结束事实才能更新或回填既有条目。
-      const identity = `${entry.incarnation_id}:${body.toolCallId}`;
+      const identity = toolProjectionIdentity(entry);
       const existing = toolIndex.get(identity);
       const state: ToolRunState = body.isError ? { phase: "failure" } : { phase: "success" };
       if (existing === undefined) {
@@ -696,8 +1109,8 @@ export class AgentActivityViewerModel {
           entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
           toolCallId: body.toolCallId,
-          generation: 1,
-          startEntryIndex: entryIndex,
+          generation: body.executionGeneration ?? 1,
+          settlementKey: canonicalEntryIdentity(entry),
           toolName: body.toolName,
           origin: body.origin,
           state,
@@ -722,11 +1135,7 @@ export class AgentActivityViewerModel {
     if (toolIndex.size > 0) {
       for (const tool of toolIndex.values()) {
         if (tool.state.phase !== "running") continue;
-        // 收束只覆盖该生命周期事实发生时已经可见的条目；之后追加的开始
-        // 事实代表新的活动，不能被可能滞后的生命周期快照投影为 unavailable。
-        const settlement = this.settlements.find(
-          (candidate) => tool.startEntryIndex < candidate.entryCount,
-        )?.state;
+        const settlement = this.settledTools.get(tool.settlementKey);
         if (settlement === "idle") tool.state = { phase: "unavailable" };
         else if (settlement === "failed") tool.state = { phase: "failure" };
         else if (settlement === "terminated") tool.state = { phase: "terminated" };
@@ -739,141 +1148,383 @@ export class AgentActivityViewerModel {
     return entries;
   }
 
-  /** 把规范条目闭集渲染为语义行；条目数为零时给出明确空态。 */
-  private eventLines(width: number): readonly ViewerSemanticLine[] {
-    const contentWidth = validRenderWidth(width);
+  /**
+   * 构建条目顺序、标题和正文块身份。正文块在这里仅登记 source；行数与窗口
+   * 由块在具体宽度下精确计算，避免布局阶段复制不可见的大正文。
+   */
+  private layout(): ViewerLayout {
     if (
-      this.cachedProjection !== undefined
-      && this.cachedProjection.width === contentWidth
-      && this.cachedProjection.revision === this.projectionRevision
-    ) return this.cachedProjection.lines;
+      this.cachedLayout !== undefined
+      && this.cachedLayout.revision === this.projectionRevision
+    ) return this.cachedLayout.layout;
 
-    if (this.entries.length === 0 && this.liveDrafts.every((draft) => draft.blocks.length === 0)) {
-      const empty = Object.freeze([{ text: EMPTY_ACTIVITY_TEXT, style: "body" as const }]);
-      this.cachedProjection = { width: contentWidth, revision: this.projectionRevision, lines: empty };
-      return empty;
-    }
-
-    const lines: ViewerSemanticLine[] = [];
-    for (const entry of this.projectEntries()) {
-      if (entry.kind === "message") {
-        let blockIndex = 0;
-        for (const block of entry.content) {
-          if (block.type === "text") {
-            lines.push(...renderMarkdownBlock(block.text, contentWidth, "body"));
-          } else {
-            const key = messageThinkingKey(
-              entry.entryId,
-              entry.incarnationId,
-              entry.streamId,
-              blockIndex,
-            );
-            lines.push(...renderThinkingBlock(
-              block.thinking,
-              contentWidth,
-              key,
-              this.expandedKeys.has(key),
-            ));
-          }
-          blockIndex += 1;
-        }
-        continue;
-      }
-
-      if (entry.kind === "parent_message") {
-        lines.push(...renderParentMessageBlock(
-          entry.content,
-          contentWidth,
-          parentMessageKey(entry.entryId),
-          this.expandedKeys.has(parentMessageKey(entry.entryId)),
-        ));
-        continue;
-      }
-
-      if (entry.kind === "live") {
-        renderLiveDraft(entry.draft, contentWidth, this.expandedKeys, lines);
-        continue;
-      }
-
-      const visual = toolDisplayVisual(entry);
-      // 工具摘要统一作为标题：状态图标位于标题前缀；可展开项顺序为折叠符、
-      // 状态图标、摘要，不可展开项由状态图标占据最左侧。
-      // Shell 只展开完整 command；即使收到违约错误正文也不显示输出或退出信息。
-      if (entry.summary !== undefined) {
-        const shell = entry.summary.tool === "bash" || entry.summary.tool === "powershell";
-        const messageBody = toolMessageBody(entry.summary);
-        const errorBody = shell ? undefined : entry.errorText;
-        const expandable = shell || errorBody !== undefined || messageBody !== undefined;
-        const expandKey = shell
-          ? toolCommandKey(entry.entryId)
-          : errorBody !== undefined
-            ? toolErrorKey(entry.entryId)
-            : toolMessageKey(entry.entryId);
-        const expanded = expandable && this.expandedKeys.has(expandKey);
-        // 失败事实的规范稳定错误码与收束事实保留在标题摘要中。
-        const suffix = toolLineSuffix(visual, entry.errorCode);
-        const summaryWidth = Math.max(
-          1,
-          contentWidth
-            - (expandable ? 2 : 0)
-            - displayWidth(suffix)
-            - displayWidth(visual.icon) - 1,
-        );
-        // get_agent_status 目标 failed 时只将 failed 与错误码片段标红。
-        const failureTail = statusFailureTail(entry.summary);
-        const summaryText = formatStatusSummary(entry.summary, summaryWidth, failureTail);
-        lines.push(toolTitleLine({
-          label: `${summaryText}${suffix}`,
-          visual,
-          width: contentWidth,
-          ...(expandable ? { key: expandKey, expanded } : {}),
-          ...(failureTail === undefined ? {} : { errorTail: failureTail }),
-        }));
-        if (
-          expanded
-          && (entry.summary.tool === "bash" || entry.summary.tool === "powershell")
-        ) {
-          const command = entry.summary.command;
-          lines.push(...renderGuidedBody(
-            contentWidth,
-            (bodyWidth) => renderShellCommandBody(command, bodyWidth),
-          ));
-        }
-        if (expanded && errorBody !== undefined) {
-          lines.push(...renderGuidedBody(
-            contentWidth,
-            (bodyWidth) => renderToolErrorBody(errorBody, bodyWidth),
-          ));
-        }
-        if (expanded && messageBody !== undefined) {
-          lines.push(...renderGuidedBody(
-            contentWidth,
-            (bodyWidth) => renderMarkdownBlock(messageBody, bodyWidth, "body"),
-          ));
-        }
-        continue;
-      }
-      // 安全兜底只显示工具名、静态运行提示与状态，不提供展开入口。
-      const summary = safeUiFact(entry.toolName);
-      const runningLabel = entry.state.phase === "running" && entry.toolName === "wait_agent"
-        ? `${summary}${SUMMARY_SEPARATOR}${WAIT_AGENT_RUNNING_TEXT}`
-        : summary;
-      const suffixParts = [
-        ...(visual.suffix === undefined ? [] : [visual.suffix]),
-        ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
-      ];
-      lines.push(toolTitleLine({
-        label: `${runningLabel}${
-          suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`
-        }`,
-        visual,
-        width: contentWidth,
+    const blocks: ViewerLayoutBlock[] = [];
+    const activeCacheKeys = new Set<string>();
+    const addStatic = (
+      lines: readonly ViewerSemanticLine[],
+      selectableKeys: readonly string[] = Object.freeze([]),
+    ): void => {
+      const frozenLines = Object.freeze([...lines]);
+      const keys = Object.freeze([...selectableKeys]);
+      blocks.push(Object.freeze({
+        selectableKeys: keys,
+        lineCount: () => frozenLines.length,
+        renderWindow: (_width: number, start: number, limit: number) => Object.freeze(
+          frozenLines.slice(Math.max(0, start), Math.max(0, start) + Math.max(0, limit)),
+        ),
+        renderTail: (_width: number, limit: number) => Object.freeze(
+          frozenLines.slice(Math.max(0, frozenLines.length - Math.max(0, limit))),
+        ),
       }));
+    };
+    const addDynamicLine = (
+      render: (width: number) => ViewerSemanticLine,
+      selectableKey?: string,
+    ): void => {
+      const keys = selectableKey === undefined ? Object.freeze([]) : Object.freeze([selectableKey]);
+      blocks.push(Object.freeze({
+        selectableKeys: keys,
+        lineCount: () => 1,
+        renderWindow: (width: number, start: number, limit: number) => {
+          if (start > 0 || limit <= 0) return Object.freeze([]);
+          return Object.freeze([render(width)]);
+        },
+        renderTail: (width: number, limit: number) => limit <= 0
+          ? Object.freeze([])
+          : Object.freeze([render(width)]),
+      }));
+    };
+    const addGuidedStatic = (line: ViewerSemanticLine, selectableKey: string): void => {
+      const keys = Object.freeze([selectableKey]);
+      blocks.push(Object.freeze({
+        selectableKeys: keys,
+        lineCount: () => 1,
+        renderWindow: (width: number, start: number, limit: number) => {
+          if (start > 0 || limit <= 0) return Object.freeze([]);
+          return renderGuidedBody(width, () => Object.freeze([line]));
+        },
+        renderTail: (width: number, limit: number) => limit <= 0
+          ? Object.freeze([])
+          : renderGuidedBody(width, () => Object.freeze([line])),
+      }));
+    };
+    const cacheFor = (
+      key: string,
+      kind: CachedBodyKind,
+      source: string,
+    ): CachedViewerBodyBlock => {
+      activeCacheKeys.add(key);
+      let cached = this.bodyBlockCache.get(key);
+      if (cached === undefined) {
+        cached = new CachedViewerBodyBlock();
+        this.bodyBlockCache.set(key, cached);
+      }
+      cached.update({ key, kind, source });
+      return cached;
+    };
+    const retainCached = (key: string, kind: CachedBodyKind, source: string): void => {
+      cacheFor(key, kind, source);
+    };
+    const addCached = (key: string, kind: CachedBodyKind, source: string): void => {
+      const cached = cacheFor(key, kind, source);
+      blocks.push(Object.freeze({
+        selectableKeys: Object.freeze([]),
+        lineCount: (width: number) => cached.lineCount(width),
+        renderWindow: (width: number, start: number, limit: number) => (
+          cached.renderWindow(width, start, limit)
+        ),
+        renderTail: (width: number, limit: number) => cached.renderTail(width, limit),
+      }));
+    };
+    const addMaybeExpandedCached = (
+      expanded: boolean,
+      key: string,
+      kind: CachedBodyKind,
+      source: string,
+    ): void => {
+      if (expanded) addCached(key, kind, source);
+      else retainCached(key, kind, source);
+    };
+
+    if (
+      !this.olderActivityOmitted
+      && this.entries.length === 0
+      && this.liveDrafts.every((draft) => draft.blocks.length === 0)
+    ) {
+      this.bodyBlockCache.clear();
+      addStatic(Object.freeze([{ text: EMPTY_ACTIVITY_TEXT, style: "body" as const }]));
+    } else {
+      if (this.olderActivityOmitted) {
+        addStatic(Object.freeze([{ text: OLDER_ACTIVITY_OMITTED_TEXT, style: "terminal" as const }]));
+      }
+      for (const entry of this.projectEntries()) {
+        if (entry.kind === "message") {
+          let blockIndex = 0;
+          for (const block of entry.content) {
+            if (block.type === "text") {
+              addCached(
+                entry.streamId === undefined
+                  ? `message-text:${entry.incarnationId}:${entry.entryId}:${blockIndex}`
+                  : `live-text:${entry.incarnationId}|${entry.streamId}:${blockIndex}`,
+                "markdown-body",
+                block.text,
+              );
+            } else {
+              const key = messageThinkingKey(
+                entry.entryId,
+                entry.incarnationId,
+                entry.streamId,
+                blockIndex,
+              );
+              const expanded = this.expandedKeys.has(key);
+              addStatic(
+                Object.freeze([disclosureTitleLine(THINKING_COLLAPSED_TEXT, key, expanded)]),
+                Object.freeze([key]),
+              );
+              addMaybeExpandedCached(
+                expanded,
+                entry.streamId === undefined
+                  ? `message-thinking:${entry.incarnationId}:${entry.entryId}:${blockIndex}`
+                  : `live-thinking:${entry.incarnationId}|${entry.streamId}:${blockIndex}`,
+                "guided-markdown-terminal",
+                block.thinking,
+              );
+            }
+            blockIndex += 1;
+          }
+          continue;
+        }
+
+        if (entry.kind === "parent_message") {
+          const key = parentMessageKey(entry.entryId);
+          const expanded = this.expandedKeys.has(key);
+          addStatic(
+            Object.freeze([disclosureTitleLine(PARENT_MESSAGE_TITLE, key, expanded)]),
+            Object.freeze([key]),
+          );
+          let blockIndex = 0;
+          for (const block of entry.content) {
+            if (block.type === "text") {
+              addMaybeExpandedCached(
+                expanded,
+                `parent-text:${entry.incarnationId}:${entry.entryId}:${blockIndex}`,
+                "guided-markdown-body",
+                block.text,
+              );
+            } else {
+              const thinkingTitleKey = `${key}:${blockIndex}`;
+              if (expanded) {
+                addGuidedStatic(
+                  disclosureTitleLine(THINKING_COLLAPSED_TEXT, thinkingTitleKey, true),
+                  thinkingTitleKey,
+                );
+              }
+              addMaybeExpandedCached(
+                expanded,
+                `parent-thinking:${entry.incarnationId}:${entry.entryId}:${blockIndex}`,
+                "guided-markdown-terminal",
+                block.thinking,
+              );
+            }
+            blockIndex += 1;
+          }
+          continue;
+        }
+
+        if (entry.kind === "live") {
+          const thinkingTitle = entry.draft.state === "frozen"
+            ? THINKING_FROZEN_TEXT
+            : entry.draft.state === "complete"
+              ? THINKING_COLLAPSED_TEXT
+              : THINKING_STREAMING_TEXT;
+          for (const block of entry.draft.blocks) {
+            if (block.contentType === "text") {
+              addCached(
+                `live-text:${entry.draft.key}:${block.contentIndex}`,
+                "markdown-body",
+                block.value,
+              );
+              continue;
+            }
+            const key = liveThinkingKey(entry.draft.key, block.contentIndex);
+            const expanded = this.expandedKeys.has(key);
+            addStatic(
+              Object.freeze([disclosureTitleLine(thinkingTitle, key, expanded)]),
+              Object.freeze([key]),
+            );
+            addMaybeExpandedCached(
+              expanded,
+              `live-thinking:${entry.draft.key}:${block.contentIndex}`,
+              "guided-markdown-terminal",
+              block.value,
+            );
+          }
+          if (entry.draft.state === "frozen" && entry.draft.blocks.length > 0) {
+            const last = entry.draft.blocks.at(-1)!;
+            if (last.contentType === "text") {
+              addStatic(Object.freeze([{ text: FROZEN_DRAFT_ELLIPSIS, style: "terminal" as const }]));
+            } else if (this.expandedKeys.has(liveThinkingKey(entry.draft.key, last.contentIndex))) {
+              addStatic(Object.freeze([{
+                text: `${EXPANDED_BODY_GUIDE}${FROZEN_DRAFT_ELLIPSIS}`,
+                style: "terminal" as const,
+              }]));
+            }
+          }
+          continue;
+        }
+
+        const visual = toolDisplayVisual(entry);
+        // 工具摘要统一作为标题：状态图标位于标题前缀；可展开项顺序为折叠符、
+        // 状态图标、摘要，不可展开项由状态图标占据最左侧。
+        if (entry.summary !== undefined) {
+          const shell = entry.summary.tool === "bash" || entry.summary.tool === "powershell";
+          const messageBody = toolMessageBody(entry.summary);
+          const errorBody = shell ? undefined : entry.errorText;
+          const expandable = shell || errorBody !== undefined || messageBody !== undefined;
+          const expandKey = shell
+            ? toolCommandKey(entry.entryId)
+            : errorBody !== undefined
+              ? toolErrorKey(entry.entryId)
+              : toolMessageKey(entry.entryId);
+          const expanded = expandable && this.expandedKeys.has(expandKey);
+          addDynamicLine((width) => {
+            const suffix = toolLineSuffix(visual, entry.errorCode);
+            const summaryWidth = Math.max(
+              1,
+              width
+                - (expandable ? 2 : 0)
+                - displayWidth(suffix)
+                - displayWidth(visual.icon) - 1,
+            );
+            const failureTail = statusFailureTail(entry.summary!);
+            const summaryText = formatStatusSummary(entry.summary!, summaryWidth, failureTail);
+            return toolTitleLine({
+              label: `${summaryText}${suffix}`,
+              visual,
+              width,
+              ...(expandable ? { key: expandKey, expanded } : {}),
+              ...(failureTail === undefined ? {} : { errorTail: failureTail }),
+            });
+          }, expandable ? expandKey : undefined);
+          if (entry.summary.tool === "bash" || entry.summary.tool === "powershell") {
+            addMaybeExpandedCached(
+              expanded,
+              `tool-command:${entry.incarnationId}:${entry.entryId}`,
+              "guided-shell-command",
+              entry.summary.command,
+            );
+          } else if (errorBody !== undefined) {
+            addMaybeExpandedCached(
+              expanded,
+              `tool-error:${entry.incarnationId}:${entry.entryId}`,
+              "guided-tool-error",
+              errorBody,
+            );
+          } else if (messageBody !== undefined) {
+            addMaybeExpandedCached(
+              expanded,
+              `tool-message:${entry.incarnationId}:${entry.entryId}`,
+              "guided-markdown-body",
+              messageBody,
+            );
+          }
+          continue;
+        }
+
+        // 安全兜底只显示工具名、静态运行提示与状态，不提供展开入口。
+        addDynamicLine((width) => {
+          const summary = safeUiFact(entry.toolName);
+          const runningLabel = entry.state.phase === "running" && entry.toolName === "wait_agent"
+            ? `${summary}${SUMMARY_SEPARATOR}${WAIT_AGENT_RUNNING_TEXT}`
+            : summary;
+          const suffixParts = [
+            ...(visual.suffix === undefined ? [] : [visual.suffix]),
+            ...(entry.errorCode === undefined ? [] : [entry.errorCode]),
+          ];
+          return toolTitleLine({
+            label: `${runningLabel}${
+              suffixParts.length === 0 ? "" : ` · ${suffixParts.join(SUMMARY_SEPARATOR)}`
+            }`,
+            visual,
+            width,
+          });
+        });
+      }
+      for (const key of this.bodyBlockCache.keys()) {
+        if (!activeCacheKeys.has(key)) this.bodyBlockCache.delete(key);
+      }
     }
 
-    const frozen = Object.freeze(lines.map((line) => Object.freeze(line)));
-    this.cachedProjection = { width: contentWidth, revision: this.projectionRevision, lines: frozen };
-    return frozen;
+    const selectableKeys: string[] = [];
+    const seenKeys = new Set<string>();
+    for (const block of blocks) {
+      for (const key of block.selectableKeys) {
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        selectableKeys.push(key);
+      }
+    }
+    const layout = Object.freeze({
+      blocks: Object.freeze(blocks),
+      selectableKeys: Object.freeze(selectableKeys),
+    });
+    this.cachedLayout = { revision: this.projectionRevision, layout };
+    return layout;
+  }
+
+  /** 只物化当前可见窗口；跟随尾部时不为绝对行号提前布局整段历史。 */
+  private visibleEventLines(width: number): readonly ViewerSemanticLine[] {
+    const contentWidth = validRenderWidth(width);
+    if (this.followEnabled) {
+      const cached = this.cachedLineCount;
+      if (
+        cached !== undefined
+        && cached.width === contentWidth
+        && cached.revision === this.projectionRevision
+      ) {
+        this.scrollOffset = Math.max(0, cached.count - this.viewportHeight);
+      }
+      return this.tailVisibleEventLines(contentWidth);
+    }
+    const maxOffset = Math.max(0, this.exactEventLineCount(contentWidth) - this.viewportHeight);
+    this.scrollOffset = clamp(this.scrollOffset, 0, maxOffset);
+    return this.windowVisibleEventLines(contentWidth);
+  }
+
+  /** 倒序逐块取尾部窗口；不为 follow 模式提前计算整个历史的精确行数。 */
+  private tailVisibleEventLines(width: number): readonly ViewerSemanticLine[] {
+    const visible: ViewerSemanticLine[] = [];
+    let remaining = this.viewportHeight;
+    const blocks = this.layout().blocks;
+    for (let index = blocks.length - 1; index >= 0 && remaining > 0; index -= 1) {
+      const block = blocks[index]!;
+      const lines = block.renderTail(width, remaining);
+      if (lines.length === 0) continue;
+      visible.unshift(...lines);
+      remaining -= lines.length;
+    }
+    return Object.freeze(visible);
+  }
+
+  private windowVisibleEventLines(width: number): readonly ViewerSemanticLine[] {
+    const start = Math.max(0, this.scrollOffset);
+    const end = start + this.viewportHeight;
+    const visible: ViewerSemanticLine[] = [];
+    let position = 0;
+    for (const block of this.layout().blocks) {
+      const count = block.lineCount(width);
+      const nextPosition = position + count;
+      if (nextPosition > start && position < end) {
+        const localStart = Math.max(0, start - position);
+        const localLimit = Math.min(count, end - position) - localStart;
+        if (localLimit > 0) {
+          visible.push(...block.renderWindow(width, localStart, localLimit));
+        }
+      }
+      position = nextPosition;
+      if (position >= end) break;
+    }
+    return Object.freeze(visible);
   }
 }
 
@@ -890,6 +1541,7 @@ type DisplayEntry =
   | {
       readonly kind: "parent_message";
       readonly entryId: string;
+      readonly incarnationId: string;
       readonly content: readonly SafeAgentActivityContentBlock[];
     }
   | {
@@ -962,52 +1614,6 @@ function renderGuidedBody(
     ...line,
     text: `${EXPANDED_BODY_GUIDE}${line.text}`,
   })));
-}
-
-/**
- * 实时草稿渲染：text 块实时按 Markdown 重渲染，不增加流式标签、角色标签
- * 或消息分隔线；thinking 默认折叠，标题按草稿状态区分流式与冻结，手动
- * 展开后持续增长。冻结 text 在草稿末尾显示弱化省略号；冻结且展开的
- * thinking 正文末尾同样显示。
- */
-function renderLiveDraft(
-  draft: AgentDisplayDraftView,
-  width: number,
-  expandedKeys: ReadonlySet<string>,
-  lines: ViewerSemanticLine[],
-): void {
-  const thinkingTitle = draft.state === "frozen"
-    ? THINKING_FROZEN_TEXT
-    : draft.state === "complete"
-      ? THINKING_COLLAPSED_TEXT
-      : THINKING_STREAMING_TEXT;
-  for (const block of draft.blocks) {
-    if (block.contentType === "text") {
-      lines.push(...renderMarkdownBlock(block.value, width, "body"));
-      continue;
-    }
-    const key = liveThinkingKey(draft.key, block.contentIndex);
-    const expanded = expandedKeys.has(key);
-    lines.push(disclosureTitleLine(thinkingTitle, key, expanded));
-    if (expanded) {
-      lines.push(...renderGuidedBody(
-        width,
-        (bodyWidth) => renderMarkdownBlock(block.value, bodyWidth, "terminal"),
-      ));
-    }
-  }
-  if (draft.state !== "frozen" || draft.blocks.length === 0) return;
-  const last = draft.blocks.at(-1)!;
-  if (last.contentType === "text") {
-    lines.push(Object.freeze({ text: FROZEN_DRAFT_ELLIPSIS, style: "terminal" as const }));
-    return;
-  }
-  if (expandedKeys.has(liveThinkingKey(draft.key, last.contentIndex))) {
-    lines.push(Object.freeze({
-      text: `${EXPANDED_BODY_GUIDE}${FROZEN_DRAFT_ELLIPSIS}`,
-      style: "terminal" as const,
-    }));
-  }
 }
 
 /** 将纯查看器投影包装成完整主题表面，避免 overlay 内部继续透出底层会话内容。 */
@@ -1176,59 +1782,28 @@ function renderMarkdownBlock(
   return Object.freeze(lines);
 }
 
-/**
- * thinking 块默认折叠为不含行数与预览的 `Thinking`；展开后保留统一标题，
- * 正文以 `│` 引导线和弱化 Markdown 显示。
- */
-function renderThinkingBlock(
-  raw: string,
+function renderCachedBodyBlock(
+  kind: CachedBodyKind,
+  source: string,
   width: number,
-  key: string,
-  expanded: boolean,
 ): readonly ViewerSemanticLine[] {
-  const title = disclosureTitleLine(THINKING_COLLAPSED_TEXT, key, expanded);
-  if (!expanded) return Object.freeze([title]);
-  const body = renderGuidedBody(
-    width,
-    (bodyWidth) => renderMarkdownBlock(raw, bodyWidth, "terminal"),
-  );
-  return Object.freeze([title, ...body]);
+  switch (kind) {
+    case "markdown-body":
+      return renderMarkdownBlock(source, width, "body");
+    case "markdown-terminal":
+      return renderMarkdownBlock(source, width, "terminal");
+    case "guided-markdown-body":
+      return renderGuidedBody(width, (bodyWidth) => renderMarkdownBlock(source, bodyWidth, "body"));
+    case "guided-markdown-terminal":
+      return renderGuidedBody(width, (bodyWidth) => renderMarkdownBlock(source, bodyWidth, "terminal"));
+    case "guided-tool-error":
+      return renderGuidedBody(width, (bodyWidth) => renderToolErrorBody(source, bodyWidth));
+    case "guided-shell-command":
+      return renderGuidedBody(width, (bodyWidth) => renderShellCommandBody(source, bodyWidth));
+  }
 }
 
 const PARENT_MESSAGE_TITLE = "Parent message";
-
-/**
- * 已接纳父代理输入统一折叠为 `Parent message`：不区分首条与后续消息，
- * 不显示父代理身份。正文完整保留、默认折叠；展开后使用 `│` 引导线显示
- * 正常 Markdown。逐条独立身份，完全相同正文不去重。
- */
-function renderParentMessageBlock(
-  content: readonly SafeAgentActivityContentBlock[],
-  width: number,
-  key: string,
-  expanded: boolean,
-): readonly ViewerSemanticLine[] {
-  const title = disclosureTitleLine(PARENT_MESSAGE_TITLE, key, expanded);
-  if (!expanded) return Object.freeze([title]);
-  const lines: ViewerSemanticLine[] = [title];
-  let blockIndex = 0;
-  for (const block of content) {
-    if (block.type === "text") {
-      lines.push(...renderGuidedBody(
-        width,
-        (bodyWidth) => renderMarkdownBlock(block.text, bodyWidth, "body"),
-      ));
-    } else {
-      const thinkingTitleKey = `${key}:${blockIndex}`;
-      lines.push(...renderGuidedBody(width, (bodyWidth) => Object.freeze([
-        disclosureTitleLine(THINKING_COLLAPSED_TEXT, thinkingTitleKey, true),
-        ...renderMarkdownBlock(block.thinking, bodyWidth, "terminal"),
-      ])));
-    }
-    blockIndex += 1;
-  }
-  return Object.freeze(lines);
-}
 
 function wrapPlainText(value: string, width: number): readonly string[] {
   return Object.freeze(value.split("\n").flatMap((line) => wrapPlainLine(line, width)));
@@ -1541,6 +2116,242 @@ function formatStatusSummary(
   return `${dim}${redPart}`;
 }
 
+function countWrappedPlainLine(value: string, width: number, trimTrailing: boolean): number {
+  let count = 0;
+  visitWrappedPlainLine(value, width, trimTrailing, () => {
+    count += 1;
+    return false;
+  });
+  return count;
+}
+
+/**
+ * 按与旧 wrapPlainLine 相同的字素簇和单词边界规则遍历软换行结果。
+ * 只在每个输出行边界创建字符串，避免对长正文反复重新分割剩余全文。
+ */
+function visitWrappedPlainLine(
+  value: string,
+  width: number,
+  trimTrailing: boolean,
+  callback: (wrapped: string) => boolean,
+): boolean {
+  void trimTrailing;
+  const normalized = value.includes("\t") ? value.replace(/\t/gu, "   ") : value;
+  const contentWidth = Math.max(1, width);
+  // 产生端净化后的大多数正文是可打印 ASCII。该分支与下方字素簇算法
+  // 的空白断行规则相同，但避免为数百万个 ASCII 字符创建 SegmentData 对象。
+  if (isPrintableAsciiLine(normalized)) {
+    return visitAsciiWrappedPlainLine(normalized, contentWidth, callback);
+  }
+  if (isSimpleCjkAsciiLine(normalized)) {
+    return visitSimpleCjkAsciiWrappedPlainLine(normalized, contentWidth, callback);
+  }
+  let totalWidth = 0;
+  const segments = [...SEGMENTER.segment(normalized)].map(({ segment, index }) => {
+    const segmentWidth = graphemeWidth(segment);
+    totalWidth += segmentWidth;
+    return { segment, index, width: segmentWidth };
+  });
+  if (totalWidth <= contentWidth) return callback(normalized);
+  if (segments.length === 0) return callback(normalized);
+
+  let cursor = 0;
+  let lineStart = 0;
+  while (cursor < segments.length) {
+    let used = 0;
+    let overflowAt = segments.length;
+    let overflowed = false;
+    let lastBreakAt = -1;
+    for (let index = cursor; index < segments.length; index += 1) {
+      const current = segments[index]!;
+      if (used > 0 && used + current.width > contentWidth) {
+        overflowAt = index;
+        overflowed = true;
+        break;
+      }
+      if (used === 0 && current.width > contentWidth) {
+        overflowAt = index + 1;
+        overflowed = true;
+        const localBreak = lastWhitespaceOffset(current.segment);
+        if (localBreak >= 0) lastBreakAt = current.index + localBreak;
+        break;
+      }
+      used += current.width;
+      const localBreak = lastWhitespaceOffset(current.segment);
+      if (localBreak >= 0) lastBreakAt = current.index + localBreak;
+    }
+
+    if (!overflowed) return callback(normalized.slice(lineStart));
+
+    if (lastBreakAt > lineStart) {
+      if (callback(normalized.slice(lineStart, lastBreakAt).trimEnd())) return true;
+      let nextStart = lastBreakAt + 1;
+      while (/\s/u.test(normalized[nextStart] ?? "")) nextStart += 1;
+      lineStart = nextStart;
+      while (cursor < segments.length && segments[cursor]!.index < nextStart) cursor += 1;
+      if (cursor >= segments.length) return callback("");
+      continue;
+    }
+
+    const cutAt = segments[overflowAt]?.index ?? normalized.length;
+    if (callback(normalized.slice(lineStart, cutAt))) return true;
+    lineStart = cutAt;
+    cursor = overflowAt;
+    if (cursor >= segments.length) return callback(normalized.slice(lineStart));
+  }
+  return false;
+}
+
+/** 已净化单行的 ASCII 快速路径；只有普通空格可作为断词空白。 */
+function isPrintableAsciiLine(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code > 0x7e) return false;
+  }
+  return true;
+}
+
+/**
+ * 与 visitWrappedPlainLine 的 ASCII 子集等价：优先在当前宽度范围内最后一个
+ * 空格换行，并跳过断词点后的连续空格；没有空格时按固定宽度切分。
+ */
+function visitAsciiWrappedPlainLine(
+  value: string,
+  width: number,
+  callback: (wrapped: string) => boolean,
+): boolean {
+  if (value.length <= width) return callback(value);
+  let lineStart = 0;
+  let cursor = 0;
+  let used = 0;
+  let lastBreakAt = -1;
+  while (cursor < value.length) {
+    if (used > 0 && used + 1 > width) {
+      if (lastBreakAt > lineStart) {
+        if (callback(value.slice(lineStart, lastBreakAt).trimEnd())) return true;
+        let nextStart = lastBreakAt + 1;
+        while (value.charCodeAt(nextStart) === 0x20) nextStart += 1;
+        if (nextStart >= value.length) return callback("");
+        lineStart = nextStart;
+        cursor = nextStart;
+      } else {
+        if (callback(value.slice(lineStart, cursor))) return true;
+        lineStart = cursor;
+      }
+      used = 0;
+      lastBreakAt = -1;
+      continue;
+    }
+    if (value.charCodeAt(cursor) === 0x20) lastBreakAt = cursor;
+    used += 1;
+    cursor += 1;
+  }
+  return callback(value.slice(lineStart));
+}
+
+function isSimpleCjkAsciiLine(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const first = value.charCodeAt(index);
+    if (first >= 0x20 && first <= 0x7e) continue;
+    if (first < 0xd800 || first > 0xdfff) {
+      if (!isSimpleWideCjkCodePoint(first)) return false;
+      continue;
+    }
+    if (first > 0xdbff) return false;
+    const second = value.charCodeAt(index + 1);
+    if (second < 0xdc00 || second > 0xdfff) return false;
+    const codePoint = ((first - 0xd800) * 0x400) + second - 0xdc00 + 0x10000;
+    if (!isSimpleWideCjkCodePoint(codePoint)) return false;
+    index += 1;
+  }
+  return true;
+}
+
+/** 只接受不存在扩展字素簇组合的东亚宽字符，保留复杂 Unicode 的精确回退。 */
+function isSimpleWideCjkCodePoint(codePoint: number): boolean {
+  return codePoint === 0x2329
+    || codePoint === 0x232a
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x3000 && codePoint !== 0x303f)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+    || (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd);
+}
+
+/** ASCII 空格与简单 CJK 标量的等价软换行，不调用 Intl.Segmenter。 */
+function visitSimpleCjkAsciiWrappedPlainLine(
+  value: string,
+  width: number,
+  callback: (wrapped: string) => boolean,
+): boolean {
+  let lineStart = 0;
+  let cursor = 0;
+  let used = 0;
+  let lastBreakAt = -1;
+  while (cursor < value.length) {
+    const first = value.charCodeAt(cursor);
+    const currentLength = first >= 0xd800 && first <= 0xdbff ? 2 : 1;
+    const currentWidth = first <= 0x7e ? 1 : 2;
+    if (used > 0 && used + currentWidth > width) {
+      if (lastBreakAt > lineStart) {
+        if (callback(value.slice(lineStart, lastBreakAt).trimEnd())) return true;
+        let nextStart = lastBreakAt + 1;
+        while (value.charCodeAt(nextStart) === 0x20) nextStart += 1;
+        if (nextStart >= value.length) return callback("");
+        lineStart = nextStart;
+        cursor = nextStart;
+      } else {
+        if (callback(value.slice(lineStart, cursor))) return true;
+        lineStart = cursor;
+      }
+      used = 0;
+      lastBreakAt = -1;
+      continue;
+    }
+    if (used === 0 && currentWidth > width) {
+      const next = cursor + currentLength;
+      if (callback(value.slice(lineStart, next))) return true;
+      lineStart = next;
+      cursor = next;
+      lastBreakAt = -1;
+      continue;
+    }
+    if (value.charCodeAt(cursor) === 0x20) lastBreakAt = cursor;
+    used += currentWidth;
+    cursor += currentLength;
+  }
+  return callback(value.slice(lineStart));
+}
+
+function lastWhitespaceOffset(value: string): number {
+  let result = -1;
+  for (let index = 0; index < value.length; index += 1) {
+    if (/\s/u.test(value[index] ?? "")) result = index;
+  }
+  return result;
+}
+
+const PLAIN_LAYOUT_MIN_SOURCE_LENGTH = 4096;
+
+/** 只对没有 Markdown 语义标记的长正文走纯文本布局；短正文继续经过 Markdown，保持既有渲染语义与缓存观测。 */
+function isPlainMarkdownSource(value: string): boolean {
+  if (value.length < PLAIN_LAYOUT_MIN_SOURCE_LENGTH) return false;
+  for (const marker of "\\*_~`[]<>#|&") {
+    if (value.includes(marker)) return false;
+  }
+  if (/\b(?:https?|ftp):\/\//u.test(value)) return false;
+  for (const line of value.split("\n")) {
+    if (/^ {4,}/u.test(line)) return false;
+    if (/^\s{0,3}(?:[-+*]|\d+[.)]|>|#{1,6}(?:\s|$)|```|~~~)/u.test(line)) return false;
+    if (/^\s*(?:-{3,}|={3,}|_{3,}|\*{3,})\s*$/u.test(line)) return false;
+    if (/ {2,}$/u.test(line)) return false;
+  }
+  return true;
+}
+
 function wrapPlainLine(value: string, width: number): string[] {
   const normalized = value.replace(/\t/gu, "   ");
   if (displayWidth(normalized) <= width) return [normalized];
@@ -1582,6 +2393,142 @@ function wrapPlainLine(value: string, width: number): string[] {
 
 function sanitizeViewerMarkup(value: string): string {
   return sanitizeSafeActivityText(value);
+}
+
+function sameLiveDraftSnapshot(
+  left: readonly AgentDisplayDraftView[],
+  right: readonly AgentDisplayDraftView[],
+): boolean {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  for (let draftIndex = 0; draftIndex < left.length; draftIndex += 1) {
+    const leftDraft = left[draftIndex];
+    const rightDraft = right[draftIndex];
+    if (leftDraft === undefined || rightDraft === undefined) return false;
+    if (
+      leftDraft.key !== rightDraft.key
+      || leftDraft.state !== rightDraft.state
+      || leftDraft.blocks.length !== rightDraft.blocks.length
+    ) return false;
+    for (let blockIndex = 0; blockIndex < leftDraft.blocks.length; blockIndex += 1) {
+      const leftBlock = leftDraft.blocks[blockIndex];
+      const rightBlock = rightDraft.blocks[blockIndex];
+      if (leftBlock === undefined || rightBlock === undefined) return false;
+      if (
+        leftBlock.contentIndex !== rightBlock.contentIndex
+        || leftBlock.contentType !== rightBlock.contentType
+        || leftBlock.value !== rightBlock.value
+      ) return false;
+    }
+  }
+  return true;
+}
+
+function reconcileCanonicalEntries(
+  current: readonly CanonicalAgentActivityEntry[],
+  next: readonly CanonicalAgentActivityEntry[],
+): readonly CanonicalAgentActivityEntry[] {
+  const currentByIdentity = new Map(
+    current.map((entry) => [canonicalEntryIdentity(entry), entry] as const),
+  );
+  return Object.freeze(next.map((entry) => {
+    const retained = currentByIdentity.get(canonicalEntryIdentity(entry));
+    return retained !== undefined && sameEntry(retained, entry) ? retained : entry;
+  }));
+}
+
+/** 规范原子身份跨工具 start→end 保持稳定，并隔离代理、运行实例、调用 ID
+ * 与执行代次；缺省代次 1 兼容旧事实。 */
+function canonicalEntryIdentity(entry: CanonicalAgentActivityEntry): string {
+  const body = entry.body;
+  const kind = body.type === "tool_execution_start" || body.type === "tool_execution_end"
+    ? "tool"
+    : body.type;
+  const toolCallId = body.type === "tool_execution_start" || body.type === "tool_execution_end"
+    ? body.toolCallId
+    : undefined;
+  const executionGeneration = body.type === "tool_execution_start"
+    || body.type === "tool_execution_end"
+    ? body.executionGeneration ?? 1
+    : undefined;
+  return JSON.stringify([
+    kind,
+    entry.agent_id,
+    entry.incarnation_id,
+    entry.entry_id,
+    toolCallId,
+    executionGeneration,
+  ]);
+}
+
+/** 旧 replay 可包含 start/end 两个事实，因此投影按调用 ID 与执行代次合并。 */
+function toolProjectionIdentity(entry: CanonicalAgentActivityEntry): string {
+  const body = entry.body;
+  if (body.type !== "tool_execution_start" && body.type !== "tool_execution_end") return "";
+  return JSON.stringify([
+    entry.incarnation_id,
+    body.toolCallId,
+    body.executionGeneration ?? 1,
+  ]);
+}
+
+/** 返回当前可观察 replay 中尚未被 end 收束的工具规范原子身份。 */
+function runningToolSettlementKeys(
+  entries: readonly CanonicalAgentActivityEntry[],
+): readonly string[] {
+  const tools = new Map<string, { settlementKey: string; completed: boolean }>();
+  for (const entry of entries) {
+    const body = entry.body;
+    if (body.type !== "tool_execution_start" && body.type !== "tool_execution_end") continue;
+    const identity = toolProjectionIdentity(entry);
+    const existing = tools.get(identity);
+    if (body.type === "tool_execution_start") {
+      if (existing === undefined) {
+        tools.set(identity, { settlementKey: canonicalEntryIdentity(entry), completed: false });
+      }
+      continue;
+    }
+    if (existing === undefined) {
+      tools.set(identity, { settlementKey: canonicalEntryIdentity(entry), completed: true });
+    } else {
+      existing.completed = true;
+    }
+  }
+  return Object.freeze([...tools.values()]
+    .filter((tool) => !tool.completed)
+    .map((tool) => tool.settlementKey));
+}
+
+function nearestSurvivingKey(
+  previousKeys: readonly string[],
+  removedKey: string,
+  currentKeys: readonly string[],
+): string | undefined {
+  if (currentKeys.length === 0) return undefined;
+  const current = new Set(currentKeys);
+  const removedIndex = previousKeys.indexOf(removedKey);
+  if (removedIndex >= 0) {
+    for (let index = removedIndex + 1; index < previousKeys.length; index += 1) {
+      const key = previousKeys[index];
+      if (key !== undefined && current.has(key)) return key;
+    }
+    for (let index = removedIndex - 1; index >= 0; index -= 1) {
+      const key = previousKeys[index];
+      if (key !== undefined && current.has(key)) return key;
+    }
+  }
+  return currentKeys[0];
+}
+
+function isValidActivitySnapshot(value: AgentActivitySnapshot): boolean {
+  return Number.isSafeInteger(value.revision)
+    && value.revision >= 0
+    && Array.isArray(value.entries)
+    && typeof value.olderActivityOmitted === "boolean";
+}
+
+function isSettledLifecycleState(value: AgentLifecycleState): value is SettledLifecycleState {
+  return value === "idle" || value === "failed" || value === "terminated";
 }
 
 function sameEntry(left: CanonicalAgentActivityEntry, right: CanonicalAgentActivityEntry): boolean {

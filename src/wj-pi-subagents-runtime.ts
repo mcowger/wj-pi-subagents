@@ -29,10 +29,12 @@ import type {
 import {
   buildDisplayStreamComplete,
   createOwnToolActivityNormalizer,
+  createOwnToolActivityNormalizerState,
   normalizeAssistantMessageUpdate,
   normalizeRpcBridgeEvent,
   type AgentActivityEventNormalization,
   type AgentDisplayStreamUpdate,
+  type OwnToolActivityNormalizerState,
   type SafeAgentActivityEvent,
   type SafeToolOrigin,
 } from "./rpc-bridge-event.ts";
@@ -203,6 +205,8 @@ export type WjPiSubagentsRuntimeActivator = (
 
 interface ActiveRuntime {
   controller: AgentController;
+  /** reload 后重新创建，绝不把旧工具代次或待决参数交给新观察代际。 */
+  toolActivityNormalizerState: OwnToolActivityNormalizerState;
   templates: TemplateSnapshotController;
   readonly tree: TreeController;
   readonly rootRuntime: RootRuntimeContext;
@@ -828,11 +832,32 @@ interface ActiveOwnDisplayStream {
  * 器登记时补充），因此顶层可以把完整消息原地替换对应草稿。
  */
 export class OwnDisplayStreamTracker {
+  private streamPrefix: string;
+  private displayEpoch: string | undefined;
   private nextStreamId = 0;
   private active: ActiveOwnDisplayStream | undefined;
   private discarding = false;
   /** 最近一条 assistant 消息流身份；message_end 生成权威条目时携带。 */
   latestStreamId: string | undefined;
+
+  constructor(streamPrefix = "message", displayEpoch?: string) {
+    this.streamPrefix = streamPrefix;
+    this.displayEpoch = displayEpoch;
+  }
+
+  get currentDisplayEpoch(): string | undefined {
+    return this.displayEpoch;
+  }
+
+  /** reload 时切换显示 epoch，避免新 activator 复用旧 streamId。 */
+  reset(streamPrefix = "message", displayEpoch?: string): void {
+    this.streamPrefix = streamPrefix;
+    this.displayEpoch = displayEpoch;
+    this.nextStreamId = 0;
+    this.active = undefined;
+    this.discarding = false;
+    this.latestStreamId = undefined;
+  }
 
   observe(event: unknown): readonly AgentDisplayStreamUpdate[] {
     if (!isRecord(event) || typeof event.type !== "string") return [];
@@ -866,6 +891,7 @@ export class OwnDisplayStreamTracker {
       { type: "message_update", assistantMessageEvent: update },
       active.streamId,
       active.nextSequence,
+      this.displayEpoch,
     );
     if (normalized.kind === "rejected") {
       // 单帧超预算：收束可见草稿并丢弃该消息的后续增量，等待权威消息。
@@ -882,7 +908,7 @@ export class OwnDisplayStreamTracker {
 
   private newStream(): ActiveOwnDisplayStream {
     this.nextStreamId += 1;
-    const streamId = `message-${this.nextStreamId}`;
+    const streamId = `${this.streamPrefix}-${this.nextStreamId}`;
     this.latestStreamId = streamId;
     return { streamId, nextSequence: 1, hasDelta: false };
   }
@@ -891,7 +917,11 @@ export class OwnDisplayStreamTracker {
     const active = this.active;
     this.active = undefined;
     if (active === undefined || !active.hasDelta) return undefined;
-    return buildDisplayStreamComplete(active.streamId, active.nextSequence);
+    return buildDisplayStreamComplete(
+      active.streamId,
+      active.nextSequence,
+      this.displayEpoch,
+    );
   }
 }
 
@@ -913,15 +943,28 @@ export function createWjPiSubagentsRuntimeActivator(
     );
     // send_message 摘要的目标名称解析器：摘要提取时实时查询直接子快照，
     // 查询失败或缺名时不携带名称，不影响正文事实。
-    const normalizeOwnActivity = createOwnToolActivityNormalizer(resolveToolOrigin, (agentId) =>
-      readDirectChildDisplayName(active, agentId, false),
+    let ownToolActivityNormalizerState = createOwnToolActivityNormalizerState();
+    let normalizeOwnActivity = createOwnToolActivityNormalizer(
+      resolveToolOrigin,
+      (agentId) => readDirectChildDisplayName(active, agentId, false),
+      ownToolActivityNormalizerState,
     );
     // 产生端实时显示流跟踪器：与权威 assistant 消息共享同一运行实例身份，
-    // 使顶层草稿可以被完整消息精确替换。
-    const ownDisplayTracker = new OwnDisplayStreamTracker();
+    // 使顶层草稿可以被完整消息精确替换；epoch 随 reload 轮换。
+    let ownDisplayEpoch = randomUUID();
+    const ownDisplayTracker = new OwnDisplayStreamTracker(
+      `message-${ownDisplayEpoch}`,
+      ownDisplayEpoch,
+    );
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
+
+    const rotateOwnDisplayEpoch = (current?: ActiveRuntime): void => {
+      ownDisplayEpoch = randomUUID();
+      ownDisplayTracker.reset(`message-${ownDisplayEpoch}`, ownDisplayEpoch);
+      current?.controller.resetDisplayDrafts(ownDisplayEpoch);
+    };
     const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
     const disposeRuntimeUi = (current?: ActiveRuntime): void => {
@@ -939,6 +982,7 @@ export function createWjPiSubagentsRuntimeActivator(
           read: () => current.controller.getAgentTree(),
           onChange: (listener) => current.tree.onChange(listener),
         }, context, {
+          readSnapshot: (agentId) => current.controller.getActivitySnapshot(agentId),
           readReplay: (agentId) => current.controller.getActivityReplay(agentId),
           onChange: (listener) => current.controller.onActivityChange(listener),
           readDisplayDrafts: (agentId) => current.controller.getDisplayDrafts(agentId),
@@ -1129,6 +1173,7 @@ export function createWjPiSubagentsRuntimeActivator(
       transfer.bindings.context = context;
       return {
         controller: transfer.controller,
+        toolActivityNormalizerState: createOwnToolActivityNormalizerState(),
         templates: transfer.templates,
         tree: transfer.tree,
         rootRuntime: transfer.rootRuntime,
@@ -1225,6 +1270,15 @@ export function createWjPiSubagentsRuntimeActivator(
       const bootstrap = bootstrapResult.kind === "child" ? bootstrapResult.bootstrap : undefined;
       if (active !== undefined && sessionEvent.reason === "reload") {
         reloadCoordinator.resumeLocal(active);
+        active.controller.resetActivityForReload();
+        ownToolActivityNormalizerState = createOwnToolActivityNormalizerState();
+        active.toolActivityNormalizerState = ownToolActivityNormalizerState;
+        normalizeOwnActivity = createOwnToolActivityNormalizer(
+          resolveToolOrigin,
+          (agentId) => readDirectChildDisplayName(active, agentId, false),
+          ownToolActivityNormalizerState,
+        );
+        rotateOwnDisplayEpoch(active);
         active.bindings.api = api;
         active.bindings.context = context;
         publishReloadSnapshot(active, context);
@@ -1239,6 +1293,11 @@ export function createWjPiSubagentsRuntimeActivator(
         try {
           current.bindings.api = api;
           current.bindings.context = context;
+          // reload 从空活动状态开始。控制器先切断旧回调并清空 cache/draft，
+          // 新订阅在各通道同步进入 snapshot 重同步窗口前不接纳展示帧；旧排队
+          // 帧不会在新实例复活，reset snapshot 后的同步新帧也不会丢失。
+          current.controller.resetActivityForReload();
+          current.toolActivityNormalizerState = createOwnToolActivityNormalizerState();
           if (!current.isChild) {
             publishReloadSnapshot(current, context);
             const authority = runtimeAuthorities.get(current.rootId);
@@ -1255,6 +1314,13 @@ export function createWjPiSubagentsRuntimeActivator(
           }
           reloadCoordinator.commitIncoming(incoming);
           active = current;
+          ownToolActivityNormalizerState = current.toolActivityNormalizerState;
+          normalizeOwnActivity = createOwnToolActivityNormalizer(
+            resolveToolOrigin,
+            (agentId) => readDirectChildDisplayName(active, agentId, false),
+            ownToolActivityNormalizerState,
+          );
+          rotateOwnDisplayEpoch(current);
           applyAgentToolVisibility(api, current.managementEnabled, current.isChild);
           refreshContextUsage(current, context);
           bindRuntimeUi(current, context);
@@ -1280,6 +1346,15 @@ export function createWjPiSubagentsRuntimeActivator(
         active = undefined;
         reloadCoordinator.releaseRuntime(current);
       }
+
+      // A non-reload session starts a new runtime identity ledger; unlike a
+      // reload transfer, no old tool invocation can legitimately continue here.
+      ownToolActivityNormalizerState = createOwnToolActivityNormalizerState();
+      normalizeOwnActivity = createOwnToolActivityNormalizer(
+        resolveToolOrigin,
+        (agentId) => readDirectChildDisplayName(active, agentId, false),
+        ownToolActivityNormalizerState,
+      );
 
       const rootId = bootstrap?.rootId ?? readRootId(options.rootIdFactory);
       if (bootstrap === undefined && runtimeAuthorities.has(rootId)) {
@@ -1409,6 +1484,7 @@ export function createWjPiSubagentsRuntimeActivator(
         });
       const state: ActiveRuntime = {
         controller: undefined as unknown as AgentController,
+        toolActivityNormalizerState: ownToolActivityNormalizerState,
         templates,
         tree,
         rootRuntime,
@@ -1492,6 +1568,9 @@ export function createWjPiSubagentsRuntimeActivator(
         throw error instanceof Error ? error : new Error("子树发布器启动失败");
       }
       active = state;
+      // child 冷启动先登记当前 display epoch，再允许后续 token 上行；该事实
+      // 仍是一次无状态 fire-and-forget，不阻塞 session_start。
+      state.controller.resetDisplayDrafts(ownDisplayEpoch);
       if (bootstrap === undefined) {
         runtimeAuthorities.set(rootId, Object.freeze({
           tree,

@@ -180,7 +180,7 @@ function renderSegmentedText(
   return `${stylePanelText(head, style, theme)}${stylePanelText(errorTail, "error", theme)}`;
 }
 
-function graphemeWidth(grapheme: string): number {
+export function graphemeWidth(grapheme: string): number {
   if (EXTENDED_PICTOGRAPHIC_PATTERN.test(grapheme) || REGIONAL_INDICATOR_PATTERN.test(grapheme)) return 2;
   let width = 0;
   for (const character of grapheme) width += codePointWidth(character);

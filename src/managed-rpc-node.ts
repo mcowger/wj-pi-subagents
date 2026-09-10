@@ -8,6 +8,7 @@ import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
 import {
   ACTIVITY_MAX_TEXT_BYTES,
   isSafeToolOrigin,
+  isValidToolExecutionGeneration,
 } from "./rpc-bridge-event.ts";
 import { LengthPrefixedFrameDecoder } from "./length-prefixed-frame-decoder.ts";
 import {
@@ -34,7 +35,7 @@ export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/7" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/8" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */
@@ -1098,9 +1099,13 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
     || value.toolName.length > 256
   ) return false;
   const allowed = value.type === "tool_execution_start"
-    ? ["type", "toolCallId", "toolName", "origin"]
-    : ["type", "toolCallId", "toolName", "origin", "isError"];
+    ? ["type", "toolCallId", "toolName", "origin", "executionGeneration"]
+    : ["type", "toolCallId", "toolName", "origin", "executionGeneration", "isError"];
   if (!Object.keys(value).every((key) => allowed.includes(key))) return false;
+  if (
+    value.executionGeneration !== undefined
+    && !isValidToolExecutionGeneration(value.executionGeneration)
+  ) return false;
   if (!isSafeToolOrigin(value.origin)) return false;
   return value.type === "tool_execution_start" || typeof value.isError === "boolean";
 }

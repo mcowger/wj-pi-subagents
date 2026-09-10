@@ -326,6 +326,8 @@ export interface RpcSupervisorChannel {
   bind(signal: AbortSignal): Promise<void>;
   waitForReady(signal: AbortSignal): Promise<void>;
   isReady(): boolean;
+  /** parent 端主动进入 reset snapshot 重同步窗口；展示帧在窗口内可丢弃。 */
+  requestSnapshot?(): Promise<void>;
   publishReply(reply: SupervisorReply, signal?: AbortSignal): Promise<void>;
   establishTerminationBarrier(): void;
   requestClose(signal: AbortSignal): Promise<void>;
@@ -641,6 +643,23 @@ export class RpcSupervisor {
   async synchronizeState(): Promise<boolean> {
     if (this.phase !== "ready") return false;
     return await this.enqueueStateReconciliation();
+  }
+
+  /**
+   * reload 时建立活动交付边界。现有通道会先进入 snapshot 重同步窗口，
+   * 因而旧 activity/display 帧只能被静默丢弃；这不是活动 ACK 或重放。
+   */
+  resetActivityDelivery(): void {
+    if (this.phase !== "ready") return;
+    const channel = this.channel;
+    if (channel?.requestSnapshot === undefined) return;
+    try {
+      void channel.requestSnapshot().catch(() => {
+        // 重同步请求失败只造成展示缺口，不能改变节点生命周期。
+      });
+    } catch {
+      // 同步适配器异常同样不影响控制面。
+    }
   }
 
   async interrupt(): Promise<RpcSupervisorInterruptResult> {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createOwnToolActivityNormalizer,
+  createOwnToolActivityNormalizerState,
   normalizeOwnToolActivityEvent,
   normalizeRpcBridgeEvent,
   parseAgentActivityEvent,
@@ -123,6 +124,7 @@ test("产生端规范化把非专用工具事实缩减为无载荷状态事实�
       toolCallId: "call_1",
       toolName: "future_plugin_tool",
       origin: "plugin",
+      executionGeneration: 1,
     },
   });
   assert.deepEqual(normalizeOwnToolActivityEvent({
@@ -138,6 +140,7 @@ test("产生端规范化把非专用工具事实缩减为无载荷状态事实�
       toolCallId: "call_1",
       toolName: "future_plugin_tool",
       origin: "plugin",
+      executionGeneration: 1,
       isError: false,
     },
   });
@@ -158,6 +161,7 @@ test("产生端规范化宽容未来新增字段并忽略未知载荷", () => {
       toolCallId: "call_1",
       toolName: "grep",
       origin: "plugin",
+      executionGeneration: 1,
     },
   });
 });
@@ -756,6 +760,177 @@ test("运行时规范化器缓存开始参数供结束事实自包含，并保�
   assert.deepEqual(summaryOf(kept.event), { tool: "read", path: "new.txt" });
 });
 
+test("工具执行代次在同一 toolCallId 复用时递增，并让 start/end 共享对应代次", () => {
+  const normalize = createOwnToolActivityNormalizer(() => "unknown");
+  const start1 = normalize({
+    type: "tool_execution_start",
+    toolCallId: "reused-call",
+    toolName: "custom_tool",
+  });
+  const end1 = normalize({
+    type: "tool_execution_end",
+    toolCallId: "reused-call",
+    toolName: "custom_tool",
+    isError: false,
+  });
+  const start2 = normalize({
+    type: "tool_execution_start",
+    toolCallId: "reused-call",
+    toolName: "custom_tool",
+  });
+  const end2 = normalize({
+    type: "tool_execution_end",
+    toolCallId: "reused-call",
+    toolName: "custom_tool",
+    isError: true,
+  });
+  for (const result of [start1, end1, start2, end2]) assert.equal(result.kind, "event");
+  if (
+    start1.kind !== "event"
+    || end1.kind !== "event"
+    || start2.kind !== "event"
+    || end2.kind !== "event"
+  ) return;
+  assert.equal(start1.event.type, "tool_execution_start");
+  assert.equal(end1.event.type, "tool_execution_end");
+  assert.equal(start2.event.type, "tool_execution_start");
+  assert.equal(end2.event.type, "tool_execution_end");
+  assert.equal(start1.event.executionGeneration, 1);
+  assert.equal(end1.event.executionGeneration, 1);
+  assert.equal(start2.event.executionGeneration, 2);
+  assert.equal(end2.event.executionGeneration, 2);
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "bad-generation",
+    toolName: "custom_tool",
+    origin: "unknown",
+    executionGeneration: 0,
+  }).kind, "invalid");
+});
+
+
+test("显式复用同一 normalizer 状态时保留代次与待决参数", () => {
+  const state = createOwnToolActivityNormalizerState();
+  const resolveOrigin = (toolName: string): SafeToolOrigin =>
+    toolName === "read" ? "pi_native" : "unknown";
+  const first = createOwnToolActivityNormalizer(resolveOrigin, undefined, state);
+
+  // 第一代完成后，第二代开始持有新的输入参数；显式把同一 state 交给
+  // 新 normalizer 时，它仍属于同一观察代际，结束事实应读取该状态。
+  const start1 = first({
+    type: "tool_execution_start",
+    toolCallId: "reload-call",
+    toolName: "read",
+    args: { path: "one.txt" },
+  });
+  const end1 = first({
+    type: "tool_execution_end",
+    toolCallId: "reload-call",
+    toolName: "read",
+    isError: false,
+    result: { content: [{ type: "text", text: "one" }] },
+  });
+  const start2 = first({
+    type: "tool_execution_start",
+    toolCallId: "reload-call",
+    toolName: "read",
+    args: { path: "two.txt" },
+  });
+  assert.equal(start1.kind, "event");
+  assert.equal(end1.kind, "event");
+  if (start2.kind !== "event" || start2.event.type !== "tool_execution_start") return;
+  assert.equal(start2.event.executionGeneration, 2);
+
+  const continued = createOwnToolActivityNormalizer(resolveOrigin, undefined, state);
+  const end2 = continued({
+    type: "tool_execution_end",
+    toolCallId: "reload-call",
+    toolName: "read",
+    isError: false,
+    result: { content: [{ type: "text", text: "two" }] },
+  });
+  assert.equal(end2.kind, "event");
+  if (end2.kind !== "event" || end2.event.type !== "tool_execution_end") return;
+  assert.equal(end2.event.executionGeneration, 2);
+  assert.deepEqual(summaryOf(end2.event), { tool: "read", path: "two.txt" });
+
+  // 256 个其它 ID 不应淘汰 reload-call 的代次账本；再次复用必须是第 3 代。
+  for (let index = 0; index < 256; index += 1) {
+    continued({
+      type: "tool_execution_start",
+      toolCallId: `long-session-${index}`,
+      toolName: "custom_tool",
+    });
+  }
+  const start3 = continued({
+    type: "tool_execution_start",
+    toolCallId: "reload-call",
+    toolName: "read",
+    args: { path: "three.txt" },
+  });
+  assert.equal(start3.kind, "event");
+  if (start3.kind !== "event" || start3.event.type !== "tool_execution_start") return;
+  assert.equal(start3.event.executionGeneration, 3);
+});
+test("规范化器忽略迟到显式旧代次对最新代次账本的回退", () => {
+  const normalize = createOwnToolActivityNormalizer(() => "unknown");
+  const start2 = normalize({
+    type: "tool_execution_start",
+    toolCallId: "monotonic-call",
+    toolName: "custom_tool",
+    executionGeneration: 2,
+  });
+  assert.equal(start2.kind, "event");
+  const staleEnd = normalize({
+    type: "tool_execution_end",
+    toolCallId: "monotonic-call",
+    toolName: "custom_tool",
+    executionGeneration: 1,
+    isError: false,
+  });
+  assert.equal(staleEnd.kind, "event");
+  const repeatedStart2 = normalize({
+    type: "tool_execution_start",
+    toolCallId: "monotonic-call",
+    toolName: "custom_tool",
+  });
+  assert.equal(repeatedStart2.kind, "event");
+  if (repeatedStart2.kind !== "event" || repeatedStart2.event.type !== "tool_execution_start") return;
+  assert.equal(repeatedStart2.event.executionGeneration, 2);
+  const end2 = normalize({
+    type: "tool_execution_end",
+    toolCallId: "monotonic-call",
+    toolName: "custom_tool",
+    isError: false,
+  });
+  assert.equal(end2.kind, "event");
+  if (end2.kind !== "event" || end2.event.type !== "tool_execution_end") return;
+  assert.equal(end2.event.executionGeneration, 2);
+  const start3 = normalize({
+    type: "tool_execution_start",
+    toolCallId: "monotonic-call",
+    toolName: "custom_tool",
+  });
+  assert.equal(start3.kind, "event");
+  if (start3.kind !== "event" || start3.event.type !== "tool_execution_start") return;
+  assert.equal(start3.event.executionGeneration, 3);
+
+  // 结构非法的 start 不应消耗下一代。
+  const invalid = normalize({
+    type: "tool_execution_start",
+    toolCallId: "invalid-call",
+    toolName: 42,
+  });
+  assert.equal(invalid.kind, "invalid");
+  const valid = normalize({
+    type: "tool_execution_start",
+    toolCallId: "invalid-call",
+    toolName: "custom_tool",
+  });
+  assert.equal(valid.kind, "event");
+  if (valid.kind !== "event" || valid.event.type !== "tool_execution_start") return;
+  assert.equal(valid.event.executionGeneration, 1);
+});
 test("活动事件闭集只允许专用工具携带摘要与错误正文，结构违约判 invalid", () => {
   // 专用摘要出现在未知来源事件上属于协议违约。
   assert.equal(parseAgentActivityEvent({

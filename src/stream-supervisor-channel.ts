@@ -153,6 +153,11 @@ export class StreamSupervisorChannel implements RpcSupervisorChannel {
     return this.publicState().state === "ready";
   }
 
+  /** parent reload 建立 reset snapshot 边界；窗口内 activity/display 可安全丢弃。 */
+  async requestSnapshot(): Promise<void> {
+    await this.send(this.protocol.requestSnapshot());
+  }
+
   async publishReply(
     reply: SupervisorReply,
     signal?: AbortSignal,

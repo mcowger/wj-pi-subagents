@@ -18,6 +18,7 @@ import {
   renderAgentActivityViewerSurface,
 } from "./agent-activity-viewer.ts";
 import type { CanonicalAgentActivityEntry } from "./canonical-activity.ts";
+import type { AgentActivitySnapshot } from "./agent-activity-cache.ts";
 import type { AgentDisplayDraftView } from "./agent-display-drafts.ts";
 import {
   displayWidth,
@@ -82,9 +83,11 @@ export interface AgentTreeSnapshotSource {
   onChange(listener: () => void): () => void;
 }
 
-/** 活动流缓存来源 seam：查看器 overlay 只通过它读取回放、草稿与变更通知。 */
+/** 活动流缓存来源 seam：优先读取一致快照，旧 source 继续使用 replay。 */
 export interface AgentActivityStreamSource {
   readReplay(agentId: string): readonly CanonicalAgentActivityEntry[];
+  /** 有界历史的权威快照；存在时 opening 与通知都不再读取旧 replay。 */
+  readSnapshot?(agentId: string): AgentActivitySnapshot;
   onChange(listener: (agentId: string) => void): () => void;
   /**
    * 可选的顶层实时草稿快照。草稿只存在于顶层登记表：即使详情未打开也持续
@@ -437,8 +440,13 @@ export function bindAgentTreeUi(
         let closed = false;
         let lastWidth = 0;
         let replay: readonly CanonicalAgentActivityEntry[] = [];
+        let initialActivitySnapshot: AgentActivitySnapshot | undefined;
         try {
-          replay = activity.readReplay(node.agent_id);
+          if (typeof activity.readSnapshot === "function") {
+            initialActivitySnapshot = activity.readSnapshot(node.agent_id);
+          } else {
+            replay = activity.readReplay(node.agent_id);
+          }
         } catch {
           // 初始读取失败落到空态，不阻断 overlay 打开。
         }
@@ -451,16 +459,19 @@ export function bindAgentTreeUi(
             initialDrafts = [];
           }
         }
-        const model = new AgentActivityViewerModel(
-          {
-            agent_id: node.agent_id,
-            template_id: node.template_id,
-            name: node.name,
-            state: node.state,
-          },
-          replay,
-          { drafts: initialDrafts },
-        );
+        const viewedAgent = Object.freeze({
+          agent_id: node.agent_id,
+          template_id: node.template_id,
+          name: node.name,
+          state: node.state,
+        });
+        const model = initialActivitySnapshot === undefined
+          ? new AgentActivityViewerModel(viewedAgent, replay, { drafts: initialDrafts })
+          : new AgentActivityViewerModel(
+            viewedAgent,
+            initialActivitySnapshot,
+            { drafts: initialDrafts },
+          );
         let renderTimer: ReturnType<typeof setTimeout> | undefined;
         const scheduleActivityRender = (): void => {
           if (closed || renderTimer !== undefined) return;
@@ -480,12 +491,15 @@ export function bindAgentTreeUi(
         try {
           unsubscribe = activity.onChange((changedAgentId) => {
             if (closed || changedAgentId !== node.agent_id) return;
+            let outcome: "changed" | "ignored" = "ignored";
             try {
-              model.syncFrom(activity.readReplay(node.agent_id));
+              outcome = typeof activity.readSnapshot === "function"
+                ? model.syncSnapshot(activity.readSnapshot(node.agent_id))
+                : model.syncFrom(activity.readReplay(node.agent_id));
             } catch {
               // 缓存读取失败保持当前内容，不中断查看器。
             }
-            scheduleActivityRender();
+            if (outcome === "changed") scheduleActivityRender();
           });
         } catch {
           unsubscribe = undefined;
@@ -550,6 +564,7 @@ export function bindAgentTreeUi(
           },
           invalidate: () => {},
           dispose: () => {
+            closed = true;
             try { unsubscribe?.(); } catch {}
             unsubscribe = undefined;
             try { unsubscribeDisplay?.(); } catch {}

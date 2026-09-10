@@ -36,7 +36,12 @@ import {
   type CanonicalAgentActivityEntry,
 } from "./canonical-activity.ts";
 import { randomUUID } from "node:crypto";
-import { AgentActivityCache } from "./agent-activity-cache.ts";
+import {
+  AgentActivityCache,
+  type AgentActivityRecordResult,
+  type AgentActivitySettlementState,
+  type AgentActivitySnapshot,
+} from "./agent-activity-cache.ts";
 import {
   AgentDisplayDraftRegistry,
   type AgentDisplayDraftView,
@@ -44,6 +49,8 @@ import {
 import {
   parseAgentActivityDisplayEvent,
   sanitizeSafeActivityText,
+  DEFAULT_TOOL_EXECUTION_GENERATION,
+  isValidToolExecutionGeneration,
   type AgentDisplayStreamUpdate,
   type SafeAgentActivityDisplayEvent,
   type SafeAgentActivityEvent,
@@ -97,6 +104,8 @@ export interface AgentSupervisor {
   terminate(): Promise<RpcSupervisorTerminationResult>;
   /** 故障节点的平台进程树边界回收；节点记录本身继续保持 failed。 */
   reapOrphanedDescendants?(): Promise<{ readonly confirmed: boolean; readonly forced: boolean }>;
+  /** reload 时让既有监督通道进入快照重同步窗口，丢弃边界前的展示帧。 */
+  resetActivityDelivery?(): void;
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void;
   wasForcedTerminationUsed(): boolean;
 }
@@ -148,7 +157,14 @@ interface ManagedAgentEntry {
   readonly supervisor: AgentSupervisor;
   readonly templateId: string;
   readonly name: string;
-  readonly unsubscribe: () => void;
+  unsubscribe: () => void;
+}
+
+interface OwnToolExecutionState {
+  readonly generation: number;
+  readonly toolName: string;
+  readonly origin: string;
+  readonly open: boolean;
 }
 
 interface PendingWaiter {
@@ -245,8 +261,12 @@ export class AgentController {
    * 中间运行时只逐层转发显示事实，不缓存草稿。
    */
   private readonly displayDrafts = new AgentDisplayDraftRegistry();
-  /** 本控制器运行实例身份：跨进程重启或 reload 后不与旧条目串流。 */
-  private readonly activityIncarnationId = randomUUID();
+  /** 本控制器运行实例身份：reload 后切换，避免新旧活动条目串流。 */
+  private activityIncarnationId = randomUUID();
+  /** 旧订阅回调若在 reload 后才执行，只允许继续处理非展示事件。 */
+  private activityDeliveryGeneration = 0;
+  /** 产生端 legacy 调用未携带代次时，由控制器补足并保持 start/end 关联。 */
+  private readonly ownToolExecutionStates = new Map<string, OwnToolExecutionState>();
   private readonly agents = new Map<string, ManagedAgentEntry>();
   /** start 抛出前无法取得公开身份的节点仍需保留内部回收能力。 */
   private readonly unassignedSupervisors = new Map<AgentSupervisor, () => void>();
@@ -356,10 +376,11 @@ export class AgentController {
       return controlFailure("internal_error");
     }
     let assignedAgentId: string | undefined;
-    const earlyEvents: RpcSupervisorEvent[] = [];
+    const earlyEvents: Array<{ readonly event: RpcSupervisorEvent; readonly deliveryGeneration: number }> = [];
+    const subscriptionGeneration = this.activityDeliveryGeneration;
     const unsubscribe = supervisor.onEvent((event) => {
-      if (assignedAgentId === undefined) earlyEvents.push(event);
-      else this.handleSupervisorEvent(assignedAgentId, event);
+      if (assignedAgentId === undefined) earlyEvents.push({ event, deliveryGeneration: subscriptionGeneration });
+      else this.handleSupervisorEvent(assignedAgentId, event, subscriptionGeneration);
     });
     let started: RpcSupervisorStartupResult;
     try {
@@ -646,6 +667,9 @@ export class AgentController {
       return controlFailure("agent_unavailable");
     }
     if (target.data.state === "terminated") {
+      // 幂等终止也必须补做活动收束：外部生命周期可能先把树投影为
+      // terminated，但没有经过本控制器的正常 resources_confirmed 回调。
+      this.settleActivityForAgents([target.data.agent_id], "terminated");
       return Object.freeze({ ok: true, data: {
         agent_id: target.data.agent_id,
         state: "terminated" as const,
@@ -722,6 +746,10 @@ export class AgentController {
       this.markTerminationIncomplete(agentId);
       return controlFailure("termination_incomplete");
     }
+    // authority.confirmResources 可能已先把整棵屏障投影为 terminal，导致
+    // confirmTreeResources 走幂等短路；无论哪条路径完成确认，都直接收束
+    // 顶层活动缓存与实时草稿。
+    this.settleActivityForAgents(barrier.agent_ids, "terminated");
     // 资源确认可能由父权威一次性提交整棵屏障，而不是由 child supervisor
     // 单独产生 resources_confirmed 事件；此处补登记 target 的 terminal 事实。
     this.notifySessionEvent(agentId, "terminal");
@@ -740,13 +768,27 @@ export class AgentController {
     }) });
   }
 
+  private settleActivityForAgents(
+    agentIds: readonly string[],
+    state: AgentActivitySettlementState,
+  ): void {
+    for (const memberId of agentIds) {
+      // 子控制器本身不保留历史，调用仍保持幂等；根控制器负责清除顶层
+      // 草稿并让 running 工具立即退出 pin 状态。
+      this.displayDrafts.settleAgent(memberId);
+      this.activityCache.settleAgent(memberId, state);
+    }
+  }
+
   private confirmTreeResources(agentId: string): boolean {
     const status = this.tree.getStatus(agentId);
     if (!status.ok || status.data.state === "terminated") return false;
     const barrier = this.tree.getTerminationBarrier(agentId);
     if (barrier.ok && barrier.data.agent_id === agentId) {
       const confirmation = this.tree.confirmTerminationBarrierResources(agentId);
-      return confirmation.ok && confirmation.data.node.state === "terminated";
+      if (!confirmation.ok || confirmation.data.node.state !== "terminated") return false;
+      this.settleActivityForAgents(barrier.data.agent_ids, "terminated");
+      return true;
     }
     const generation = this.tree.getLifecycleGeneration(agentId);
     if (!generation.ok) return false;
@@ -754,7 +796,9 @@ export class AgentController {
       type: "resources_confirmed",
       expected_generation: generation.data,
     });
-    return result.ok && result.data.applied && result.data.node.state === "terminated";
+    if (!result.ok || !result.data.applied || result.data.node.state !== "terminated") return false;
+    this.settleActivityForAgents([agentId], "terminated");
+    return true;
   }
 
   private markTerminationIncomplete(agentId: string): void {
@@ -773,6 +817,7 @@ export class AgentController {
         expected_generation: generation.data,
       });
       if (result.ok && result.data.applied && result.data.node.state === "terminated") {
+        this.settleActivityForAgents(barrier.data.agent_ids, "terminated");
         this.notifySessionEvent(agentId, "terminal");
       }
     }
@@ -807,23 +852,106 @@ export class AgentController {
     return this.tree.getTreeSnapshotFor(this.actor);
   }
 
+  private ownToolEntryIdentity(
+    event: Extract<SafeAgentActivityEvent, {
+      readonly type: "tool_execution_start" | "tool_execution_end";
+    }>,
+  ): {
+    readonly entryId: string;
+    readonly executionGeneration: number;
+    readonly nextState: OwnToolExecutionState | undefined;
+  } | undefined {
+    const suppliedGeneration = event.executionGeneration;
+    if (
+      suppliedGeneration !== undefined
+      && !isValidToolExecutionGeneration(suppliedGeneration)
+    ) return undefined;
+    const previous = this.ownToolExecutionStates.get(event.toolCallId);
+    let generation: number;
+    let nextState: OwnToolExecutionState | undefined;
+    if (suppliedGeneration !== undefined) {
+      generation = suppliedGeneration;
+      const stale = previous !== undefined && generation < previous.generation;
+      const lateStartForClosedGeneration = event.type === "tool_execution_start"
+        && previous !== undefined
+        && generation === previous.generation
+        && previous.open === false;
+      // 迟到旧代次仍可形成其自身 entry 身份，但绝不回退账本或重开
+      // 最新已完成 invocation。
+      if (!stale && !lateStartForClosedGeneration) {
+        nextState = {
+          generation,
+          toolName: event.toolName,
+          origin: event.origin,
+          open: event.type === "tool_execution_start",
+        };
+      }
+    } else if (
+      event.type === "tool_execution_start"
+      && previous !== undefined
+      && previous.open
+      && previous.toolName === event.toolName
+      && previous.origin === event.origin
+    ) {
+      generation = previous.generation;
+      nextState = {
+        generation,
+        toolName: event.toolName,
+        origin: event.origin,
+        open: true,
+      };
+    } else {
+      generation = event.type === "tool_execution_end"
+        ? previous?.generation ?? DEFAULT_TOOL_EXECUTION_GENERATION
+        : (previous?.generation ?? 0) + 1;
+      nextState = {
+        generation,
+        toolName: event.toolName,
+        origin: event.origin,
+        open: event.type === "tool_execution_start",
+      };
+    }
+    return {
+      entryId: deriveNamespaceUuid(
+        TOOL_ACTIVITY_ENTRY_NAMESPACE,
+        `${this.activityIncarnationId}:${event.toolCallId}:${generation}`,
+      ),
+      executionGeneration: generation,
+      nextState,
+    };
+  }
+
   /**
    * 子模式运行时把当前 Pi 节点自身的完整活动封装为规范条目并沿上游端口
    * 转发；中间运行时不保存历史。根没有可上行的代理身份，返回 false。
    *
-   * 工具开始与结束是同一条目的状态事实：条目身份由运行实例身份与工具
-   * 活动 ID 确定性派生，两者在缓存、回放与去重中聚合为同一原子条目；
+   * 工具开始与结束是同一条目的状态事实：条目身份由运行实例、工具活动 ID
+   * 与执行代次确定性派生，两者在缓存、回放与去重中聚合为同一原子条目；
    * assistant 消息仍是每条独立身份的原子条目，且可携带与实时显示流的
    * 精确关联身份（displayStreamId），供顶层原地替换对应草稿。
    */
   recordOwnActivity(event: SafeAgentActivityEvent, displayStreamId?: string): boolean {
     if (this.actor.kind !== "agent") return false;
-    const body = event.type === "message" && displayStreamId !== undefined
-      ? Object.freeze({ ...event, streamId: displayStreamId })
-      : event;
-    const entryId = event.type === "tool_execution_start" || event.type === "tool_execution_end"
-      ? deriveNamespaceUuid(TOOL_ACTIVITY_ENTRY_NAMESPACE, `${this.activityIncarnationId}:${event.toolCallId}`)
-      : randomUUID();
+    let body: SafeAgentActivityEvent;
+    let entryId: string;
+    let nextToolExecutionState: { readonly toolCallId: string; readonly state: OwnToolExecutionState } | undefined;
+    if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+      const identity = this.ownToolEntryIdentity(event);
+      if (identity === undefined) return false;
+      body = Object.freeze({ ...event, executionGeneration: identity.executionGeneration });
+      entryId = identity.entryId;
+      if (identity.nextState !== undefined) {
+        nextToolExecutionState = {
+          toolCallId: event.toolCallId,
+          state: identity.nextState,
+        };
+      }
+    } else {
+      body = event.type === "message" && displayStreamId !== undefined
+        ? Object.freeze({ ...event, streamId: displayStreamId })
+        : event;
+      entryId = randomUUID();
+    }
     const candidate: CanonicalAgentActivityEntry = Object.freeze({
       contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
       agent_id: this.actor.agent_id,
@@ -833,6 +961,13 @@ export class AgentController {
     });
     const parsed = parseCanonicalAgentActivityEntry(candidate);
     if (parsed.kind !== "entry") return false;
+    if (nextToolExecutionState !== undefined) {
+      // 仅在 canonical 结构通过后提交账本；非法 host 事实不应消耗代次。
+      this.ownToolExecutionStates.set(
+        nextToolExecutionState.toolCallId,
+        nextToolExecutionState.state,
+      );
+    }
     try {
       this.publishUpstreamActivity?.(Object.freeze({ agent_id: this.actor.agent_id, entry: parsed.entry }));
     } catch {
@@ -847,7 +982,9 @@ export class AgentController {
    * agentId 取当前代理，incarnationId 取本运行实例身份，使 delta 与 complete
    * 携带同一身份，且与权威消息的关联身份一致。
    */
-  recordOwnDisplayEvent(update: AgentDisplayStreamUpdate): boolean {
+  recordOwnDisplayEvent(
+    update: AgentDisplayStreamUpdate | SafeAgentActivityDisplayEvent,
+  ): boolean {
     if (this.actor.kind !== "agent") return false;
     const candidate = Object.freeze({
       ...update,
@@ -878,6 +1015,20 @@ export class AgentController {
     return this.activityCache.revision(agentId);
   }
 
+  /**
+   * 读取带淘汰事实的活动快照。旧的 getActivityReplay 继续只返回 entries；
+   * reload 会通过 resetActivityForReload() 把该快照与 omission 标记一并归零。
+   */
+  getActivitySnapshot(agentId: unknown): AgentActivitySnapshot {
+    return this.activityCache.snapshot(agentId);
+  }
+
+  /** 活动历史是否曾发生过容量淘汰；仅在当前 reload 观察代际内成立。 */
+  hasOlderActivityOmitted(agentId: unknown): boolean {
+    return isCanonicalUuid(agentId)
+      && this.activityCache.hasOlderActivityOmitted(agentId);
+  }
+
   /** 注册活动流变更观察者；回调携带发生变更的代理身份。 */
   onActivityChange(listener: (agentId: string) => void): () => void {
     return this.activityCache.onChange(listener);
@@ -890,6 +1041,96 @@ export class AgentController {
   getDisplayDrafts(agentId: unknown): readonly AgentDisplayDraftView[] {
     if (!isCanonicalUuid(agentId)) return Object.freeze([]);
     return this.displayDrafts.drafts(agentId);
+  }
+
+  /**
+   * reload 开始新的活动观察代际：历史、工具条目、淘汰事实、实时草稿和本地
+   * 工具账本全部丢弃。旧回调先由 delivery generation 隔离；重新订阅时暂缓
+   * 接纳 activity/display，直到对应通道已同步切入既有 snapshot 重同步窗口。
+   * 因此边界前尚在传输或回调队列中的帧不能复活，同时不会丢失同步返回的
+   * reset snapshot 后新帧。
+   */
+  resetActivityForReload(): boolean {
+    this.activityDeliveryGeneration += 1;
+    const deliveryGeneration = this.activityDeliveryGeneration;
+    this.activityIncarnationId = randomUUID();
+    this.ownToolExecutionStates.clear();
+    const historyCleared = this.activityCache.clear();
+    const draftsCleared = this.displayDrafts.clear();
+    const resetDeliveries: Array<() => void> = [];
+
+    // 已被异步源捕获的旧回调保留旧 generation；即使取消订阅后才执行，也
+    // 只会被 handleSupervisorEvent 静默丢弃其 activity/display 事实。新的
+    // 订阅若同步重放旧数据，则在 resetActivityDelivery 建立 resync 前同样丢弃。
+    for (const [agentId, entry] of this.agents) {
+      try {
+        entry.unsubscribe();
+      } catch {
+        // 退订异常不恢复旧活动可见性。
+      }
+      let acceptsActivityDelivery = false;
+      try {
+        entry.unsubscribe = entry.supervisor.onEvent((event) => {
+          if (
+            !acceptsActivityDelivery
+            && (
+              event.kind === "activity"
+              || event.kind === "activity_stream"
+              || event.kind === "activity_display"
+            )
+          ) return;
+          this.handleSupervisorEvent(agentId, event, deliveryGeneration);
+        });
+      } catch {
+        entry.unsubscribe = () => {};
+      }
+      resetDeliveries.push(() => {
+        // 生产通道在 requestSnapshot() 中先同步进入 resyncing，再开始传输；
+        // 因而此后同步抵达的活动帧已属于 reset snapshot 之后的新观察代际。
+        acceptsActivityDelivery = true;
+        entry.supervisor.resetActivityDelivery?.();
+      });
+    }
+
+    for (const resetDelivery of resetDeliveries) {
+      try {
+        resetDelivery();
+      } catch {
+        // 旧 fake 或已经关闭的监督器不能阻断本地清空。
+      }
+    }
+
+    return historyCleared || draftsCleared;
+  }
+
+  /** reload 只清除实时草稿；新语义需要丢弃完整历史时使用 resetActivityForReload。 */
+  clearDisplayDrafts(): boolean {
+    return this.displayDrafts.clear();
+  }
+
+  /** 语义别名：产生端切换 display epoch，不影响活动缓存。 */
+  resetDisplayDrafts(displayEpoch?: string): boolean {
+    const cleared = this.clearDisplayDrafts();
+    if (displayEpoch === undefined) return cleared;
+    if (!isCanonicalUuid(displayEpoch)) return cleared;
+    if (this.actor.kind !== "agent") return cleared;
+    const candidate = Object.freeze({
+      type: "display_reset" as const,
+      agentId: this.actor.agent_id,
+      incarnationId: this.activityIncarnationId,
+      displayEpoch,
+    });
+    const parsed = parseAgentActivityDisplayEvent(candidate);
+    if (parsed.kind !== "event" || parsed.event.type !== "display_reset") return cleared;
+    try {
+      // 这是无状态控制事实：只提交一次，不等待 ACK、不建立重试或历史副本。
+      this.publishUpstreamDisplayActivity?.(
+        Object.freeze({ agent_id: this.actor.agent_id, event: parsed.event }),
+      );
+    } catch {
+      // reset barrier 与普通显示事实一样是尽力而为；权威消息仍可替换草稿。
+    }
+    return true;
   }
 
   /**
@@ -972,7 +1213,11 @@ export class AgentController {
 
   private async terminateAfterParentBarrier(agentId: string): Promise<void> {
     const status = this.directChild(agentId);
-    if (!status.ok || status.data.state === "terminated") return;
+    if (!status.ok) return;
+    if (status.data.state === "terminated") {
+      this.settleActivityForAgents([agentId], "terminated");
+      return;
+    }
     const key = `parent:${agentId}`;
     const existing = this.terminationFlows.get(key);
     const flow = existing ?? this.runDirectTermination(agentId, false);
@@ -1004,6 +1249,7 @@ export class AgentController {
     this.unassignedSupervisors.clear();
     this.terminationFlows.clear();
     this.orphanCleanupFlows.clear();
+    this.ownToolExecutionStates.clear();
   }
 
   /** grant 已签发但监督器尚未拥有任何资源时，仍按不可逆终止事实关闭身份。 */
@@ -1019,10 +1265,13 @@ export class AgentController {
     if (!barrier.ok) return;
     const generation = this.tree.getLifecycleGeneration(agentId);
     if (!generation.ok) return;
-    this.tree.applyLifecycleEvent(agentId, {
+    const outcome = this.tree.applyLifecycleEvent(agentId, {
       type: "resources_confirmed",
       expected_generation: generation.data,
     });
+    if (outcome.ok && outcome.data.applied && outcome.data.node.state === "terminated") {
+      this.settleActivityForAgents([agentId], "terminated");
+    }
   }
 
   private preflightTemplate(templateId: string): ControlResult<TemplateDefinition | undefined> {
@@ -1058,7 +1307,7 @@ export class AgentController {
     supervisor: AgentSupervisor,
     input: SpawnAgentInput,
     unsubscribe: () => void,
-    earlyEvents: readonly RpcSupervisorEvent[],
+    earlyEvents: readonly { readonly event: RpcSupervisorEvent; readonly deliveryGeneration: number }[],
   ): void {
     this.agents.set(agentId, {
       supervisor,
@@ -1066,7 +1315,9 @@ export class AgentController {
       name: input.name,
       unsubscribe,
     });
-    for (const event of earlyEvents) this.handleSupervisorEvent(agentId, event);
+    for (const pending of earlyEvents) {
+      this.handleSupervisorEvent(agentId, pending.event, pending.deliveryGeneration);
+    }
     this.resolveWaiters(agentId);
     this.releaseTerminatedSupervisor(agentId);
   }
@@ -1083,7 +1334,19 @@ export class AgentController {
     }
   }
 
-  private handleSupervisorEvent(agentId: string | undefined, event: RpcSupervisorEvent): void {
+  private handleSupervisorEvent(
+    agentId: string | undefined,
+    event: RpcSupervisorEvent,
+    deliveryGeneration: number = this.activityDeliveryGeneration,
+  ): void {
+    if (
+      deliveryGeneration !== this.activityDeliveryGeneration
+      && (
+        event.kind === "activity"
+        || event.kind === "activity_stream"
+        || event.kind === "activity_display"
+      )
+    ) return;
     // 生命周期事实的真实 agent_id 优先于“该监督器所属的直接子”；后代事实
     // 可以更新共享树，但不能被错误投影成直接子的会话通知或清理动作。
     const lifecycleAgentId = event.kind === "lifecycle"
@@ -1093,6 +1356,12 @@ export class AgentController {
       && this.directChild(lifecycleAgentId).ok
       ? lifecycleAgentId
       : undefined;
+    const lifecycleApplied = directLifecycleAgentId !== undefined
+      && event.kind === "lifecycle"
+      && this.wasLifecycleEventApplied(directLifecycleAgentId, event.event);
+    const activityLifecycleApplied = lifecycleAgentId !== undefined
+      && event.kind === "lifecycle"
+      && this.wasLifecycleEventApplied(lifecycleAgentId, event.event);
 
     if (event.kind === "reply" && this.onReply !== undefined && agentId !== undefined) {
       try {
@@ -1144,7 +1413,12 @@ export class AgentController {
     // 实时草稿只服务显示层：代理进入 idle、failed 或 terminated 时清除该代理
     // 仍未被权威消息替换的草稿。收束不改变生命周期或缓存行为；之后同一运行
     // 实例迟到的合法权威消息仍可写入历史。
-    if (event.kind === "lifecycle" && this.actor.kind === "root" && lifecycleAgentId !== undefined) {
+    if (
+      event.kind === "lifecycle"
+      && this.actor.kind === "root"
+      && lifecycleAgentId !== undefined
+      && activityLifecycleApplied
+    ) {
       const settledType = event.event.type;
       if (
         settledType === "agent_settled"
@@ -1154,11 +1428,28 @@ export class AgentController {
     }
     if (event.kind === "fault" && this.actor.kind === "root" && agentId !== undefined) {
       this.displayDrafts.settleAgent(agentId);
+      this.activityCache.settleAgent(agentId, "failed");
     }
     // activity 阶段属于安全树快照；工具正文、名称和参数仍只留在监督器本地。
-    const lifecycleApplied = directLifecycleAgentId !== undefined
-      && event.kind === "lifecycle"
-      && this.wasLifecycleEventApplied(directLifecycleAgentId, event.event);
+    const activitySettlementState: AgentActivitySettlementState | undefined = event.kind !== "lifecycle"
+      ? undefined
+      : event.event.type === "agent_settled"
+        ? "idle"
+        : event.event.type === "runtime_failed"
+          ? "failed"
+          : event.event.type === "resources_confirmed"
+            ? "terminated"
+            : undefined;
+    // 只有真实代际事件才收束缓存中的 running 工具；这不会建立活动拒绝
+    // 屏障，后续同一运行实例的迟到活动和 end 仍可写入或回填。
+    if (
+      this.actor.kind === "root"
+      && lifecycleAgentId !== undefined
+      && activitySettlementState !== undefined
+      && activityLifecycleApplied
+    ) {
+      this.activityCache.settleAgent(lifecycleAgentId, activitySettlementState);
+    }
     let runtimeFailedAgentId: string | undefined;
     if (
       directLifecycleAgentId !== undefined
@@ -1245,18 +1536,21 @@ export class AgentController {
       try {
         this.publishUpstreamActivity?.(Object.freeze({ agent_id: agentId, entry }));
       } catch {
-        // 上行转发失败不回滚任何状态，也不改变节点生命周期；缺口静默。
+        // 上行转发不回滚任何状态，也不改变节点生命周期；缺口静默。
       }
       return false;
     }
-    const revision = this.activityCache.revision(agentId);
-    this.activityCache.append(agentId, entry);
-    const changed = this.activityCache.revision(agentId) !== revision;
-    if (changed && entry.body.type === "message" && typeof entry.body.streamId === "string") {
-      // 权威完整消息携带与实时流精确关联的身份：原地替换并清除对应草稿。
+    const result: AgentActivityRecordResult = this.activityCache.record(agentId, entry);
+    // 权威完整消息的 draft 清理与历史是否发生可见变更是两个独立事实：
+    // 合法重复消息也必须收束匹配草稿，但只有 result.changed 才触发历史通知。
+    if (
+      result.accepted
+      && entry.body.type === "message"
+      && typeof entry.body.streamId === "string"
+    ) {
       this.displayDrafts.replaceDraft(agentId, entry.incarnation_id, entry.body.streamId);
     }
-    return changed;
+    return result.changed;
   }
 
   /**
@@ -1336,12 +1630,28 @@ export class AgentController {
         return;
       }
     }
-    this.tree.confirmTerminationBarrierResources(agentId, true);
+    // reapOrphanedDescendants 已确认平台资源释放；即使故障目标本身保留
+    // failed（preserveFailedTarget），其屏障成员的 running 工具也必须退出
+    // pin，且非权威草稿不能继续存活。不要依赖随后是否产生 lifecycle 帧。
+    this.settleActivityForAgents(barrier.agent_ids, "terminated");
+    const confirmation = this.tree.confirmTerminationBarrierResources(agentId, true);
+    const status = this.tree.getStatus(agentId);
+    if (
+      (confirmation.ok && confirmation.data.node.state === "terminated")
+      || (status.ok && status.data.state === "terminated")
+    ) {
+      // Orphan reaping may confirm the entire barrier without emitting the normal
+      // resources_confirmed lifecycle event, or the authority may have already
+      // applied the same idempotent transition locally. Settlement above is
+      // intentionally independent of this local projection result.
+      this.settleActivityForAgents(barrier.agent_ids, "terminated");
+    }
   }
 
   private releaseTerminatedSupervisor(agentId: string): void {
     const status = this.tree.getStatus(agentId);
     if (!status.ok || status.data.state !== "terminated") return;
+    this.settleActivityForAgents([agentId], "terminated");
     const entry = this.agents.get(agentId);
     if (entry === undefined) return;
     entry.unsubscribe();

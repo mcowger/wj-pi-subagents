@@ -323,6 +323,54 @@ test("reset 快照落地后活动帧恢复正常交付", () => {
   });
 });
 
+test("主动 reload 快照边界丢弃未曾见过的旧 activity 与 display 流", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const oldActivity = child.publishActivity({ entry: canonicalEntry(childAgentId, "边界前活动") })[0];
+  const oldDisplay = child.publishDisplayActivity({
+    event: {
+      type: "message_delta",
+      streamId: "only-delayed-old-stream",
+      sequence: 1,
+      contentIndex: 0,
+      contentType: "text",
+      delta: "边界前草稿",
+      agentId: childAgentId,
+      incarnationId: randomUUID(),
+      displayEpoch: randomUUID(),
+    },
+  })[0];
+  assert.ok(oldActivity && oldDisplay);
+
+  // 先切入 resyncing，再投递此前从未观察过的流。它们必须静默前进序号，
+  // 不被交付，也不依赖本地 tombstone 是否已记录该 streamId。
+  const request = parent.requestSnapshot();
+  assert.equal(parent.getPublicState().state, "resyncing");
+  const droppedActivity = parent.receive(oldActivity);
+  const droppedDisplay = parent.receive(oldDisplay);
+  assert.equal(droppedActivity.kind, "accepted");
+  assert.equal(droppedDisplay.kind, "accepted");
+  if (droppedActivity.kind === "accepted") assert.equal(droppedActivity.activity, undefined);
+  if (droppedDisplay.kind === "accepted") assert.equal(droppedDisplay.display, undefined);
+
+  const childResponse = child.receive(request);
+  assert.equal(childResponse.kind, "accepted");
+  const resetSnapshot = (childResponse as Extract<SupervisorReceiveResult, { kind: "accepted" }>).outbound[0];
+  assert.ok(resetSnapshot);
+  assert.equal(parent.receive(resetSnapshot).kind, "accepted");
+  assert.equal(parent.getPublicState().state, "ready");
+
+  const fresh = child.publishActivity({ entry: canonicalEntry(childAgentId, "边界后活动") })[0];
+  assert.ok(fresh);
+  const accepted = parent.receive(fresh);
+  assert.equal(accepted.kind, "accepted");
+  if (accepted.kind === "accepted") {
+    assert.deepEqual(accepted.activity?.entry.body, {
+      type: "message",
+      content: [{ type: "text", text: "边界后活动" }],
+    });
+  }
+});
+
 test("终止屏障下活动帧被无条件丢弃：不交付、不升级故障", () => {
   const { parent, child, childAgentId } = readyPair();
   parent.establishTerminationBarrier();

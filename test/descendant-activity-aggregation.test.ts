@@ -194,17 +194,121 @@ test("子模式扩展把本进程完整活动规范化上行且不在本层缓�
       toolCallId: "call_1",
       toolName: "read",
       origin: "unknown",
+      executionGeneration: 1,
     });
     assert.deepEqual(delivered[2]?.entry.body, {
       type: "tool_execution_end",
       toolCallId: "call_1",
       toolName: "read",
       origin: "unknown",
+      executionGeneration: 1,
       isError: false,
     });
     // 中间运行时不保存历史：本层回放为空。
     assert.deepEqual(controller?.getActivityReplay(CHILD_ID), []);
     assert.equal(controller?.getActivityRevision(CHILD_ID), 0);
+  } finally {
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+    await parentChannel?.release().catch(() => {});
+    await listener.close().catch(() => {});
+  }
+});
+
+test("子模式扩展 reload 后重置本地工具代次并轮换活动身份", async () => {
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const listener = await transportAdapter.listen({
+    agentId: CHILD_ID,
+    credential: LOCAL_CREDENTIAL,
+  });
+  const api = new FakeExtensionApi();
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  let parentChannel: StreamSupervisorChannel | undefined;
+  const delivered: SupervisorActivityDelivery[] = [];
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment: childEnvironment(listener.endpoint),
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+  });
+  const parentReady = (async () => {
+    const transport = await listener.waitForConnection(AbortSignal.timeout(2_000));
+    const channel = new StreamSupervisorChannel({
+      role: "parent",
+      rootId: ROOT_ID,
+      localAgentId: null,
+      peerAgentId: CHILD_ID,
+      parentAgentId: null,
+      depth: 1,
+      credential: SUPERVISOR_CREDENTIAL,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+      transport,
+      onReply: () => true,
+    });
+    parentChannel = channel;
+    channel.onActivity((activity) => delivered.push(activity));
+    const signal = AbortSignal.timeout(2_000);
+    await channel.bind(signal);
+    await channel.waitForReady(signal);
+  })();
+
+  try {
+    await activator(api as unknown as ExtensionApiSurface, {
+      ok: true,
+      nodeVersion: process.versions.node,
+      piVersion: "0.85.1",
+      platform: process.platform,
+      processTreeAdapter: {} as never,
+    } as AvailableHostCapabilities);
+    await Promise.all([
+      api.emit("session_start", { type: "session_start", reason: "startup" }, context),
+      parentReady,
+    ]);
+
+    await api.emit("tool_execution_start", {
+      type: "tool_execution_start",
+      toolCallId: "reused-call",
+      toolName: "read",
+      args: { path: "before-reload.ts" },
+    }, context);
+    await waitForCount(delivered, 1);
+    const before = delivered[0]?.entry;
+    assert.ok(before);
+
+    await api.emit("session_start", { type: "session_start", reason: "reload" }, context);
+    await api.emit("tool_execution_start", {
+      type: "tool_execution_start",
+      toolCallId: "reused-call",
+      toolName: "read",
+      args: { path: "after-reload.ts" },
+    }, context);
+    await waitForCount(delivered, 2);
+    const after = delivered[1]?.entry;
+    assert.ok(after);
+
+    assert.notEqual(after.incarnation_id, before.incarnation_id);
+    assert.deepEqual(before.body, {
+      type: "tool_execution_start",
+      toolCallId: "reused-call",
+      toolName: "read",
+      origin: "unknown",
+      executionGeneration: 1,
+    });
+    assert.deepEqual(after.body, {
+      type: "tool_execution_start",
+      toolCallId: "reused-call",
+      toolName: "read",
+      origin: "unknown",
+      executionGeneration: 1,
+    });
   } finally {
     await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
     await parentChannel?.release().catch(() => {});

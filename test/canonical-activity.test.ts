@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import {
+  parseAgentActivityEvent,
+  parseCanonicalAgentActivityEvent,
+} from "../src/rpc-bridge-event.ts";
+import {
   CANONICAL_ACTIVITY_CONTRACT_VERSION,
   CANONICAL_ACTIVITY_CHUNK_TOTAL_LIMIT,
   chunkCanonicalAgentActivityEntry,
@@ -42,11 +46,100 @@ function validEntry(overrides: Partial<CanonicalAgentActivityEntry> = {}): Canon
 }
 
 test("规范条目契约版本是固定字符串，解析器只接受当前版本", () => {
-  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/7");
+  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/8");
   assert.equal(parseCanonicalAgentActivityEntry(validEntry()).kind, "entry");
 
-  const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/6" });
+  const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/7" });
   assert.equal(parseCanonicalAgentActivityEntry(legacy).kind, "invalid");
+});
+
+test("/8 canonical wire 与本地兼容规范化的工具代次边界分离", () => {
+  const localLegacy = {
+    type: "tool_execution_start",
+    toolCallId: "call_legacy",
+    toolName: "read",
+    origin: "pi_native",
+  };
+  // 本地 Pi 原始输入允许旧形状，canonical wire 则必须明示代次。
+  assert.equal(parseAgentActivityEvent(localLegacy).kind, "event");
+  assert.equal(parseCanonicalAgentActivityEvent(localLegacy).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEntry(validEntry({ body: localLegacy as never })).kind, "invalid");
+
+  assert.equal(parseCanonicalAgentActivityEvent({
+    ...localLegacy,
+    executionGeneration: 1,
+  }).kind, "event");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    ...localLegacy,
+    executionGeneration: 0,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    ...localLegacy,
+    executionGeneration: 1.5,
+  }).kind, "invalid");
+});
+
+test("/8 canonical wire 严格拒绝 message 与 parent_message 的附加字段", () => {
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "message",
+    content: [{ type: "text", text: "完整正文", unexpected: true }],
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "message",
+    content: [{ type: "text", text: "完整正文" }],
+    extra: true,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "message",
+    content: [{ type: "text", text: "完整正文" }],
+    streamId: undefined,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "parent_message",
+    content: [{ type: "text", text: "父消息" }],
+    streamId: "forbidden",
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "pi_native",
+    executionGeneration: 1,
+    summary: undefined,
+  }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "tool_execution_start",
+    toolCallId: "call_1",
+    toolName: "read",
+    origin: "pi_native",
+    executionGeneration: 1,
+    isError: false,
+  }).kind, "invalid");
+});
+
+test("/8 canonical wire 遵循 JSON 图语义并拒绝非 JSON 附加状态", () => {
+  const sharedBlock = { type: "text", text: "可共享的正文块" };
+  // JSON.stringify 会将同一引用在两个位置分别展开；它不是循环。
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "message",
+    content: [sharedBlock, sharedBlock],
+  }).kind, "event");
+
+  const arrayWithNamedProperty = [{ type: "text", text: "正文" }] as Array<Record<string, unknown>> & {
+    unexpected?: undefined;
+  };
+  arrayWithNamedProperty.unexpected = undefined;
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "message",
+    content: arrayWithNamedProperty,
+  }).kind, "invalid");
+
+  const cyclicBlock: Record<string, unknown> = { type: "text", text: "正文" };
+  cyclicBlock.self = cyclicBlock;
+  assert.equal(parseCanonicalAgentActivityEvent({
+    type: "message",
+    content: [cyclicBlock],
+  }).kind, "invalid");
 });
 
 test("assistant 消息正文可携带与实时流精确关联的 streamId，身份违约被拒绝", () => {

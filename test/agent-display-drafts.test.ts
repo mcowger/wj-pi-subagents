@@ -69,19 +69,53 @@ function textValues(views: readonly AgentDisplayDraftView[]): readonly string[] 
 
 test("序号 9 先于 8 到达时暂存，8 到达后按 8、9 连续显示", () => {
   const registry = new AgentDisplayDraftRegistry();
+  let notificationCount = 0;
+  registry.onChange(() => notificationCount += 1);
   // 先建立连续前缀 1..7；9 属于未来帧。
   for (let sequence = 1; sequence <= 7; sequence += 1) {
     assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", sequence, 0, "text", "字")), true);
   }
-  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 9, 0, "text", "九")), true);
-  // 缺口未补齐前只显示连续前缀；9 暂存但不显示。
+  assert.equal(notificationCount, 7);
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 9, 0, "text", "九")), false);
+  // 缺口未补齐前只显示连续前缀；9 已接纳但不改变快照，也不通知 UI。
   assert.deepEqual(
     textValues(registry.drafts(AGENT_ID)),
     ["字字字字字字字"],
   );
+  assert.equal(notificationCount, 7);
 
   assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 8, 0, "text", "八")), true);
   assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["字字字字字字字八九"]);
+  assert.equal(notificationCount, 8);
+});
+
+test("重复 future 幂等保留首帧，等价 delta 推进序号但不通知", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  const snapshots: (readonly AgentDisplayDraftView[])[] = [];
+  registry.onChange((agentId) => snapshots.push(registry.drafts(agentId)));
+
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "一")), true);
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 3, 0, "text", "原始三")), false);
+  // 相同 sequence 即使载荷不同也不覆盖先到帧。
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 3, 0, "text", "覆盖三")), false);
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["一"]);
+
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 2, 0, "text", "二")), true);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["一二原始三"]);
+  assert.equal(snapshots.length, 2);
+
+  // 空 delta 已接纳并推进 sequence，但投影等价，所以不通知。
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 4, 0, "text", "")), false);
+  assert.equal(snapshots.length, 2);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["一二原始三"]);
+
+  // future complete 本身不通知；等价 delta 补齐缺口时仍须通知 complete 状态变化。
+  assert.equal(registry.applyEvent(AGENT_ID, complete("message-1", 6)), false);
+  assert.equal(snapshots.length, 2);
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 5, 0, "text", "")), true);
+  assert.equal(snapshots.length, 3);
+  assert.equal(snapshots.at(-1)?.[0]?.state, "complete");
 });
 
 test("多个连续未来帧一次补齐并保持块序，无超时且先到高序号不清空前缀", () => {
@@ -108,20 +142,29 @@ test("多个连续未来帧一次补齐并保持块序，无超时且先到高�
   assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["想一想二", "正文", "尾"]);
 });
 
-test("255/256/257 未来帧边界：256 暂存正常，第 257 个触发冻结", () => {
+test("255/256/257 不同 future 边界：重复不冻结，第 257 个不同帧才冻结", () => {
   const registry = new AgentDisplayDraftRegistry();
+  let notificationCount = 0;
+  registry.onChange(() => notificationCount += 1);
   registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "前缀"));
-  // 帧 3..258 共 256 个未来帧：恰好到达缓冲上限，不冻结。
+  // 帧 3..258 共 256 个不同 future：已接纳但投影不变，也不通知。
   for (let sequence = 3; sequence <= MAX_DISPLAY_DRAFT_FUTURE_FRAMES + 2; sequence += 1) {
-    assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", sequence, 0, "text", "x")), true);
+    assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", sequence, 0, "text", "x")), false);
   }
   assert.equal(registry.drafts(AGENT_ID)[0]?.state, "streaming");
+  assert.equal(notificationCount, 1);
 
-  // 第 257 个未来帧：保留已验证前缀、丢弃 future buffer 并冻结。
+  // 满容量时重复已有 future 不覆盖、不冻结，也不通知。
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 258, 0, "text", "替换")), false);
+  assert.equal(registry.drafts(AGENT_ID)[0]?.state, "streaming");
+  assert.equal(notificationCount, 1);
+
+  // 第 257 个不同 future：保留已验证前缀、丢弃 buffer、冻结并通知状态变化。
   assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 259, 0, "text", "y")), true);
   const frozen = registry.drafts(AGENT_ID)[0];
   assert.equal(frozen?.state, "frozen");
   assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["前缀"]);
+  assert.equal(notificationCount, 2);
 });
 
 test("冻结后不继续应用 token，等待权威完整消息替换", () => {
@@ -198,6 +241,43 @@ test("相邻 streaming thinking 实时合并，complete 后同一标题变为 Th
   );
 });
 
+test("分块累积保持公开 delta 输出等价且连续 thinking 只插入既有分隔", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  let sequence = 1;
+  const textChunks = Array.from(
+    { length: 2_048 },
+    (_, index) => `chunk-${index.toString().padStart(4, "0")}|`,
+  );
+  for (const chunk of textChunks) {
+    registry.applyEvent(AGENT_ID, delta("message-1", sequence, 0, "text", chunk));
+    sequence += 1;
+  }
+
+  const thinkingBlocks = Array.from(
+    { length: 64 },
+    (_, index) => [`thought-${index}-`, "done"] as const,
+  );
+  for (const [index, chunks] of thinkingBlocks.entries()) {
+    for (const chunk of chunks) {
+      registry.applyEvent(AGENT_ID, delta("message-1", sequence, index + 1, "thinking", chunk));
+      sequence += 1;
+    }
+  }
+
+  assert.deepEqual(registry.drafts(AGENT_ID)[0]?.blocks, [
+    {
+      contentIndex: 0,
+      contentType: "text",
+      value: textChunks.join(""),
+    },
+    {
+      contentIndex: 1,
+      contentType: "thinking",
+      value: thinkingBlocks.map((chunks) => chunks.join("")).join("\n\n"),
+    },
+  ]);
+});
+
 test("权威消息先到时登记墓碑：后续该流迟到的 delta 与 complete 被忽略", () => {
   const registry = new AgentDisplayDraftRegistry();
   assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, "message-1"), false);
@@ -226,9 +306,34 @@ test("生命周期收束清除未替换草稿并阻断旧流复活；重启实�
   assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "串流")), false);
 });
 
+test("reload clear 清除草稿但保留旧流墓碑，迟到帧不能复活且新 epoch 可见", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "旧草稿"));
+  assert.equal(registry.clear(), true);
+  assert.deepEqual(registry.drafts(AGENT_ID), []);
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-1", 2, 0, "text", "迟到旧帧")), false);
+  assert.equal(registry.applyEvent(AGENT_ID, complete("message-1", 2)), false);
+
+  // 新 activator 使用新的 stream epoch；即使仍在同一 incarnation 中也可见。
+  assert.equal(registry.applyEvent(AGENT_ID, delta("message-reload-1", 1, 0, "text", "新草稿")), true);
+  assert.deepEqual(textValues(registry.drafts(AGENT_ID)), ["新草稿"]);
+});
+
+
+test("reload 墓碑不设 256 淘汰：长会话最早旧流的迟到帧仍被拒绝", () => {
+  const registry = new AgentDisplayDraftRegistry();
+  for (let index = 0; index < 300; index += 1) {
+    const streamId = `epoch-${index}`;
+    registry.applyEvent(AGENT_ID, delta(streamId, 1, 0, "text", `draft-${index}`));
+    assert.equal(registry.replaceDraft(AGENT_ID, INCARNATION_ID, streamId), true);
+  }
+  // 如果墓碑仍按 256 FIFO 淘汰，epoch-0 会重新创建草稿；永久身份墓碑必须
+  // 让该迟到帧保持静默缺失。
+  assert.equal(registry.applyEvent(AGENT_ID, delta("epoch-0", 2, 0, "text", "迟到旧流")), false);
+  assert.deepEqual(registry.drafts(AGENT_ID), []);
+});
 test("查看器关闭期间持续组装：重新打开立即显示当前连续前缀", () => {
   const registry = new AgentDisplayDraftRegistry();
-  // 查看器未打开：display 事件仍进入顶层登记表。
   registry.applyEvent(AGENT_ID, delta("message-1", 1, 0, "text", "第一段 "));
   registry.applyEvent(AGENT_ID, delta("message-1", 2, 1, "thinking", "草稿思考"));
 
@@ -371,7 +476,7 @@ test("监督通道 display 帧端到端交付，事件身份与外层身份绑�
 });
 
 test("display 帧属于固定协议版本与帧 kind 闭集", () => {
-  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/25");
+  assert.equal(SUPERVISOR_PROTOCOL_VERSION, "wj-pi-subagents/26");
   assert.equal((SUPERVISOR_FRAME_KINDS as readonly string[]).includes("display"), true);
   // 闭集校验：身份不完整的显示事件在通道边界前即被拒绝。
   assert.equal(
@@ -446,6 +551,20 @@ test("中断的消息由下一条 message_start 收束，streamId 仍逐消息�
   assert.equal(outputs[0]?.type === "message_delta" ? outputs[0].streamId : undefined, "message-3");
   assert.deepEqual(outputs.map((update) => [update.type, update.sequence]), [["message_delta", 1]]);
 });
+
+test("产生端跟踪器 reset 切换 stream epoch，避免复用 message-1 身份", () => {
+  const tracker = new OwnDisplayStreamTracker("message-old");
+  const start = { type: "message_start", message: { role: "assistant", content: [] } };
+  const first = tracker.observe(start);
+  assert.equal(first.length, 0);
+  assert.equal(tracker.latestStreamId, "message-old-1");
+  tracker.reset("message-new");
+  const second = tracker.observe(start);
+  assert.equal(second.length, 0);
+  assert.equal(tracker.latestStreamId, "message-new-1");
+  assert.notEqual("message-old-1", tracker.latestStreamId);
+});
+
 
 test("查看器投影直接消费草稿视图：流式与冻结标题随状态切换", () => {
   const viewer = new AgentActivityViewerModel({

@@ -60,6 +60,8 @@ function displayDelta(
 class FakeSupervisor implements AgentSupervisor {
   private readonly listeners = new Set<(event: RpcSupervisorEvent) => void>();
   readonly agentId: string;
+  activityDeliveryResetCount = 0;
+  synchronousActivityDeliveryOnReset: SupervisorActivityDelivery | undefined;
   tree: TreeController | undefined;
   actor: TreeActor = ROOT_TREE_ACTOR;
   reservation: ReserveStartingChildInput | undefined;
@@ -95,6 +97,20 @@ class FakeSupervisor implements AgentSupervisor {
       state: "terminated",
       cleanup: "confirmed",
     });
+  }
+
+  resetActivityDelivery(): void {
+    this.activityDeliveryResetCount += 1;
+    const delivery = this.synchronousActivityDeliveryOnReset;
+    if (delivery !== undefined) this.emitActivityDelivery(delivery);
+  }
+
+  /** 模拟异步源已经捕获旧订阅、却在 reset 后才投递的回调。 */
+  captureRaw(event: RpcSupervisorEvent): () => void {
+    const captured = [...this.listeners];
+    return () => {
+      for (const listener of captured) listener(event);
+    };
   }
 
   onEvent(listener: (event: RpcSupervisorEvent) => void): () => void {
@@ -265,6 +281,97 @@ test("顶层控制器把活动条目写入缓存，按到达序可回放且修�
   assert.equal(controller.getActivityRevision(AGENT_ID), 2);
   assert.deepEqual(notified, [AGENT_ID, AGENT_ID]);
   unsubscribe();
+});
+
+test("reload 清空活动状态并拒绝已捕获的旧 activity/display 回调", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  // 先形成已淘汰窗口与可见草稿，证明 reset 不只是清除最后一条。
+  for (let index = 0; index <= 100; index += 1) {
+    fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, `旧历史 ${index}`) });
+  }
+  fake.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: displayDelta("old-stream", 1, 0, "text", "旧草稿"),
+  });
+  assert.equal(controller.getActivitySnapshot(AGENT_ID).olderActivityOmitted, true);
+  assert.equal(controller.getDisplayDrafts(AGENT_ID).length, 1);
+
+  const lateActivity = fake.captureRaw(Object.freeze({
+    kind: "activity_stream" as const,
+    agent_id: AGENT_ID,
+    entry: messageEntry(AGENT_ID, "迟到旧历史"),
+  }));
+  const lateDisplay = fake.captureRaw(Object.freeze({
+    kind: "activity_display" as const,
+    agent_id: AGENT_ID,
+    event: displayDelta("late-old-stream", 1, 0, "text", "迟到旧草稿"),
+  }));
+
+  assert.equal(controller.resetActivityForReload(), true);
+  assert.equal(fake.activityDeliveryResetCount, 1);
+  assert.deepEqual(controller.getActivitySnapshot(AGENT_ID), {
+    entries: [],
+    revision: 0,
+    olderActivityOmitted: false,
+  });
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+
+  // 这两个闭包持有 reset 前的 onEvent listener，不得把旧内容重新写入。
+  lateActivity();
+  lateDisplay();
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+
+  // 新订阅仍接收新观察代际；display reset 建立新 epoch 后才接受新草稿。
+  const nextEpoch = randomUUID();
+  const nextIncarnation = randomUUID();
+  fake.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: Object.freeze({
+      type: "display_reset" as const,
+      agentId: AGENT_ID,
+      incarnationId: nextIncarnation,
+      displayEpoch: nextEpoch,
+    }),
+  });
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, "新历史") });
+  fake.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: Object.freeze({
+      type: "message_delta" as const,
+      streamId: "new-stream",
+      sequence: 1,
+      contentIndex: 0,
+      contentType: "text" as const,
+      delta: "新草稿",
+      displayEpoch: nextEpoch,
+      agentId: AGENT_ID,
+      incarnationId: nextIncarnation,
+    }),
+  });
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID).map((entry) => entry.body), [{
+    type: "message",
+    content: [{ type: "text", text: "新历史" }],
+  }]);
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID)[0]?.blocks.map((block) => block.value), ["新草稿"]);
+});
+
+test("reload 重订阅后保留同步 reset snapshot 的新活动", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: messageEntry(AGENT_ID, "reload 前历史") });
+  const afterReset = messageEntry(AGENT_ID, "同步 reset snapshot 后活动");
+  fake.synchronousActivityDeliveryOnReset = Object.freeze({ agent_id: AGENT_ID, entry: afterReset });
+
+  assert.equal(controller.resetActivityForReload(), true);
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), [afterReset]);
 });
 
 test("顶层把实时显示事实组装为按代理隔离的草稿，不写入缓存或上行活动流", async () => {
@@ -501,6 +608,61 @@ test("子代理终止后顶层活动缓存仍可回放", async () => {
   assert.equal(controller.getActivityRevision(AGENT_ID), 1);
 });
 
+test("direct termination 无 lifecycle 事件时也收束活动工具与实时草稿", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+  const incarnationId = "12121212-1212-4121-8121-121212121212";
+  const running = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: incarnationId,
+    entry_id: "34343434-3434-4343-8343-343434343434",
+    body: Object.freeze({
+      type: "tool_execution_start" as const,
+      toolCallId: "termination-running",
+      toolName: "read",
+      origin: "pi_native" as const,
+      executionGeneration: 1,
+    }),
+  });
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: running });
+  fake.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: displayDelta("termination-stream", 1, 0, "text", "未完成草稿"),
+  });
+  for (let index = 0; index < 100; index += 1) {
+    fake.emitActivityDelivery({
+      agent_id: AGENT_ID,
+      entry: Object.freeze({
+        contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+        agent_id: AGENT_ID,
+        incarnation_id: incarnationId,
+        entry_id: randomUUID(),
+        body: Object.freeze({
+          type: "tool_execution_start" as const,
+          toolCallId: `termination-fill-${index}`,
+          toolName: "read",
+          origin: "pi_native" as const,
+          executionGeneration: 1,
+        }),
+      }),
+    });
+  }
+  assert.equal(controller.getActivitySnapshot(AGENT_ID).entries.length, 101);
+  assert.equal(controller.getDisplayDrafts(AGENT_ID).length, 1);
+
+  // FakeSupervisor 不发 resources_confirmed；terminateAgent 自身必须完成同一
+  // 活动收束，否则 running 工具会永久 pin 在窗口外。
+  const terminated = await controller.terminateAgent(AGENT_ID);
+  assert.equal(terminated.ok, true, JSON.stringify(terminated));
+  const snapshot = controller.getActivitySnapshot(AGENT_ID);
+  assert.equal(snapshot.entries.length, 100);
+  assert.equal(snapshot.entries.some((entry) => entry.entry_id === running.entry_id), false);
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+});
+
+
 test("中间层 recordOwnActivity 生成规范身份并保持正文不变", async () => {
   const rootSupervisor = new FakeSupervisor(AGENT_ID);
   const { controller: root } = makeController(rootSupervisor);
@@ -558,16 +720,201 @@ test("工具开始与结束事实确定性共享同一条目身份", async () =>
   assert.equal(child.recordOwnActivity(endBody), true);
 
   const replay = root.getActivityReplay(AGENT_ID);
-  assert.equal(replay.length, 2);
-  // 同一条目的状态事实：条目身份与运行实例身份在开始与结束间保持一致。
-  assert.equal(replay[0]?.entry_id, replay[1]?.entry_id);
-  assert.equal(replay[0]?.incarnation_id, replay[1]?.incarnation_id);
+  assert.equal(replay.length, 1);
+  // start/end 在顶层缓存中是一个原子；end 原地替换 running 事实。
+  assert.equal(replay[0]?.body.type, "tool_execution_end");
+  assert.match(replay[0]?.entry_id ?? "", /^[0-9a-f-]{36}$/u);
+  assert.match(replay[0]?.incarnation_id ?? "", /^[0-9a-f-]{36}$/u);
+  assert.equal(root.getActivityRevision(AGENT_ID), 2);
 
-  // 重复提交同一事实仍派生同一条目身份，下游可按条目身份幂等聚合。
+  // 重复提交同一 end 保持幂等：不新增 atom、不递增 revision、不通知。
+  const notified: string[] = [];
+  const unsubscribe = root.onActivityChange((agentId) => notified.push(agentId));
   assert.equal(child.recordOwnActivity(endBody), true);
   const replayAfterRepeat = root.getActivityReplay(AGENT_ID);
-  assert.equal(replayAfterRepeat[2]?.entry_id, replay[0]?.entry_id);
+  assert.deepEqual(replayAfterRepeat, replay);
+  assert.equal(root.getActivityRevision(AGENT_ID), 2);
+  assert.deepEqual(notified, []);
+  unsubscribe();
 });
+
+test("controller 为复用 toolCallId 的不同执行代次派生不同条目身份", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: new FakeSupervisor(GRANDCHILD_ID),
+    publishUpstreamActivity: (delivery) => rootSupervisor.emitActivityDelivery(delivery),
+  });
+  const makeTool = (
+    type: "tool_execution_start" | "tool_execution_end",
+    generation: number,
+  ): SafeAgentActivityEvent => type === "tool_execution_start"
+    ? Object.freeze({
+      type,
+      toolCallId: "controller-reused-call",
+      toolName: "read",
+      origin: "pi_native",
+      executionGeneration: generation,
+    })
+    : Object.freeze({
+      type,
+      toolCallId: "controller-reused-call",
+      toolName: "read",
+      origin: "pi_native",
+      executionGeneration: generation,
+      isError: false,
+    });
+  child.recordOwnActivity(makeTool("tool_execution_start", 1));
+  child.recordOwnActivity(makeTool("tool_execution_end", 1));
+  child.recordOwnActivity(makeTool("tool_execution_start", 2));
+  child.recordOwnActivity(makeTool("tool_execution_end", 2));
+
+  const replay = root.getActivityReplay(AGENT_ID);
+  assert.equal(replay.length, 2);
+  assert.deepEqual(replay.map((entry) => entry.body.type === "tool_execution_end"
+    ? entry.body.executionGeneration
+    : undefined), [1, 2]);
+  assert.notEqual(replay[0]?.entry_id, replay[1]?.entry_id);
+});
+
+
+test("controller 代次账本跨过 256 个其它 ID 仍不复用首代且不受迟到旧 end 回退", () => {
+  const published: SupervisorActivityDelivery[] = [];
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: new FakeSupervisor(GRANDCHILD_ID),
+    publishUpstreamActivity: (delivery) => published.push(delivery),
+  });
+  const tool = (
+    toolCallId: string,
+    type: "tool_execution_start" | "tool_execution_end",
+    executionGeneration?: number,
+  ): SafeAgentActivityEvent => type === "tool_execution_start"
+    ? Object.freeze({
+      type,
+      toolCallId,
+      toolName: "custom_tool",
+      origin: "unknown",
+      ...(executionGeneration === undefined ? {} : { executionGeneration }),
+    })
+    : Object.freeze({
+      type,
+      toolCallId,
+      toolName: "custom_tool",
+      origin: "unknown",
+      ...(executionGeneration === undefined ? {} : { executionGeneration }),
+      isError: false,
+    });
+
+  child.recordOwnActivity(tool("long-lived", "tool_execution_start"));
+  child.recordOwnActivity(tool("long-lived", "tool_execution_end"));
+  for (let index = 0; index < 300; index += 1) {
+    child.recordOwnActivity(tool(`other-${index}`, "tool_execution_start"));
+  }
+  child.recordOwnActivity(tool("long-lived", "tool_execution_start"));
+  const secondStart = published.at(-1)?.entry.body;
+  assert.equal(secondStart?.type, "tool_execution_start");
+  if (secondStart?.type !== "tool_execution_start") return;
+  assert.equal(secondStart.executionGeneration, 2);
+
+  // 第 1 代迟到 end 仍按第 1 代派生，但不能把当前第 2 代账本改为 closed。
+  child.recordOwnActivity(tool("long-lived", "tool_execution_end", 1));
+  child.recordOwnActivity(tool("long-lived", "tool_execution_start"));
+  const repeatedSecondStart = published.at(-1)?.entry.body;
+  assert.equal(repeatedSecondStart?.type, "tool_execution_start");
+  if (repeatedSecondStart?.type !== "tool_execution_start") return;
+  assert.equal(repeatedSecondStart.executionGeneration, 2);
+});
+
+
+test("权威完整消息即使是重复事实也会清除匹配 draft，但不触发历史通知", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  const entry = messageEntryWithStream(AGENT_ID, "完整正文", "message-duplicate", INCARNATION_ID);
+  const historyNotifications: string[] = [];
+  const unsubscribe = controller.onActivityChange((agentId) => historyNotifications.push(agentId));
+  fake.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: displayDelta("message-duplicate", 1, 0, "text", "实时草稿"),
+  });
+  assert.equal(controller.getDisplayDrafts(AGENT_ID).length, 1);
+
+  // 模拟历史已由另一条入口接纳，但该入口尚未执行 draft 清理；随后通过
+  // controller 重新收到同一权威事实，专门覆盖 changed=false 的清理分支。
+  const internals = controller as unknown as {
+    activityCache: { append: (agentId: string, entry: CanonicalAgentActivityEntry) => void };
+  };
+  internals.activityCache.append(AGENT_ID, entry);
+  const revisionBeforeDuplicate = controller.getActivityRevision(AGENT_ID);
+  const beforeDuplicateNotifications = historyNotifications.length;
+
+  // 同一权威完整消息再次到达：cache changed=false，但 draft 必须收束。
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry });
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+  assert.equal(controller.getActivityRevision(AGENT_ID), revisionBeforeDuplicate);
+  assert.equal(historyNotifications.length, beforeDuplicateNotifications);
+  unsubscribe();
+});
+
+test("controller 暴露带 omission 的原子快照，并按 agent 隔离容量", async () => {
+  const fake = new FakeSupervisor();
+  const { controller } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  for (let index = 0; index < 101; index += 1) {
+    fake.emitActivityDelivery({
+      agent_id: AGENT_ID,
+      entry: messageEntry(AGENT_ID, `controller-${index}`),
+    });
+  }
+  const snapshot = controller.getActivitySnapshot(AGENT_ID);
+  assert.equal(snapshot.entries.length, 100);
+  assert.equal(snapshot.olderActivityOmitted, true);
+  assert.equal(controller.hasOlderActivityOmitted(AGENT_ID), true);
+  assert.equal(controller.getActivitySnapshot(GRANDCHILD_ID).entries.length, 0);
+});
+
+test("活动生命周期收束只结算 running 工具，不阻断之后的合法迟到活动", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  const start = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(start.ok, true, JSON.stringify(start));
+  if (!start.ok) return;
+  assert.equal(tree.applyLifecycleEvent(AGENT_ID, {
+    type: "agent_start",
+    expected_generation: start.data,
+  }).ok, true);
+  fake.emitLifecycle(AGENT_ID, { type: "agent_start", expected_generation: start.data });
+
+  const settledGeneration = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(settledGeneration.ok, true, JSON.stringify(settledGeneration));
+  if (!settledGeneration.ok) return;
+  assert.equal(tree.applyLifecycleEvent(AGENT_ID, {
+    type: "agent_settled",
+    expected_generation: settledGeneration.data,
+  }).ok, true);
+  fake.emitLifecycle(AGENT_ID, {
+    type: "agent_settled",
+    expected_generation: settledGeneration.data,
+  });
+
+  const late = messageEntry(AGENT_ID, "settled 后迟到正文");
+  fake.emitActivityDelivery({ agent_id: AGENT_ID, entry: late });
+  assert.equal(controller.getActivitySnapshot(AGENT_ID).entries.some((entry) => entry.entry_id === late.entry_id), true);
+});
+
 
 test("活动流转发异常被屏障吞掉：不沿 onEvent 传播，后续事件正常处理", async () => {
   const fake = new FakeSupervisor();

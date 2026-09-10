@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import {
   AgentController,
@@ -21,6 +22,10 @@ import type {
   RpcSupervisorStartupResult,
   RpcSupervisorTerminationResult,
 } from "../src/rpc-supervisor.ts";
+import {
+  CANONICAL_ACTIVITY_CONTRACT_VERSION,
+  type CanonicalAgentActivityEntry,
+} from "../src/canonical-activity.ts";
 import type {
   AgentTemplateListItem,
   TemplateDefinition,
@@ -148,6 +153,12 @@ class BoundarySupervisor implements AgentSupervisor {
       event,
     });
     for (const listener of this.listeners) listener(emitted);
+  }
+
+  emitNonLifecycleEvent(
+    event: Exclude<RpcSupervisorEvent, { readonly kind: "lifecycle" }>,
+  ): void {
+    for (const listener of this.listeners) listener(event);
   }
 }
 
@@ -362,4 +373,121 @@ test("故障后代回收在根 confirmResources 前先刷新上行生命周期�
   assert.equal(nestedStatus.ok && nestedStatus.data.state, "terminated");
   const directStatus = tree.getStatus(DIRECT_ID);
   assert.equal(directStatus.ok && directStatus.data.state, "failed");
+});
+
+test("孤儿回收不依赖 supervisor lifecycle 回调也会收束活动", { timeout: 5_000 }, async () => {
+  const tree = makeTree();
+  const order: string[] = [];
+  let supervisor!: BoundarySupervisor;
+  const controller = new AgentController({
+    tree,
+    allowUnvalidatedTemplates: true,
+    createSupervisor: (input) => {
+      supervisor = new BoundarySupervisor(tree, order);
+      supervisor.configure(input);
+      return supervisor;
+    },
+  });
+
+  const spawned = await controller.spawnAgent({ template_id: "managed", name: "故障父" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  const nested = tree.reserveStartingChild(actor(DIRECT_ID), {
+    templateId: "managed",
+    name: "孤儿后代",
+  });
+  assert.equal(nested.ok, true, JSON.stringify(nested));
+  const nestedReady = tree.applyLifecycleEvent(GRANDCHILD_ID, {
+    type: "startup_ready",
+    expected_generation: generation(tree, GRANDCHILD_ID),
+  });
+  assert.equal(nestedReady.ok && nestedReady.data.applied, true, JSON.stringify(nestedReady));
+  const nestedWorking = tree.applyLifecycleEvent(GRANDCHILD_ID, {
+    type: "agent_start",
+    expected_generation: generation(tree, GRANDCHILD_ID),
+  });
+  assert.equal(nestedWorking.ok && nestedWorking.data.applied, true, JSON.stringify(nestedWorking));
+
+  const incarnationId = "880e8400-e29b-41d4-a716-446655440002";
+  const runningEntries: CanonicalAgentActivityEntry[] = Array.from(
+    { length: 101 },
+    (_, index) => Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: GRANDCHILD_ID,
+      incarnation_id: incarnationId,
+      entry_id: randomUUID(),
+      body: Object.freeze({
+        type: "tool_execution_start" as const,
+        toolCallId: `orphan-running-${index}`,
+        toolName: "read",
+        origin: "pi_native" as const,
+        executionGeneration: 1,
+      }),
+    }),
+  );
+  for (const entry of runningEntries) {
+    supervisor.emitNonLifecycleEvent(Object.freeze({
+      kind: "activity_stream",
+      agent_id: GRANDCHILD_ID,
+      entry,
+    }));
+  }
+  supervisor.emitNonLifecycleEvent(Object.freeze({
+    kind: "activity_display",
+    agent_id: GRANDCHILD_ID,
+    event: Object.freeze({
+      type: "message_delta",
+      agentId: GRANDCHILD_ID,
+      incarnationId,
+      streamId: "orphan-live-draft",
+      sequence: 1,
+      contentIndex: 0,
+      contentType: "text",
+      delta: "尚未形成权威正文",
+    }),
+  }));
+
+  const beforeReaping = controller.getActivitySnapshot(GRANDCHILD_ID);
+  assert.equal(beforeReaping.entries.length, 101);
+  assert.equal(beforeReaping.olderActivityOmitted, false);
+  assert.deepEqual(beforeReaping.entries, runningEntries);
+  assert.deepEqual(
+    controller.getDisplayDrafts(GRANDCHILD_ID).flatMap((draft) =>
+      draft.blocks.map((block) => block.value)),
+    ["尚未形成权威正文"],
+  );
+
+  const failed = tree.applyLifecycleEvent(DIRECT_ID, {
+    type: "runtime_failed",
+    expected_generation: generation(tree, DIRECT_ID),
+  });
+  assert.equal(failed.ok && failed.data.applied, true, JSON.stringify(failed));
+  const orphanBeforeReaping = tree.getStatus(GRANDCHILD_ID);
+  assert.equal(orphanBeforeReaping.ok && orphanBeforeReaping.data.state, "terminating");
+  // 树权威已建立故障屏障，但 supervisor 没有发送 lifecycle 回调；活动仍待回收路径收束。
+  assert.equal(controller.getActivitySnapshot(GRANDCHILD_ID).entries.length, 101);
+  assert.equal(controller.getDisplayDrafts(GRANDCHILD_ID).length, 1);
+
+  const settlementSeen = deferred();
+  const unsubscribe = controller.onActivityChange((agentId) => {
+    if (
+      agentId === GRANDCHILD_ID
+      && controller.getActivitySnapshot(agentId).entries.length === 100
+    ) settlementSeen.resolve();
+  });
+  supervisor.emitNonLifecycleEvent(Object.freeze({ kind: "fault", code: "rpc_process_exit" }));
+  await settlementSeen.promise;
+  unsubscribe();
+
+  assert.deepEqual(order, ["reap"]);
+  const orphanAfterReaping = tree.getStatus(GRANDCHILD_ID);
+  assert.equal(orphanAfterReaping.ok && orphanAfterReaping.data.state, "terminated");
+  const failedParent = tree.getStatus(DIRECT_ID);
+  assert.equal(failedParent.ok && failedParent.data.state, "failed");
+
+  const afterReaping = controller.getActivitySnapshot(GRANDCHILD_ID);
+  assert.equal(afterReaping.entries.length, 100);
+  assert.equal(afterReaping.olderActivityOmitted, true);
+  assert.equal(afterReaping.revision, beforeReaping.revision + 1);
+  assert.deepEqual(afterReaping.entries, runningEntries.slice(1));
+  assert.deepEqual(controller.getDisplayDrafts(GRANDCHILD_ID), []);
 });

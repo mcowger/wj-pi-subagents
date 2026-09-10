@@ -10,6 +10,7 @@ import {
   type AgentTreeUiContext,
 } from "../src/agent-tree-ui.ts";
 import type { AgentDisplayDraftView } from "../src/agent-display-drafts.ts";
+import type { AgentActivitySnapshot } from "../src/agent-activity-cache.ts";
 import type { CanonicalAgentActivityEntry } from "../src/canonical-activity.ts";
 import {
   CANONICAL_ACTIVITY_CONTRACT_VERSION,
@@ -387,7 +388,8 @@ test("/agents overlay 请求响应式尺寸并经宿主路径渲染生命周期�
   binding.dispose();
 });
 
-test("孙代理查看器可回放并实时追加，活动与树更新共用一次 50ms 重绘", async () => {
+test("孙代理查看器同步回放，并将连续草稿通知合并到一次 50ms 重绘", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   type OverlayComponent = {
     render(width: number): string[];
     handleInput?(data: string): void;
@@ -441,7 +443,16 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   const replayReads: string[] = [];
   let activityChange: ((agentId: string) => void) | undefined;
   let displayChange: ((agentId: string) => void) | undefined;
-  const drafts: AgentDisplayDraftView[] = [];
+  let drafts: readonly AgentDisplayDraftView[] = Object.freeze([]);
+  const displayDraft = (value: string): AgentDisplayDraftView => Object.freeze({
+    key: "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81|message-1",
+    state: "streaming",
+    blocks: Object.freeze([Object.freeze({
+      contentIndex: 0,
+      contentType: "text",
+      value,
+    })]),
+  });
   const draftReads: string[] = [];
   const activity: AgentActivityStreamSource = {
     readReplay: (agentId) => {
@@ -492,31 +503,191 @@ test("孙代理查看器可回放并实时追加，活动与树更新共用一�
   activityChange?.(WORKING_CHILD_ID);
   assert.match(viewer?.render(120).join("\n") ?? "", /孙代理实时完整事件/u);
 
-  // 草稿变更通知携带代理身份；查看器重新拉取快照后显示当前连续前缀。
-  drafts.push(Object.freeze({
-    key: "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81|message-1",
-    state: "streaming" as const,
-    blocks: Object.freeze([Object.freeze({
-      contentIndex: 0,
-      contentType: "text" as const,
-      value: "partial",
-    })]),
-  }));
+  // 草稿变更通知在 timer 前立即更新模型；连续通知仍只合并一次 50ms 重绘。
+  drafts = Object.freeze([displayDraft("草稿第一版")]);
+  displayChange?.(PARENT_ID);
   displayChange?.(WORKING_CHILD_ID);
-  assert.match(viewer?.render(120).join("\n") ?? "", /partial/u);
+  drafts = Object.freeze([displayDraft("草稿最后一版")]);
+  displayChange?.(WORKING_CHILD_ID);
+  displayChange?.(WORKING_CHILD_ID);
+  assert.deepEqual(draftReads, [
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+  ]);
+  assert.equal(renderRequests[1] ?? 0, 0);
+  const beforeDraftFlush = viewer?.render(120).join("\n") ?? "";
+  assert.doesNotMatch(beforeDraftFlush, /草稿第一版/u);
+  assert.match(beforeDraftFlush, /草稿最后一版/u);
 
+  // canonical 历史与树更新继续同步生效，但与草稿共用同一个待处理重绘。
   currentSnapshot = Object.freeze({ ...treeSnapshot(), tree_revision: 8 });
   treeChange?.();
-  displayChange?.(WORKING_CHILD_ID);
+  t.mock.timers.tick(49);
+  assert.deepEqual(draftReads, [
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+  ]);
   assert.equal(renderRequests[1] ?? 0, 0);
-  await new Promise<void>((resolve) => setTimeout(resolve, 65));
+
+  t.mock.timers.tick(1);
+  assert.deepEqual(draftReads, [
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+    WORKING_CHILD_ID,
+  ]);
   assert.equal(renderRequests[1], 1);
+  const afterDraftFlush = viewer?.render(120).join("\n") ?? "";
+  assert.doesNotMatch(afterDraftFlush, /草稿第一版/u);
+  assert.match(afterDraftFlush, /草稿最后一版/u);
+
+  // Esc 关闭会退订并清除待处理调度；旧回调也不再读草稿或重绘。
+  drafts = Object.freeze([displayDraft("关闭前待处理草稿")]);
+  displayChange?.(WORKING_CHILD_ID);
+  assert.equal(draftReads.length, 5);
+  const staleDisplayChange = displayChange;
+  viewer?.handleInput?.("\x1b");
+  assert.equal(activityChange, undefined);
+  assert.equal(displayChange, undefined);
+  const readsAfterClose = draftReads.length;
+  const rendersAfterClose = renderRequests[1] ?? 0;
+  drafts = Object.freeze([displayDraft("关闭后草稿")]);
+  staleDisplayChange?.(WORKING_CHILD_ID);
+  t.mock.timers.tick(50);
+  assert.equal(draftReads.length, readsAfterClose);
+  assert.equal(renderRequests[1] ?? 0, rendersAfterClose);
 
   binding.dispose();
   await panelPromise;
   await Promise.all(overlayCompletions);
-  assert.equal(activityChange, undefined);
-  assert.equal(displayChange, undefined);
+});
+
+test("活动查看器优先消费一致 snapshot，并按 revision 忽略重复通知", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  type OverlayComponent = {
+    render(width: number): string[];
+    handleInput?(data: string): void;
+  };
+  const overlays: OverlayComponent[] = [];
+  const completions: Promise<void>[] = [];
+  const renderRequests: number[] = [];
+  const ui = {
+    custom: (
+      factory: (
+        tui: { requestRender(): void },
+        theme: unknown,
+        keybindings: unknown,
+        done: (result: undefined) => void,
+      ) => OverlayComponent,
+    ) => {
+      const index = overlays.length;
+      let settle: () => void = () => {};
+      const completion = new Promise<void>((resolve) => { settle = resolve; });
+      overlays.push(factory(
+        { requestRender: () => { renderRequests[index] = (renderRequests[index] ?? 0) + 1; } },
+        MARKER_THEME,
+        undefined,
+        () => settle(),
+      ));
+      completions.push(completion);
+      return completion;
+    },
+  } as unknown as NonNullable<AgentTreeUiContext["ui"]>;
+  const source = {
+    read: () => ({ ok: true as const, data: treeSnapshot() }),
+    onChange: (_listener: () => void) => () => {},
+  };
+  const entryId = "11111111-1111-4111-8111-111111111111";
+  const incarnationId = "22222222-2222-4222-8222-222222222222";
+  const start: CanonicalAgentActivityEntry = Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: WORKING_CHILD_ID,
+    incarnation_id: incarnationId,
+    entry_id: entryId,
+    body: Object.freeze({
+      type: "tool_execution_start",
+      toolCallId: "snapshot-call",
+      toolName: "read_file",
+      origin: "unknown",
+    }),
+  });
+  const end: CanonicalAgentActivityEntry = Object.freeze({
+    ...start,
+    body: Object.freeze({
+      type: "tool_execution_end",
+      toolCallId: "snapshot-call",
+      toolName: "read_file",
+      origin: "unknown",
+      isError: false,
+    }),
+  });
+  let currentActivity: AgentActivitySnapshot = Object.freeze({
+    entries: Object.freeze([start]),
+    revision: 1,
+    olderActivityOmitted: false,
+  });
+  const snapshotReads: string[] = [];
+  const replayReads: string[] = [];
+  let activityChange: ((agentId: string) => void) | undefined;
+  const activity: AgentActivityStreamSource = {
+    readSnapshot: (agentId) => {
+      snapshotReads.push(agentId);
+      return currentActivity;
+    },
+    readReplay: (agentId) => {
+      replayReads.push(agentId);
+      return [];
+    },
+    onChange: (listener) => {
+      activityChange = listener;
+      return () => { if (activityChange === listener) activityChange = undefined; };
+    },
+  };
+  const binding = bindAgentTreeUi(source, { hasUI: true, mode: "tui", ui }, activity);
+
+  const panelPromise = binding.openPanel();
+  await Promise.resolve();
+  overlays[0]?.handleInput?.("\x1b[B");
+  overlays[0]?.handleInput?.("\r");
+  const viewer = overlays[1];
+  assert.ok(viewer !== undefined);
+  assert.deepEqual(snapshotReads, [WORKING_CHILD_ID]);
+  assert.deepEqual(replayReads, []);
+  assert.match(viewer.render(120).join("\n"), /↻.*read_file/u);
+
+  currentActivity = Object.freeze({
+    entries: Object.freeze([end]),
+    revision: 2,
+    olderActivityOmitted: true,
+  });
+  activityChange?.(WORKING_CHILD_ID);
+  const updated = viewer.render(120).join("\n");
+  assert.match(updated, /Older activity omitted/u);
+  assert.match(updated, /✓.*read_file/u);
+  assert.doesNotMatch(updated, /↻/u);
+  t.mock.timers.tick(50);
+  assert.equal(renderRequests[1], 1);
+
+  // 同 revision 的冲突载荷是 stale 快照：读取一次，但模型与重绘都 no-op。
+  currentActivity = Object.freeze({
+    entries: Object.freeze([start]),
+    revision: 2,
+    olderActivityOmitted: false,
+  });
+  activityChange?.(WORKING_CHILD_ID);
+  t.mock.timers.tick(50);
+  assert.equal(renderRequests[1], 1);
+  assert.match(viewer.render(120).join("\n"), /✓.*read_file/u);
+  assert.deepEqual(snapshotReads, [WORKING_CHILD_ID, WORKING_CHILD_ID, WORKING_CHILD_ID]);
+  assert.deepEqual(replayReads, []);
+
+  binding.dispose();
+  await panelPromise;
+  await Promise.all(completions);
 });
 
 /* ---------------------------------- 鼠标支持 ---------------------------------- */

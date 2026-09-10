@@ -19,6 +19,23 @@ const MAX_ACTIVITY_CONTENT_BLOCKS = 64;
 const MAX_TOOL_ID_BYTES = 256;
 const MAX_ACTIVITY_STREAM_ID_BYTES = 128;
 
+/** display epoch 是不透明的有界代际 token；产生端默认使用 UUID，测试/协议可用固定 token。 */
+export function isValidDisplayEpoch(value: unknown): value is string {
+  return validBoundedText(value, MAX_ACTIVITY_STREAM_ID_BYTES);
+}
+
+
+
+/** 缺省工具代次：仅本地兼容输入使用，严格 canonical wire 必须显式携带。 */
+export const DEFAULT_TOOL_EXECUTION_GENERATION = 1;
+
+/** 工具执行代次必须是从 1 开始的安全整数。 */
+export function isValidToolExecutionGeneration(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= DEFAULT_TOOL_EXECUTION_GENERATION;
+}
+
 /** 活动消息事件允许的正文块闭集：assistant 文本与 thinking。 */
 export type SafeAgentActivityContentBlock =
   | { readonly type: "text"; readonly text: string }
@@ -349,6 +366,8 @@ export type SafeAgentActivityEvent =
       readonly toolCallId: string;
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
+      /** 同一运行实例内复用 toolCallId 时递增；旧事实缺省为首代。 */
+      readonly executionGeneration?: number;
       /** 仅来源验证通过的专用工具可携带的白名单摘要。 */
       readonly summary?: SafeToolSummary;
     }
@@ -357,6 +376,8 @@ export type SafeAgentActivityEvent =
       readonly toolCallId: string;
       readonly toolName: string;
       readonly origin: SafeToolOrigin;
+      /** 与开始事实相同的执行代次；旧事实缺省为首代。 */
+      readonly executionGeneration?: number;
       readonly isError: boolean;
       /** 自包含摘要：成功时含结果事实，失败时只含输入参数。 */
       readonly summary?: SafeToolSummary;
@@ -376,6 +397,8 @@ export type AgentDisplayStreamUpdate =
       readonly type: "message_delta";
       readonly streamId: string;
       readonly sequence: number;
+      /** 同一产生端 reload 代际；旧本地调用可省略。 */
+      readonly displayEpoch?: string;
       readonly contentIndex: number;
       readonly contentType: "text" | "thinking";
       readonly delta: string;
@@ -384,7 +407,17 @@ export type AgentDisplayStreamUpdate =
       readonly type: "message_complete";
       readonly streamId: string;
       readonly sequence: number;
+      /** 同一产生端 reload 代际；旧本地调用可省略。 */
+      readonly displayEpoch?: string;
     };
+
+/** 显示源 reload 的无状态控制事实；不等待确认、不重放、不进入历史。 */
+export interface SafeAgentActivityDisplayReset {
+  readonly type: "display_reset";
+  readonly agentId: string;
+  readonly incarnationId: string;
+  readonly displayEpoch: string;
+}
 
 export type AgentDisplayStreamUpdateNormalization =
   | { readonly kind: "event"; readonly event: AgentDisplayStreamUpdate }
@@ -394,14 +427,16 @@ export type AgentDisplayStreamUpdateNormalization =
 
 /**
  * 仅供已打开查看器使用的短暂 assistant 增量；它绝不进入活动缓存。
- * 实时流身份至少包含 agentId、incarnationId 与 streamId，且 delta 与
- * complete 携带同一身份；sequence 在每个 streamId 内严格递增。不同代理、
- * 重启实例或复用 stream ID 不会关联到同一草稿。
+ * 实时流身份至少包含 agentId、incarnationId、displayEpoch 与 streamId，且
+ * delta 与 complete 携带该身份及严格递增 sequence。旧本地调用可省略
+ * displayEpoch；跨进程产生端必须由 reset barrier 先建立当前代际。
  */
-export type SafeAgentActivityDisplayEvent = AgentDisplayStreamUpdate & {
-  readonly agentId: string;
-  readonly incarnationId: string;
-};
+export type SafeAgentActivityDisplayEvent =
+  | (AgentDisplayStreamUpdate & {
+      readonly agentId: string;
+      readonly incarnationId: string;
+    })
+  | SafeAgentActivityDisplayReset;
 
 export type AgentActivityDisplayEventNormalization =
   | { readonly kind: "event"; readonly event: SafeAgentActivityDisplayEvent }
@@ -512,14 +547,19 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
       if (
         !validBoundedText(event.toolCallId, MAX_TOOL_ID_BYTES)
         || !validBoundedText(event.toolName, MAX_TOOL_ID_BYTES)
+        || (event.executionGeneration !== undefined
+          && !isValidToolExecutionGeneration(event.executionGeneration))
       ) return INVALID_EVENT;
+      const executionGeneration = event.executionGeneration;
       if (event.type === "tool_execution_start") {
-        // 桥接输入是 Pi 原始事件：旧字段与未来新增字段一律剥离。
+        // 桥接输入是 Pi 原始事件：未列入闭集的载荷一律剥离；若宿主显式
+        // 提供执行代次则保留该身份事实，供后续规范条目关联。
         return safeEvent(Object.freeze({
           type: event.type,
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           origin: "unknown",
+          ...(executionGeneration === undefined ? {} : { executionGeneration }),
         }));
       }
       if (typeof event.isError !== "boolean") return INVALID_EVENT;
@@ -528,6 +568,7 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
         toolCallId: event.toolCallId,
         toolName: event.toolName,
         origin: "unknown",
+        ...(executionGeneration === undefined ? {} : { executionGeneration }),
         isError: event.isError,
       }));
     }
@@ -623,7 +664,12 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       if (!validBoundedText(value.toolCallId, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
       if (!validBoundedText(value.toolName, MAX_TOOL_ID_BYTES)) return INVALID_ACTIVITY_EVENT;
       if (
-        !hasOnlyToolEventKeys(value, ["type", "toolCallId", "toolName", "origin", "summary"])
+        !hasOnlyToolEventKeys(
+          value,
+          ["type", "toolCallId", "toolName", "origin", "executionGeneration", "summary"],
+        )
+        || (value.executionGeneration !== undefined
+          && !isValidToolExecutionGeneration(value.executionGeneration))
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
@@ -638,6 +684,9 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolCallId: value.toolCallId,
           toolName: value.toolName,
           origin: value.origin,
+          ...(value.executionGeneration === undefined
+            ? {}
+            : { executionGeneration: value.executionGeneration }),
           ...(value.summary === undefined ? {} : { summary: value.summary as SafeToolSummary }),
         }),
       });
@@ -649,8 +698,13 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
         typeof value.isError !== "boolean"
         || !hasOnlyToolEventKeys(
           value,
-          ["type", "toolCallId", "toolName", "origin", "isError", "summary", "errorText", "errorCode"],
+          [
+            "type", "toolCallId", "toolName", "origin", "executionGeneration", "isError",
+            "summary", "errorText", "errorCode",
+          ],
         )
+        || (value.executionGeneration !== undefined
+          && !isValidToolExecutionGeneration(value.executionGeneration))
       ) return INVALID_ACTIVITY_EVENT;
       if (!isSafeToolOrigin(value.origin)) return INVALID_ACTIVITY_EVENT;
       if (value.summary !== undefined) {
@@ -687,6 +741,9 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
           toolCallId: value.toolCallId,
           toolName: value.toolName,
           origin: value.origin,
+          ...(value.executionGeneration === undefined
+            ? {}
+            : { executionGeneration: value.executionGeneration }),
           isError: value.isError,
           ...(value.summary === undefined ? {} : { summary: value.summary as SafeToolSummary }),
           ...(value.errorText === undefined ? {} : { errorText: value.errorText }),
@@ -700,14 +757,177 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
 }
 
 /**
- * 校验携带完整实时流身份的显示层短暂事件。它与完整活动事件使用相同的正文
- * 预算，但不会被 AgentActivityCache 接收或回放；监督通道 display 帧、控制器
- * 转发与顶层草稿登记共用同一校验。
+ * canonical 活动条目的专用 wire parser。通用 parser 仍服务本地 raw/managed-RPC
+ * 路径并允许兼容旧事实；只有跨层权威条目经过这里，工具状态必须带显式代次，
+ * message/parent_message 正文和嵌套 block 均按严格闭集拒绝额外键。
+ */
+export function parseCanonicalAgentActivityEvent(
+  value: unknown,
+): AgentActivityEventNormalization {
+  if (!isStrictWireJsonValue(value) || !isRecord(value) || typeof value.type !== "string") {
+    return INVALID_ACTIVITY_EVENT;
+  }
+  switch (value.type) {
+    case "message":
+      if (
+        !hasExactObjectKeys(value, ["type", "content"])
+        && !hasExactObjectKeys(value, ["type", "content", "streamId"])
+      ) return INVALID_ACTIVITY_EVENT;
+      if (!isStrictCanonicalActivityContent(value.content)) return INVALID_ACTIVITY_EVENT;
+      return parseAgentActivityEvent(value);
+    case "parent_message":
+      // parent_message 永远不携带 assistant streamId；显式出现即拒绝。
+      if (!hasExactObjectKeys(value, ["type", "content"])) return INVALID_ACTIVITY_EVENT;
+      if (!isStrictCanonicalActivityContent(value.content)) return INVALID_ACTIVITY_EVENT;
+      return parseAgentActivityEvent(value);
+    case "tool_execution_start":
+      if (
+        !hasExactKeysWithOptional(
+          value,
+          ["type", "toolCallId", "toolName", "origin", "executionGeneration"],
+          ["summary"],
+        )
+        || !Object.prototype.hasOwnProperty.call(value, "executionGeneration")
+        || !isValidToolExecutionGeneration(value.executionGeneration)
+      ) return INVALID_ACTIVITY_EVENT;
+      return parseAgentActivityEvent(value);
+    case "tool_execution_end":
+      if (
+        !hasExactKeysWithOptional(
+          value,
+          ["type", "toolCallId", "toolName", "origin", "executionGeneration", "isError"],
+          ["summary", "errorText", "errorCode"],
+        )
+        || !Object.prototype.hasOwnProperty.call(value, "executionGeneration")
+        || !isValidToolExecutionGeneration(value.executionGeneration)
+      ) return INVALID_ACTIVITY_EVENT;
+      return parseAgentActivityEvent(value);
+    default:
+      return INVALID_ACTIVITY_EVENT;
+  }
+}
+
+/**
+ * canonical message 的 content 不能依赖通用 raw normalizer 的“逐块剥离”语义；
+ * 权威 wire 中未知块、缺字段和额外字段都属于结构违约。
+ */
+function isStrictCanonicalActivityContent(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ACTIVITY_CONTENT_BLOCKS) {
+    return false;
+  }
+  for (const item of value) {
+    if (!isRecord(item) || (item.type !== "text" && item.type !== "thinking")) return false;
+    if (item.type === "text") {
+      if (
+        !hasExactObjectKeys(item, ["type", "text"])
+        || typeof item.text !== "string"
+        || item.text.length === 0
+      ) return false;
+    } else if (
+      !hasExactObjectKeys(item, ["type", "thinking"])
+      || typeof item.thinking !== "string"
+      || item.thinking.length === 0
+    ) return false;
+  }
+  return true;
+}
+
+/**
+ * 严格 canonical 入口模拟 JSON wire：直接调用者也不能用 undefined、NaN、
+ * 稀疏数组或循环对象绕过“字段存在且有效”的闭集校验。
+ */
+function isStrictWireJsonValue(root: unknown): boolean {
+  const pending: Array<{ readonly value: unknown; readonly leaving: boolean }> = [{
+    value: root,
+    leaving: false,
+  }];
+  // 只追踪当前遍历路径：JSON 可序列化共享引用在不同分支会分别展开，不能
+  // 与真正的循环对象混为一谈。
+  const active = new Set<object>();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined) return false;
+    const { value } = current;
+    if (current.leaving) {
+      if (value !== null && typeof value === "object") active.delete(value);
+      continue;
+    }
+    if (value === null || typeof value === "string" || typeof value === "boolean") continue;
+    if (typeof value === "number") {
+      if (Number.isFinite(value)) continue;
+      return false;
+    }
+    if (Array.isArray(value)) {
+      if (active.has(value) || Object.getOwnPropertySymbols(value).length > 0) return false;
+      for (const key of Object.keys(value)) {
+        if (!/^(?:0|[1-9]\d*)$/u.test(key)) return false;
+      }
+      active.add(value);
+      pending.push({ value, leaving: true });
+      for (let index = 0; index < value.length; index += 1) {
+        if (!Object.prototype.hasOwnProperty.call(value, index)) return false;
+        pending.push({ value: value[index], leaving: false });
+      }
+      continue;
+    }
+    if (!isRecord(value) || active.has(value) || Object.getOwnPropertySymbols(value).length > 0) {
+      return false;
+    }
+    active.add(value);
+    pending.push({ value, leaving: true });
+    for (const key of Object.keys(value)) pending.push({ value: value[key], leaving: false });
+  }
+  return true;
+}
+
+/**
+ * 校验固定对象键集合。与本地 raw normalizer 的宽容字段白名单刻意分开，
+ * 以免未来字段在 canonical authority 入口被静默吞掉。
+ */
+function hasExactObjectKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  if (Object.keys(value).length !== keys.length) return false;
+  return keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+function hasExactKeysWithOptional(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): boolean {
+  const allowed = new Set([...required, ...optional]);
+  const keys = Object.keys(value);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && keys.every((key) => allowed.has(key));
+}
+
+/**
+ * 校验携带完整实时流身份的显示层短暂事件，或无状态 display reset barrier。
+ * 它与完整活动事件使用相同的正文预算；控制器和监督通道共用这一校验。
  */
 export function parseAgentActivityDisplayEvent(
   value: unknown,
 ): AgentActivityDisplayEventNormalization {
   if (!isRecord(value) || typeof value.type !== "string") return INVALID_ACTIVITY_DISPLAY_EVENT;
+
+  if (value.type === "display_reset") {
+    if (!hasExactObjectKeys(value, ["type", "agentId", "incarnationId", "displayEpoch"])) {
+      return INVALID_ACTIVITY_DISPLAY_EVENT;
+    }
+    if (
+      !isCanonicalUuid(value.agentId)
+      || !isCanonicalUuid(value.incarnationId)
+      || !isCanonicalUuid(value.displayEpoch)
+    ) return INVALID_ACTIVITY_DISPLAY_EVENT;
+    return Object.freeze({
+      kind: "event",
+      event: Object.freeze({
+        type: "display_reset" as const,
+        agentId: value.agentId,
+        incarnationId: value.incarnationId,
+        displayEpoch: value.displayEpoch,
+      }),
+    });
+  }
+
   const streamId = value.streamId;
   const sequence = value.sequence;
   if (!validBoundedText(streamId, MAX_ACTIVITY_STREAM_ID_BYTES)) {
@@ -721,19 +941,34 @@ export function parseAgentActivityDisplayEvent(
   if (!isCanonicalUuid(value.agentId) || !isCanonicalUuid(value.incarnationId)) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
   }
+  if (value.displayEpoch !== undefined && !isCanonicalUuid(value.displayEpoch)) {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
+  const commonRequiredKeys = ["type", "streamId", "sequence", "agentId", "incarnationId"];
   if (value.type === "message_complete") {
+    if (!hasExactKeysWithOptional(value, commonRequiredKeys, ["displayEpoch"])) {
+      return INVALID_ACTIVITY_DISPLAY_EVENT;
+    }
     return Object.freeze({
       kind: "event",
       event: Object.freeze({
         type: "message_complete" as const,
         streamId,
         sequence,
+        ...(value.displayEpoch === undefined ? {} : { displayEpoch: value.displayEpoch }),
         agentId: value.agentId,
         incarnationId: value.incarnationId,
       }),
     });
   }
   if (value.type !== "message_delta") return INVALID_ACTIVITY_DISPLAY_EVENT;
+  if (!hasExactKeysWithOptional(
+    value,
+    [...commonRequiredKeys, "contentIndex", "contentType", "delta"],
+    ["displayEpoch"],
+  )) {
+    return INVALID_ACTIVITY_DISPLAY_EVENT;
+  }
   const contentIndex = value.contentIndex;
   const contentType = value.contentType;
   const delta = value.delta;
@@ -755,6 +990,7 @@ export function parseAgentActivityDisplayEvent(
       type: "message_delta" as const,
       streamId,
       sequence,
+      ...(value.displayEpoch === undefined ? {} : { displayEpoch: value.displayEpoch }),
       contentIndex,
       contentType,
       delta,
@@ -773,6 +1009,7 @@ export function normalizeAssistantMessageUpdate(
   value: unknown,
   streamId: string,
   sequence: number,
+  displayEpoch?: string,
 ): AgentDisplayStreamUpdateNormalization {
   if (!isRecord(value) || value.type !== "message_update" || !isRecord(value.assistantMessageEvent)) {
     return INVALID_ACTIVITY_DISPLAY_EVENT;
@@ -800,6 +1037,7 @@ export function normalizeAssistantMessageUpdate(
     contentIndex,
     contentType: update.type === "text_delta" ? "text" : "thinking",
     delta,
+    ...(displayEpoch === undefined ? {} : { displayEpoch }),
   });
   if (encodedJsonLength(delta) > ACTIVITY_MAX_TEXT_BYTES) {
     return ACTIVITY_DISPLAY_REJECTED;
@@ -811,8 +1049,14 @@ export function normalizeAssistantMessageUpdate(
 export function buildDisplayStreamComplete(
   streamId: string,
   sequence: number,
+  displayEpoch?: string,
 ): AgentDisplayStreamUpdate {
-  return Object.freeze({ type: "message_complete", streamId, sequence });
+  return Object.freeze({
+    type: "message_complete",
+    streamId,
+    sequence,
+    ...(displayEpoch === undefined ? {} : { displayEpoch }),
+  });
 }
 
 /**
@@ -833,9 +1077,23 @@ export function normalizeOwnToolActivityEvent(
   origin: SafeToolOrigin,
   startArgs?: unknown,
   resolveAgentName?: (agentId: string) => string | undefined,
+  executionGeneration?: number,
 ): AgentActivityEventNormalization {
   if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
   if (!isSafeToolOrigin(origin)) return INVALID_ACTIVITY_EVENT;
+  const eventGeneration = event.executionGeneration;
+  if (
+    eventGeneration !== undefined
+    && !isValidToolExecutionGeneration(eventGeneration)
+  ) return INVALID_ACTIVITY_EVENT;
+  const isToolExecution = event.type === "tool_execution_start" || event.type === "tool_execution_end";
+  const effectiveGeneration = isToolExecution
+    ? executionGeneration ?? eventGeneration ?? DEFAULT_TOOL_EXECUTION_GENERATION
+    : undefined;
+  if (
+    effectiveGeneration !== undefined
+    && !isValidToolExecutionGeneration(effectiveGeneration)
+  ) return INVALID_ACTIVITY_EVENT;
   // 专用摘要只作用于来源验证通过的原生专用工具与插件专用工具；其余来源
   // 与工具都是无载荷安全兜底。
   const dedicatedPiTool = origin === "pi_native"
@@ -861,6 +1119,7 @@ export function normalizeOwnToolActivityEvent(
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       origin,
+      ...(effectiveGeneration === undefined ? {} : { executionGeneration: effectiveGeneration }),
       ...(summary === undefined ? {} : { summary }),
     });
   }
@@ -897,6 +1156,7 @@ export function normalizeOwnToolActivityEvent(
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       origin,
+      ...(effectiveGeneration === undefined ? {} : { executionGeneration: effectiveGeneration }),
       isError: event.isError,
       ...(summary === undefined ? {} : { summary }),
       ...(errorText === undefined ? {} : { errorText }),
@@ -904,6 +1164,73 @@ export function normalizeOwnToolActivityEvent(
     });
   }
   return INVALID_ACTIVITY_EVENT;
+}
+
+const MAX_PENDING_TOOL_ARGS = 256;
+
+interface ToolExecutionGenerationState {
+  readonly generation: number;
+  readonly open: boolean;
+}
+
+interface PendingToolArguments {
+  readonly args: unknown;
+}
+
+/**
+ * 工具活动规范化器的可交接状态。它不是历史正文：generation 账本只用于在
+ * 同一运行实例复用 toolCallId 时维持稳定身份，pendingArgs 只暂存尚未结束
+ * 工具的白名单提取输入。两张表随运行时 reload 一起转移，不能在新 activator
+ * 中重新初始化，否则迟到 end 会串到首代。
+ */
+export interface OwnToolActivityNormalizerState {
+  readonly generations: Map<string, ToolExecutionGenerationState>;
+  readonly pendingArgs: Map<string, PendingToolArguments>;
+}
+
+export function createOwnToolActivityNormalizerState(): OwnToolActivityNormalizerState {
+  return {
+    generations: new Map<string, ToolExecutionGenerationState>(),
+    pendingArgs: new Map<string, PendingToolArguments>(),
+  };
+}
+
+/** 显式传入同一观察代际的运行时状态闭集校验；reload 不会复用该状态。 */
+export function isOwnToolActivityNormalizerState(
+  value: unknown,
+): value is OwnToolActivityNormalizerState {
+  if (
+    !isRecord(value)
+    || !(value.generations instanceof Map)
+    || !(value.pendingArgs instanceof Map)
+    || value.pendingArgs.size > MAX_PENDING_TOOL_ARGS
+  ) {
+    return false;
+  }
+  for (const [toolCallId, state] of value.generations) {
+    if (
+      typeof toolCallId !== "string"
+      || !isRecord(state)
+      || !isValidToolExecutionGeneration(state.generation)
+      || typeof state.open !== "boolean"
+    ) return false;
+  }
+  for (const [key, pending] of value.pendingArgs) {
+    if (typeof key !== "string") return false;
+    const separator = key.lastIndexOf("\u0000");
+    const generationText = separator < 0 ? "" : key.slice(separator + 1);
+    const generation = Number(generationText);
+    if (
+      separator <= 0
+      || !isValidToolExecutionGeneration(generation)
+      || !Number.isInteger(generation)
+      || !isRecord(pending)
+      || !Object.hasOwn(pending, "args")
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -915,28 +1242,100 @@ export function normalizeOwnToolActivityEvent(
 export function createOwnToolActivityNormalizer(
   resolveToolOrigin: (toolName: string) => SafeToolOrigin,
   resolveAgentName?: (agentId: string) => string | undefined,
+  state: OwnToolActivityNormalizerState = createOwnToolActivityNormalizerState(),
 ): (event: unknown) => AgentActivityEventNormalization {
-  const MAX_PENDING_TOOL_ARGS = 256;
-  const pendingArgs = new Map<string, unknown>();
+  const pendingKey = (toolCallId: string, generation: number): string =>
+    `${toolCallId}\u0000${generation}`;
   return (event: unknown): AgentActivityEventNormalization => {
     if (!isRecord(event) || typeof event.type !== "string") return INVALID_ACTIVITY_EVENT;
     const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
-    if (event.type === "tool_execution_start" && toolCallId.length > 0) {
-      // 同活动 ID 的重复开始覆盖旧参数；容量溢出时淘汰最早待决条目。
-      pendingArgs.delete(toolCallId);
-      if (isRecord(event.args)) pendingArgs.set(toolCallId, event.args);
-      while (pendingArgs.size > MAX_PENDING_TOOL_ARGS) {
-        const oldest = pendingArgs.keys().next().value;
-        if (oldest === undefined) break;
-        pendingArgs.delete(oldest);
+    const isStart = event.type === "tool_execution_start";
+    const isEnd = event.type === "tool_execution_end";
+    const explicitGeneration = event.executionGeneration;
+    if (
+      explicitGeneration !== undefined
+      && !isValidToolExecutionGeneration(explicitGeneration)
+    ) return INVALID_ACTIVITY_EVENT;
+
+    let executionGeneration: number | undefined;
+    let previous: ToolExecutionGenerationState | undefined;
+    let shouldAdvanceLedger = false;
+    let shouldStorePending = false;
+    let shouldConsumePending = false;
+    if ((isStart || isEnd) && toolCallId.length > 0) {
+      previous = state.generations.get(toolCallId);
+      if (explicitGeneration !== undefined) {
+        executionGeneration = explicitGeneration;
+        const stale = previous !== undefined && explicitGeneration < previous.generation;
+        const lateStartForClosedGeneration = isStart
+          && previous !== undefined
+          && explicitGeneration === previous.generation
+          && previous.open === false;
+        // A late fact for an older generation must still be emitted with its own
+        // identity, but it may not move the ledger backwards or reopen the latest
+        // closed invocation. This is what keeps reuse safe after reload/IPC delay.
+        shouldAdvanceLedger = !stale && !lateStartForClosedGeneration;
+        shouldStorePending = isStart && !lateStartForClosedGeneration;
+        shouldConsumePending = isEnd;
+      } else if (isStart) {
+        // 同一调用的重复开始保持代次；完成后复用 toolCallId 时递增。
+        executionGeneration = previous?.open === true
+          ? previous.generation
+          : (previous?.generation ?? 0) + 1;
+        shouldAdvanceLedger = true;
+        shouldStorePending = true;
+      } else {
+        // end 缺失 start 时仍建立首代；重复 end 复用最近已知代次。
+        executionGeneration = previous?.generation ?? DEFAULT_TOOL_EXECUTION_GENERATION;
+        shouldAdvanceLedger = previous === undefined || previous.open === true;
+        shouldConsumePending = true;
       }
     }
+
     const origin = resolveToolOrigin(typeof event.toolName === "string" ? event.toolName : "");
-    const startArgs = event.type === "tool_execution_end" && toolCallId.length > 0
-      ? pendingArgs.get(toolCallId)
+    const pending = isEnd
+      && toolCallId.length > 0
+      && executionGeneration !== undefined
+      ? state.pendingArgs.get(pendingKey(toolCallId, executionGeneration))
       : undefined;
-    if (event.type === "tool_execution_end") pendingArgs.delete(toolCallId);
-    return normalizeOwnToolActivityEvent(event, origin, startArgs, resolveAgentName);
+    const normalized = normalizeOwnToolActivityEvent(
+      event,
+      origin,
+      pending?.args,
+      resolveAgentName,
+      executionGeneration,
+    );
+    // Do not let malformed host events mutate the generation/argument ledger.
+    if (normalized.kind !== "event") return normalized;
+
+    if (
+      (isStart || isEnd)
+      && toolCallId.length > 0
+      && executionGeneration !== undefined
+    ) {
+      if (shouldAdvanceLedger) {
+        state.generations.delete(toolCallId);
+        state.generations.set(toolCallId, {
+          generation: executionGeneration,
+          open: isStart,
+        });
+      }
+      if (isStart && shouldStorePending) {
+        const key = pendingKey(toolCallId, executionGeneration);
+        // 同活动 ID 的重复开始覆盖旧参数；容量溢出时淘汰最早待决条目。
+        state.pendingArgs.delete(key);
+        if (isRecord(event.args)) state.pendingArgs.set(key, { args: event.args });
+        while (state.pendingArgs.size > MAX_PENDING_TOOL_ARGS) {
+          const oldest = state.pendingArgs.keys().next().value;
+          if (oldest === undefined) break;
+          state.pendingArgs.delete(oldest);
+        }
+      }
+      if (shouldConsumePending) {
+        state.pendingArgs.delete(pendingKey(toolCallId, executionGeneration));
+      }
+    }
+    return normalized;
   };
 }
 

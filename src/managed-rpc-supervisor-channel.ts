@@ -133,6 +133,11 @@ export class ManagedRpcSupervisorChannel implements RpcSupervisorChannel {
     return this.protocol.getPublicState().state === "ready";
   }
 
+  /** parent reload 建立 reset snapshot 边界；窗口内 activity/display 可安全丢弃。 */
+  async requestSnapshot(): Promise<void> {
+    await this.send(this.protocol.requestSnapshot());
+  }
+
   async publishReply(_reply: SupervisorReply, _signal?: AbortSignal): Promise<void> {
     throw new Error("父端监督通道不能发布代理回复");
   }
