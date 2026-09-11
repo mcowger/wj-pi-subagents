@@ -17,7 +17,7 @@ export type AgentLifecycleState = LifecycleState;
 /** working 期间可安全展示的当前活动阶段。 */
 export const AGENT_ACTIVITY_PHASES = Object.freeze([
   "processing",
-  "executing_tools",
+  "tool_calls",
   "compacting",
 ] as const);
 export type AgentActivityPhase = (typeof AGENT_ACTIVITY_PHASES)[number];

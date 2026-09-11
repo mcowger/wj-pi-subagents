@@ -2305,7 +2305,7 @@ test("get_agent_status 只将 failed 与错误码片段标红，查询成功始�
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     toolEnd("t1", "get_agent_status", false, "plugin", INCARNATION_ID, {
       tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, name: "worker-b",
-      state: "working", phase: "executing_tools",
+      state: "working", phase: "tool_calls",
     }),
     toolEnd("t2", "get_agent_status", false, "plugin", INCARNATION_ID, {
       tool: "get_agent_status", agent_id: CHILD_SPAWN_ID, state: "idle",
@@ -2325,7 +2325,7 @@ test("get_agent_status 只将 failed 与错误码片段标红，查询成功始�
   const body = viewer.render(160).slice(1, -1).join("\n");
 
   // working/interrupting 可显示 activity phase；terminated 显示终止结果。
-  assert.match(body, /✓ get_agent_status · worker-b · 1b3f2a7c · working · executing_tools\n/u);
+  assert.match(body, /✓ get_agent_status · worker-b · 1b3f2a7c · working · tool_calls\n/u);
   assert.match(body, /✓ get_agent_status · 1b3f2a7c · idle\n/u);
   assert.match(body, /✓ get_agent_status · 1b3f2a7c · terminated · completed\n/u);
   // 目标 failed：failed 与错误码片段并列，查询成功状态仍位于最左侧。

@@ -1073,7 +1073,7 @@ export class RpcSupervisor {
         this.compactionObservationVersion += 1;
         const completionVersion = this.markLifecycleObservation();
         this.compactionEndFenceVersion = this.compactionObservationVersion;
-        this.emitActivity(this.activeTools.size > 0 ? "executing_tools" : "processing");
+        this.emitActivity(this.activeTools.size > 0 ? "tool_calls" : "processing");
         void this.enqueueStateReconciliation(completionVersion).catch(() => {
           // 状态探针失败不能伪造 idle；后续状态查询或消息发送仍可重试校准。
         });
@@ -1249,7 +1249,7 @@ export class RpcSupervisor {
     }
     this.retiredToolCallIds.delete(event.toolCallId);
     this.activeTools.add(event.toolCallId);
-    this.emitActivity(this.runtimeCompactionActive ? "compacting" : "executing_tools");
+    this.emitActivity(this.runtimeCompactionActive ? "compacting" : "tool_calls");
   }
 
   private receiveToolEnd(event: Record<string, unknown>): void {
@@ -1265,7 +1265,7 @@ export class RpcSupervisor {
     this.activeTools.delete(event.toolCallId);
     this.emitActivity(this.runtimeCompactionActive
       ? "compacting"
-      : this.activeTools.size > 0 ? "executing_tools" : "processing");
+      : this.activeTools.size > 0 ? "tool_calls" : "processing");
   }
 
   private emitActivity(phase: AgentActivityPhase): void {
@@ -1422,7 +1422,7 @@ export class RpcSupervisor {
       }
       this.emitActivity(isCompacting
         ? "compacting"
-        : this.activeTools.size > 0 ? "executing_tools" : "processing");
+        : this.activeTools.size > 0 ? "tool_calls" : "processing");
       return true;
     }
 

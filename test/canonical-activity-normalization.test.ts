@@ -1936,9 +1936,9 @@ test("控制工具成功事实区分幂等、强制回收、压缩阻塞与状�
     {
       details: {
         agent_id: PLUGIN_CHILD_ID, state: "working", revision: 7,
-        activity: { phase: "executing_tools" }, context_usage_percent: 88,
+        activity: { phase: "tool_calls" }, context_usage_percent: 88,
       },
-      expected: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "working", phase: "executing_tools" },
+      expected: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "working", phase: "tool_calls" },
     },
     {
       details: { agent_id: PLUGIN_CHILD_ID, state: "idle", revision: 8 },
@@ -2161,7 +2161,7 @@ test("等待与控制摘要的 wire 闭集：未知键、非法目标与闭集�
     toolName: "get_agent_status",
     origin: "plugin",
     isError: false,
-    summary: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "failed", phase: "executing_tools" },
+    summary: { tool: "get_agent_status", agent_id: PLUGIN_CHILD_ID, state: "failed", phase: "tool_calls" },
   }).kind, "event");
   assert.equal(parseAgentActivityEvent({
     type: "tool_execution_end",

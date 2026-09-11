@@ -82,7 +82,7 @@ class FakeSupervisor implements AgentSupervisor {
     for (const listener of this.listeners) listener({ kind: "lifecycle", event });
   }
 
-  emitActivity(phase: "processing" | "executing_tools" | "compacting"): void {
+  emitActivity(phase: "processing" | "tool_calls" | "compacting"): void {
     for (const listener of this.listeners) {
       listener({ kind: "activity", activity: { phase } });
     }
@@ -148,10 +148,10 @@ test("监督器活动阶段进入公开快照，并在生命周期离开 working
   assert.equal(status.ok, true);
   if (status.ok) assert.deepEqual(status.data.activity, { phase: "processing" });
 
-  fake.emitActivity("executing_tools");
+  fake.emitActivity("tool_calls");
   status = tree.getStatus(AGENT_ID);
   assert.equal(status.ok, true);
-  if (status.ok) assert.deepEqual(status.data.activity, { phase: "executing_tools" });
+  if (status.ok) assert.deepEqual(status.data.activity, { phase: "tool_calls" });
 
   fake.emitActivity("compacting");
   status = tree.getStatus(AGENT_ID);

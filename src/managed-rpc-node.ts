@@ -35,7 +35,7 @@ export type ManagedRpcReply = ChildReplyEnvelope;
 
 export type ManagedRpcTransportFault = "eof" | "protocol_fault" | "process_exit";
 
-export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/9" as const;
+export const MANAGED_RPC_BRIDGE_PROTOCOL = "wj-pi-subagents/managed-rpc/10" as const;
 /** 只用于节点启动事务的一次性本地认证，不进入公开控制面。 */
 export const MANAGED_RPC_BRIDGE_CREDENTIAL_ENV = "WJ_PI_SUBAGENTS_MANAGED_RPC_CREDENTIAL" as const;
 /** 外层桥接 JSON 正文的硬边界。 */

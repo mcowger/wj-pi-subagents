@@ -316,7 +316,7 @@ test("活动流上行不影响既有活动阶段与工具配对跟踪", async ()
       .filter((event): event is Extract<RpcSupervisorEvent, { kind: "activity" }> =>
         event.kind === "activity")
       .map((event) => event.activity.phase);
-    assert.ok(phases.includes("executing_tools"));
+    assert.ok(phases.includes("tool_calls"));
     assert.ok(phases.includes("processing"));
   } finally {
     unsubscribe();

@@ -21,7 +21,7 @@ import {
 const AGENT_ID = "550e8400-e29b-41d4-a716-446655440000";
 
 function snapshot(
-  phase: "processing" | "executing_tools" | "compacting",
+  phase: "processing" | "tool_calls" | "compacting",
 ): AgentSnapshot {
   return Object.freeze({
     agent_id: AGENT_ID,
@@ -45,7 +45,7 @@ function withoutActivity(node: AgentSnapshot): AgentSnapshot {
 
 test("活动阶段快照只接受三个公开值，并限制在 working/interrupting", () => {
   assert.deepEqual(parseAgentActivitySummary({ phase: "processing" }), { phase: "processing" });
-  assert.deepEqual(parseAgentActivitySummary({ phase: "executing_tools" }), { phase: "executing_tools" });
+  assert.deepEqual(parseAgentActivitySummary({ phase: "tool_calls" }), { phase: "tool_calls" });
   assert.deepEqual(parseAgentActivitySummary({ phase: "compacting" }), { phase: "compacting" });
   assert.equal(parseAgentActivitySummary({ phase: "editing" }), undefined);
   assert.equal(parseAgentActivitySummary({ phase: "processing", category: "reading" }), undefined);
@@ -84,12 +84,12 @@ test("作用域根快照不会清除父端活动阶段，settled 才会清除", 
   assert.equal(current.data.state, "working");
   assert.deepEqual(current.data.activity, { phase: "processing" });
 
-  const activityUpdated = tree.updateActivity(AGENT_ID, { phase: "executing_tools" });
+  const activityUpdated = tree.updateActivity(AGENT_ID, { phase: "tool_calls" });
   assert.equal(activityUpdated.ok, true, JSON.stringify(activityUpdated));
   const withActivity = tree.getStatus(AGENT_ID);
   assert.equal(withActivity.ok, true, JSON.stringify(withActivity));
   if (!withActivity.ok) return;
-  assert.deepEqual(withActivity.data.activity, { phase: "executing_tools" });
+  assert.deepEqual(withActivity.data.activity, { phase: "tool_calls" });
 
   const legacyScopeSnapshot: SubtreeSnapshotInput = {
     scope_agent_id: AGENT_ID,
@@ -102,7 +102,7 @@ test("作用域根快照不会清除父端活动阶段，settled 才会清除", 
   assert.equal(status.ok, true);
   if (status.ok) {
     assert.equal(status.data.state, "working");
-    assert.deepEqual(status.data.activity, { phase: "executing_tools" });
+    assert.deepEqual(status.data.activity, { phase: "tool_calls" });
   }
 
   const generation = tree.getLifecycleGeneration(AGENT_ID);
@@ -130,14 +130,14 @@ function scoped(node: AgentSnapshot): ScopedAgentTreeSnapshot {
 }
 
 test("输入框 widget 和子代理面板显示活动阶段但不显示工具类别", () => {
-  const current = scoped(snapshot("executing_tools"));
+  const current = scoped(snapshot("tool_calls"));
   const widget = renderAgentsWidget(current, 160);
   assert.equal(widget.length, 2);
-  assert.match(widget[1] ?? "", /executing_tools/);
+  assert.match(widget[1] ?? "", /tool_calls/);
   assert.doesNotMatch(widget[1] ?? "", /reading|editing|running|active_count/);
 
   const panel = new AgentTreePanelModel(current, { viewport_height: 8 });
   const lines = panel.render(160);
-  assert.ok(lines.some((line) => line.includes("executing_tools")));
+  assert.ok(lines.some((line) => line.includes("tool_calls")));
   assert.ok(lines.every((line) => !line.includes("active_count") && !line.includes("reading")));
 });
