@@ -190,7 +190,7 @@ export type WaitAgentEventOutcome =
   | "terminal"
   ;
 
-export type WaitAgentOutcome = WaitAgentEventOutcome | "timeout";
+export type WaitAgentOutcome = WaitAgentEventOutcome | "timeout" | "woken";
 
 export interface WaitAgentData {
   readonly agent_id: string;
@@ -205,7 +205,14 @@ export interface WaitAgentTimeoutData {
   readonly outcome: "timeout";
 }
 
-export type WaitAgentResult = ControlResult<WaitAgentData | WaitAgentTimeoutData>;
+/** 父代理消息唤醒：目标列表事实与 timeout 同构，另带固定唤醒原因。 */
+export interface WaitAgentWokenData {
+  readonly agent_ids: readonly string[];
+  readonly outcome: "woken";
+  readonly wake_reason: "parent_input";
+}
+
+export type WaitAgentResult = ControlResult<WaitAgentData | WaitAgentTimeoutData | WaitAgentWokenData>;
 
 export interface InterruptAgentData {
   readonly agent_id: string;
@@ -522,6 +529,27 @@ export class AgentController {
       const ready = this.readyWaitResult(parsed.agent_ids);
       if (ready !== undefined) this.finishWaiter(waiter, ready);
     });
+  }
+
+  /**
+   * 父代理消息到达时释放当前所有活跃 wait waiter，作为与 timeout 同级的
+   * 独立结束原因：它只表示父输入已抵达，不表示被等待的目标已产生事件。
+   * 已就绪的真实事件（快照或未投递通知）仍优先返回；本入口不登记任何会话
+   * 事件、不改写回合水位，也不重置计时；无活跃 waiter 时是纯 no-op。
+   */
+  wakeWaitersForParentInput(): void {
+    if (this.pendingWaiters.size === 0) return;
+    for (const waiter of [...this.pendingWaiters]) {
+      const ready = this.readyWaitResult(waiter.agentIds);
+      if (ready !== undefined) {
+        this.finishWaiter(waiter, ready);
+        continue;
+      }
+      this.finishWaiter(waiter, Object.freeze({
+        ok: true,
+        data: makeWaitWokenData(waiter.agentIds),
+      }));
+    }
   }
 
   getWaitTimeoutMs(): number {
@@ -1852,6 +1880,15 @@ function makeWaitTimeoutData(agentIds: readonly string[]): WaitAgentTimeoutData 
   return Object.freeze({
     agent_ids: Object.freeze([...agentIds]),
     outcome: "timeout",
+  });
+}
+
+/** 父输入唤醒只携带该次 wait 的完整目标列表，不携带状态、修订或错误。 */
+function makeWaitWokenData(agentIds: readonly string[]): WaitAgentWokenData {
+  return Object.freeze({
+    agent_ids: Object.freeze([...agentIds]),
+    outcome: "woken",
+    wake_reason: "parent_input",
   });
 }
 

@@ -2202,6 +2202,18 @@ test("wait_agent 成功摘要显示实际 outcome 与 batch release 事实", () 
   assert.doesNotMatch(body, /22c4d1e8-3a5b/u);
 });
 
+test("wait_agent woken 摘要展示目标数量与实际 outcome", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "wait_agent", false, "plugin", INCARNATION_ID, {
+      tool: "wait_agent", target_count: 2, outcome: "woken",
+    }),
+  ], { viewport_height: 20 });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+
+  // 父输入唤醒是成功返回的工具调用：展示实际 outcome，不展示固定 wake_reason。
+  assert.match(body, /✓ wait_agent · 2 targets · woken\n/u);
+});
+
 test("wait_agent 目标 failed 与调用失败都使用前置错误状态", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,

@@ -16,6 +16,7 @@ import { createAgentFault } from "../src/agent-snapshot-codec.ts";
 import {
   registerAgentTools,
   SEND_MESSAGE_HANDOFF_NOTICE,
+  WAIT_PARENT_INPUT_WOKEN_NOTICE,
 } from "../src/agent-tools.ts";
 import type {
   RpcSupervisorCommandResult,
@@ -121,6 +122,16 @@ function renderRegisteredError(
     theme,
     { args, isError: true },
   ).render(120).join("\n");
+}
+
+function renderWaitDetails(tool: RegisteredAgentTool, details: unknown): string {
+  assert.ok(tool.renderResult);
+  return tool.renderResult(
+    { content: [], details },
+    {},
+    theme,
+    {},
+  ).render(160).join("\n");
 }
 
 const longMessage = [
@@ -494,6 +505,48 @@ test("wait_agent 主动取消展示 Pi 标准提示", () => {
   assert.equal(
     renderUnexpectedError("spawn_agent", "Operation aborted"),
     "internal_error: Operation aborted",
+  );
+});
+
+test("wait_agent woken 结果展示目标数量与固定唤醒原因，闭集外仍拒绝", () => {
+  const tool = registeredTool(makeEmptyController(), "wait_agent");
+  const agentId = "550e8400-e29b-41d4-a716-446655440000";
+  const secondAgentId = "550e8400-e29b-41d4-a716-446655440001";
+
+  assert.equal(
+    renderWaitDetails(tool, {
+      agent_ids: [agentId],
+      outcome: "woken",
+      wake_reason: "parent_input",
+    }),
+    "1 agents · woken · parent_input",
+  );
+  assert.equal(
+    renderWaitDetails(tool, {
+      agent_ids: [agentId, secondAgentId],
+      outcome: "woken",
+      wake_reason: "parent_input",
+    }),
+    "2 agents · woken · parent_input",
+  );
+
+  // 缺少目标或 outcome 不在闭集：仍走 invalidResult。
+  for (const details of [
+    { outcome: "woken", wake_reason: "parent_input" },
+    { agent_ids: [], outcome: "woken", wake_reason: "parent_input" },
+    { agent_ids: [agentId], outcome: "detached" },
+  ]) {
+    assert.equal(
+      renderWaitDetails(tool, details),
+      "internal_error: Internal controller error",
+      JSON.stringify(details),
+    );
+  }
+
+  // wake_reason 是固定值：不影响展示，woken 本身不被拒绝。
+  assert.equal(
+    renderWaitDetails(tool, { agent_ids: [agentId], outcome: "woken" }),
+    "1 agents · woken · parent_input",
   );
 });
 
@@ -995,4 +1048,74 @@ test("其余工具成功返回的 JSON 形态不变，不附带 notice 字段", 
     depth: 1,
     state: "idle",
   });
+});
+
+test("wait_agent 仅在 woken 结果附加顶层提示，其它结果不附加", async () => {
+  const fake = new HandoffSupervisor();
+  const controller = makeHandoffController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "唤醒提示测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  const tree = fake.tree;
+  assert.ok(tree);
+  const lifecycle = tree.getLifecycleGeneration(HANDOFF_AGENT_ID);
+  assert.equal(lifecycle.ok, true);
+  if (lifecycle.ok) {
+    tree.applyLifecycleEvent(HANDOFF_AGENT_ID, {
+      type: "agent_start",
+      expected_generation: lifecycle.data,
+    });
+  }
+
+  const tool = registeredTool(controller, "wait_agent");
+  assert.ok(tool.execute);
+  const pending = tool.execute(
+    "woken-notice-call",
+    { agent_ids: [HANDOFF_AGENT_ID], timeout_ms: 30_000 },
+    undefined,
+    undefined,
+    {},
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.wakeWaitersForParentInput();
+  const result = await pending as {
+    content: readonly { readonly type: string; readonly text: string }[];
+    details: unknown;
+  };
+
+  const wokenData = {
+    agent_ids: [HANDOFF_AGENT_ID],
+    outcome: "woken",
+    wake_reason: "parent_input",
+  };
+  assert.deepEqual(JSON.parse(result.content[0]!.text), {
+    ok: true,
+    data: wokenData,
+    notice: WAIT_PARENT_INPUT_WOKEN_NOTICE,
+  });
+  assert.deepEqual(result.details, wokenData);
+
+  // 真实事件结果（idle）不携带该提示。
+  const nextLifecycle = tree.getLifecycleGeneration(HANDOFF_AGENT_ID);
+  assert.equal(nextLifecycle.ok, true);
+  if (nextLifecycle.ok) {
+    tree.applyLifecycleEvent(HANDOFF_AGENT_ID, {
+      type: "agent_settled",
+      expected_generation: nextLifecycle.data,
+    });
+  }
+  const idle = await tool.execute(
+    "idle-notice-call",
+    { agent_ids: [HANDOFF_AGENT_ID], timeout_ms: 30_000 },
+    undefined,
+    undefined,
+    {},
+  ) as {
+    content: readonly { readonly type: string; readonly text: string }[];
+  };
+  const idleParsed = JSON.parse(idle.content[0]!.text) as Record<string, unknown>;
+  assert.equal("notice" in idleParsed, false);
+  const idleData = idleParsed.data as Record<string, unknown>;
+  assert.equal(idleData.agent_id, HANDOFF_AGENT_ID);
+  assert.equal(idleData.outcome, "idle");
+  assert.equal(idleData.state, "idle");
 });

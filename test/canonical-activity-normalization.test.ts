@@ -1806,6 +1806,22 @@ test("wait_agent 成功事实显示实际 outcome 与 batch release 事实，不
   if (multiTimeout.kind !== "event" || multiTimeout.event.type !== "tool_execution_end") return;
   assert.deepEqual(summaryOf(multiTimeout.event), { tool: "wait_agent", target_count: 3, outcome: "timeout" });
 
+  // 父输入唤醒与 timeout 同构：只保留目标事实与实际 outcome，wake_reason 不进入摘要。
+  const woken = normalizeOwnToolActivityEvent(
+    pluginEnd("wait_agent", {
+      details: {
+        agent_ids: [PLUGIN_CHILD_ID, WAIT_RELEASED_BY_ID],
+        outcome: "woken",
+        wake_reason: "parent_input",
+      },
+    }, false),
+    "plugin",
+    { agent_ids: [PLUGIN_CHILD_ID, WAIT_RELEASED_BY_ID] },
+  );
+  assert.equal(woken.kind, "event");
+  if (woken.kind !== "event" || woken.event.type !== "tool_execution_end") return;
+  assert.deepEqual(summaryOf(woken.event), { tool: "wait_agent", target_count: 2, outcome: "woken" });
+
   // batch release：释放者名称（解析命中时）与释放 outcome。
   const batch = normalizeOwnToolActivityEvent(
     pluginEnd("wait_agent", {
@@ -2104,6 +2120,16 @@ test("等待与控制摘要的 wire 闭集：未知键、非法目标与闭集�
     },
   };
   assert.equal(parseAgentActivityEvent(validWait).kind, "event");
+
+  // woken 属于 wait_agent 活动摘要闭集；wake_reason 不进入摘要。
+  assert.equal(parseAgentActivityEvent({
+    type: "tool_execution_end",
+    toolCallId: "call_1",
+    toolName: "wait_agent",
+    origin: "plugin",
+    isError: false,
+    summary: { tool: "wait_agent", target_count: 2, outcome: "woken" },
+  }).kind, "event");
 
   const invalidCases: readonly Record<string, unknown>[] = [
     // 未知键判违约。

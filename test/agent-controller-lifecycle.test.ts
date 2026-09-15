@@ -468,3 +468,125 @@ test("send_message 接纳后写入接收者父消息活动，未接纳不产生�
   assert.equal(repeated.length, 2);
   assert.notEqual(repeated[0]?.entry_id, repeated[1]?.entry_id);
 });
+
+test("父输入唤醒活跃 wait_agent 返回 woken 事实，不登记会话事件", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "唤醒测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+
+  const wait = controller.waitAgents({ agent_ids: [AGENT_ID], timeout_ms: 10_000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.wakeWaitersForParentInput();
+  const woken = await wait;
+  assert.deepEqual(woken, {
+    ok: true,
+    data: {
+      agent_ids: [AGENT_ID],
+      outcome: "woken",
+      wake_reason: "parent_input",
+    },
+  });
+
+  // 唤醒不改变目标状态；后续真实事件仍按原语义唤醒。
+  const working = tree.getStatus(AGENT_ID);
+  assert.equal(working.ok, true);
+  if (working.ok) assert.equal(working.data.state, "working");
+  assert.equal(controller.notifySessionEvent(AGENT_ID, "reply"), true);
+  const afterWake = await waitForEvent(controller);
+  assert.equal(afterWake.ok, true);
+  if (afterWake.ok) assert.equal(afterWake.data.outcome, "reply");
+});
+
+test("无活跃 waiter 时父输入唤醒是纯 no-op", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "空唤醒测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+
+  controller.wakeWaitersForParentInput();
+
+  // 不得留下任何待决事实：后续 wait 仍要等待真实事件。
+  const wait = waitForEvent(controller);
+  let settled = false;
+  void wait.then(() => { settled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  fake.emitReply("message", "真实事件");
+  const result = await wait;
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.data.outcome, "reply");
+});
+
+test("父输入唤醒投影树查询失败而不是 woken", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "唤醒失败测试" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+
+  const wait = controller.waitAgents({ agent_ids: [AGENT_ID], timeout_ms: 10_000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  // 直接推进树并清空终止记录：waiter 仍待决而后续树查询必然失败。
+  tree.applyLifecycleEvent(AGENT_ID, {
+    type: "terminate_accepted",
+    expected_generation: generation(tree),
+  });
+  tree.applyLifecycleEvent(AGENT_ID, {
+    type: "resources_confirmed",
+    expected_generation: generation(tree),
+  });
+  const terminated = tree.getStatus(AGENT_ID);
+  assert.equal(terminated.ok, true);
+  if (terminated.ok) assert.equal(terminated.data.state, "terminated");
+  assert.equal(tree.clearTerminatedRecords(), true);
+
+  // 控制器层没有 notice 概念："不附加 woken 提示"等价于结果必须是树查询失败本身。
+  controller.wakeWaitersForParentInput();
+  const result = await wait;
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.error.code, "agent_not_found");
+  assert.equal("outcome" in result, false);
+  assert.equal("data" in result, false);
+});
+
+test("父输入唤醒优先返回已就绪的真实事件", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  const spawned = await controller.spawnAgent({ template_id: "demo", name: "真实事件优先" });
+  assert.equal(spawned.ok, true, JSON.stringify(spawned));
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+
+  const idleWait = controller.waitAgents({ agent_ids: [AGENT_ID], timeout_ms: 10_000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  // 直接推进树快照：waiter 仍待决而真实结果已就绪，同步唤醒必须先投影真实事件。
+  tree.applyLifecycleEvent(AGENT_ID, {
+    type: "agent_settled",
+    expected_generation: generation(tree),
+  });
+  controller.wakeWaitersForParentInput();
+  const idle = await idleWait;
+  assert.equal(idle.ok, true);
+  if (idle.ok) {
+    assert.equal(idle.data.outcome, "idle");
+    assert.equal(idle.data.state, "idle");
+    assert.equal("agent_ids" in idle.data, false);
+  }
+
+  fake.emitLifecycle({ type: "agent_start", expected_generation: generation(tree) });
+  const terminalWait = controller.waitAgents({ agent_ids: [AGENT_ID], timeout_ms: 10_000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  tree.applyLifecycleEvent(AGENT_ID, {
+    type: "runtime_failed",
+    expected_generation: generation(tree),
+  });
+  controller.wakeWaitersForParentInput();
+  const terminal = await terminalWait;
+  assert.equal(terminal.ok, true);
+  if (terminal.ok) {
+    assert.equal(terminal.data.outcome, "terminal");
+    assert.equal(terminal.data.state, "failed");
+  }
+});

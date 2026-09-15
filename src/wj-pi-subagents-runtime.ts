@@ -1159,6 +1159,21 @@ export function createWjPiSubagentsRuntimeActivator(
       };
     });
 
+    // 父代理 steer 在消息入队前到达：同步唤醒本进程内所有活跃 wait waiter。
+    // Pi 会 await 该 handler 且无超时保护，因此它必须保持纯同步、无 I/O、
+    // 无登记、绝不抛错，并且不返回 handled/transform 让 Pi 改变入队语义。
+    api.on("input", (event) => {
+      try {
+        if (!isRecord(event)) return;
+        if (event.source !== "rpc" || event.streamingBehavior !== "steer") return;
+        const current = active;
+        if (current === undefined || !current.isChild || current.handoffPending === true) return;
+        current.controller?.wakeWaitersForParentInput();
+      } catch {
+        // 唤醒失败不能冒泡到 Pi 的 prompt preflight，也不能拖住父代理。
+      }
+    });
+
     api.on("context", (event, rawContext) => {
       const current = active;
       if (current === undefined || current.handoffPending === true) return;

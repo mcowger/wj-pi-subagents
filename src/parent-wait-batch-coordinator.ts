@@ -4,6 +4,7 @@ import type {
   WaitAgentEventOutcome,
   WaitAgentResult,
   WaitAgentTimeoutData,
+  WaitAgentWokenData,
 } from "./agent-controller.ts";
 import {
   WAIT_AGENT_MAX_TARGETS,
@@ -20,7 +21,11 @@ export interface WaitAgentBatchReleasedData {
   readonly released_by_outcome: WaitAgentEventOutcome;
 }
 
-export type WaitAgentToolData = WaitAgentData | WaitAgentTimeoutData | WaitAgentBatchReleasedData;
+export type WaitAgentToolData =
+  | WaitAgentData
+  | WaitAgentTimeoutData
+  | WaitAgentWokenData
+  | WaitAgentBatchReleasedData;
 export type WaitAgentToolResult = ControlResult<WaitAgentToolData>;
 
 interface WaitBatchToolContext {
@@ -117,6 +122,17 @@ export class ParentWaitBatchCoordinator {
           data: Object.freeze({
             agent_ids: prepared.input.agent_ids,
             outcome: "timeout" as const,
+          }),
+        });
+      }
+      if (shared.data.outcome === "woken") {
+        // 父输入唤醒与 timeout 同构：每个调用只返回自己的目标列表与固定原因。
+        return Object.freeze({
+          ok: true,
+          data: Object.freeze({
+            agent_ids: prepared.input.agent_ids,
+            outcome: "woken" as const,
+            wake_reason: "parent_input" as const,
           }),
         });
       }

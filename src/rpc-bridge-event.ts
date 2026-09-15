@@ -303,12 +303,13 @@ type WaitAgentSummaryOutcome =
   | "idle"
   | "terminal"
   | "timeout"
+  | "woken"
   | "batch_released";
 /** wait_agent 事件 outcome 闭集（batch release 的释放者 outcome）。 */
 type WaitAgentEventOutcomeName = "reply" | "final_report" | "idle" | "terminal";
 
 const WAIT_OUTCOME_NAMES: ReadonlySet<string> = new Set<WaitAgentSummaryOutcome>([
-  "reply", "final_report", "idle", "terminal", "timeout", "batch_released",
+  "reply", "final_report", "idle", "terminal", "timeout", "woken", "batch_released",
 ]);
 const WAIT_EVENT_OUTCOME_NAMES: ReadonlySet<string> = new Set<WaitAgentEventOutcomeName>([
   "reply", "final_report", "idle", "terminal",
@@ -1871,6 +1872,11 @@ function extractPluginToolSummary(
       const details = successDetails;
       const outcome = details?.outcome;
       if (typeof outcome !== "string" || !isWaitOutcomeName(outcome)) return undefined;
+      if (outcome === "woken") {
+        // 父输入唤醒与 timeout 同构：只保留目标事实与实际 outcome；
+        // wake_reason 是固定值，不进入活动摘要。
+        return { tool: "wait_agent", ...base, outcome };
+      }
       if (outcome === "batch_released") {
         const releasedBy = details?.released_by_agent_id;
         const releasedOutcome = details?.released_by_outcome;

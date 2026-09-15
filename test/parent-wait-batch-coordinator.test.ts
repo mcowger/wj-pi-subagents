@@ -291,6 +291,65 @@ test("wait_agent 批次取消传播 Operation aborted 且不改变目标状态",
   }
 });
 
+test("wait_agent 批次被父输入唤醒时各调用返回自己的目标与唤醒原因", async () => {
+  const { controller, tree } = makeController();
+  const firstSpawn = await controller.spawnAgent({ template_id: "demo", name: "first" });
+  const secondSpawn = await controller.spawnAgent({ template_id: "demo", name: "second" });
+  assert.equal(firstSpawn.ok, true);
+  assert.equal(secondSpawn.ok, true);
+
+  for (const agentId of [FIRST_AGENT_ID, SECOND_AGENT_ID]) {
+    tree.applyLifecycleEvent(agentId, {
+      type: "agent_start",
+      expected_generation: generation(tree, agentId),
+    });
+  }
+
+  const coordinator = new ParentWaitBatchCoordinator();
+  const context = batchContext();
+  try {
+    const first = coordinator.wait(
+      controller,
+      "wait-call-1",
+      { agent_ids: [FIRST_AGENT_ID], timeout_ms: 30_000 },
+      undefined,
+      context,
+    );
+    const second = coordinator.wait(
+      controller,
+      "wait-call-2",
+      { agent_ids: [SECOND_AGENT_ID], timeout_ms: 30_000 },
+      undefined,
+      context,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.wakeWaitersForParentInput();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.equal(firstResult.ok, true);
+    assert.equal(secondResult.ok, true);
+    if (firstResult.ok) {
+      assert.deepEqual(firstResult.data, {
+        agent_ids: [FIRST_AGENT_ID],
+        outcome: "woken",
+        wake_reason: "parent_input",
+      });
+      assert.equal("released_by_agent_id" in firstResult.data, false);
+    }
+    if (secondResult.ok) {
+      assert.deepEqual(secondResult.data, {
+        agent_ids: [SECOND_AGENT_ID],
+        outcome: "woken",
+        wake_reason: "parent_input",
+      });
+      assert.equal("released_by_agent_id" in secondResult.data, false);
+    }
+  } finally {
+    coordinator.clear();
+    controller.dispose();
+  }
+});
+
 test("wait_agent 批次对 persisted raw 和 prepared timeout 使用同一规范值", async () => {
   const { controller, tree } = makeController();
   const firstSpawn = await controller.spawnAgent({ template_id: "demo", name: "first" });
@@ -345,6 +404,53 @@ test("wait_agent 批次对 persisted raw 和 prepared timeout 使用同一规范
   } finally {
     clearTimeout(guard);
     coordinator.clear();
+    controller.dispose();
+  }
+});
+
+test("父输入唤醒在多目标部分就绪时返回已就绪的真实事件", async () => {
+  const { controller, tree } = makeController();
+  const firstSpawn = await controller.spawnAgent({ template_id: "demo", name: "first" });
+  const secondSpawn = await controller.spawnAgent({ template_id: "demo", name: "second" });
+  assert.equal(firstSpawn.ok, true);
+  assert.equal(secondSpawn.ok, true);
+
+  for (const agentId of [FIRST_AGENT_ID, SECOND_AGENT_ID]) {
+    tree.applyLifecycleEvent(agentId, {
+      type: "agent_start",
+      expected_generation: generation(tree, agentId),
+    });
+  }
+
+  try {
+    const wait = controller.waitAgents({
+      agent_ids: [FIRST_AGENT_ID, SECOND_AGENT_ID],
+      timeout_ms: 30_000,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // 只推进第一个目标：部分就绪必须投影真实事件而不是 woken。
+    tree.applyLifecycleEvent(FIRST_AGENT_ID, {
+      type: "agent_settled",
+      expected_generation: generation(tree, FIRST_AGENT_ID),
+    });
+    controller.wakeWaitersForParentInput();
+
+    const result = await wait;
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.data.outcome, "idle");
+      assert.equal("agent_ids" in result.data, false);
+      if (result.data.outcome === "idle") {
+        assert.equal(result.data.agent_id, FIRST_AGENT_ID);
+        assert.equal(result.data.state, "idle");
+        assert.equal(typeof result.data.revision, "number");
+      }
+    }
+    // 唤醒不得改动未就绪目标的快照。
+    const second = tree.getStatus(SECOND_AGENT_ID);
+    assert.equal(second.ok, true);
+    if (second.ok) assert.equal(second.data.state, "working");
+  } finally {
     controller.dispose();
   }
 });

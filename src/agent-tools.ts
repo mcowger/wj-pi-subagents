@@ -60,6 +60,15 @@ export const SEND_MESSAGE_HANDOFF_NOTICE =
   + "不得再对该范围进行任何直接处理，包括但不限于读取文件、搜索代码、执行命令、分析实现、修改内容、运行验证或自行补充调查；"
   + "不得以“只读操作”“确认细节”“降低风险”或“尽快完成”为理由介入。";
 
+/**
+ * wait_agent 被父代理输入唤醒时附带的移交提示；只在该次结果 outcome 为
+ * woken 时出现，不包含父代理消息正文或条数，也不表示目标已完成。
+ */
+export const WAIT_PARENT_INPUT_WOKEN_NOTICE =
+  "Released by an incoming message from the parent agent, not by any target event: "
+  + "the agents you are waiting for have not finished. The pending message will be delivered "
+  + "after this turn's tool calls finish; do not call wait_agent again in this turn.";
+
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];
 
 /** 公开工具错误使用稳定 JSON 外壳，不把异常、路径或句柄带回模型。 */
@@ -192,7 +201,7 @@ const descriptions: Readonly<Record<AgentToolName, string>> = Object.freeze({
   get_agent_templates: "List currently discovered and valid subagent templates as a JSON array. Each item includes template_id, optional description, and declared business tools. Do not call spawn_agent when the result is [].",
   spawn_agent: "Create a direct child subagent with a valid template_id and complete the startup handshake. Call get_agent_templates first; copy template_id exactly and preserve case. Do not guess, rewrite, or substitute description. Do not call spawn_agent when get_agent_templates returns []. After creation, use send_message to send the first task.",
   send_message: "Send a message or steering to a direct child subagent. accepted: true means only that the receiving accepted this message; it does not mean the model read it, started work, or completed processing. A delivery failure affects only this call and does not change lifecycle state. After receiving accepted: true, the parent agent must treat the task as delivered, must not resend the same task, and must cease any direct work on that scope.",
-  wait_agent: "Wait for the next independent reply, final_report, idle, or terminal event from one or more direct child subagents. If a target is already idle, failed, or terminated with no newer event, return its current stable state immediately. The result includes independent lifecycle state and revision, never task results or report text. batch_released is only a tool-call wrapper; timeout ends only this wait.",
+  wait_agent: "Wait for the next independent reply, final_report, idle, or terminal event from one or more direct child subagents. If a target is already idle, failed, or terminated with no newer event, return its current stable state immediately. The result includes independent lifecycle state and revision, never task results or report text. batch_released is only a tool-call wrapper; timeout ends only this wait. woken with wake_reason parent_input means this wait was released by an incoming message from the parent agent, not by any target event: the targets are still unfinished, and wait_agent must not be called again in that turn.",
   interrupt_agent: "Cooperatively interrupt the active Pi turn of a direct child subagent while preserving its node and context.",
   terminate_agent: "Permanently terminate a direct child subagent and its registered subtree, then confirm resource reclamation. Use only when you are sure the branch will not be reused.",
   get_agent_status: "Read the most recently confirmed safe status snapshot for a direct child subagent.",
@@ -300,6 +309,10 @@ export const CHILD_COORDINATION_SYSTEM_PROMPT = [
   "    - 报告内容：应包含父代理任务中要求包含的所有内容。",
   "    - 默认行为：任务完成时默认调用一次 `final_report`，除非父代理在任务消息中明确表示\"无需汇报\"。",
   "    - 语义：该工具调用构成发往父代理的最终报告，不会自动结束当前工作或生命周期。",
+  "  - `wait_agent`（等待子代理）：",
+  "    - 被父代理消息唤醒：父代理来信会让你正在进行的 `wait_agent` 提前返回，结果为 `outcome: \"woken\"`、`wake_reason: \"parent_input\"`。该结果不表示你等待的子代理已经完成。",
+  "    - 收到该结果后：不得在本回合再次调用 `wait_agent`；先让本回合的工具调用结束，父代理的消息会在下一次模型调用前送达。",
+  "    - 禁止：把 `woken` 当作子代理的完成结果；在同一个回合内重复等待。",
   "  - 禁止重复调用：",
   "    - 没有新增信息时，不得重复调用回传工具（`normal_reply` 和 `final_report`）。",
   "    - 同一内容不得同时调用 `normal_reply` 和 `final_report`，两者互斥。",
@@ -349,6 +362,24 @@ function toolResult<T>(result: ControlResult<T>, dataOnly = false, notice?: stri
   };
 }
 
+/** 静态文案或按成功结果动态决定的顶层 notice；非成功结果不进入该解析。 */
+type AgentToolSuccessNotice = string | ((data: unknown) => string | undefined);
+
+function resolveSuccessNotice(
+  notice: AgentToolSuccessNotice | undefined,
+  result: ControlResult<unknown>,
+): string | undefined {
+  if (typeof notice !== "function") return notice;
+  // 失败结果在 toolResult 内转换成 SubagentToolError，永远不携带 notice。
+  return result.ok ? notice(result.data) : undefined;
+}
+
+/** 只有父输入唤醒事实（与 timeout 同级）才附加专用提示。 */
+function isWokenWaitData(data: unknown): boolean {
+  return typeof data === "object" && data !== null
+    && (data as Record<string, unknown>).outcome === "woken";
+}
+
 async function controllerFor(
   provider: AgentToolControllerProvider,
   context: unknown,
@@ -375,7 +406,7 @@ function executeTool(
   dataOnly = false,
   lookups: AgentToolRenderLookups = {},
   prepareArguments?: (args: unknown) => unknown,
-  successNotice?: string,
+  successNotice?: AgentToolSuccessNotice,
 ): Record<string, unknown> {
   return {
     name,
@@ -401,11 +432,14 @@ function executeTool(
       signal: AbortSignal | undefined,
       _onUpdate: unknown,
       context: unknown,
-    ) => toolResult(await execute(await controllerFor(provider, context), params, {
-      toolCallId,
-      signal,
-      context,
-    }), dataOnly, successNotice),
+    ) => {
+      const result = await execute(await controllerFor(provider, context), params, {
+        toolCallId,
+        signal,
+        context,
+      });
+      return toolResult(result, dataOnly, resolveSuccessNotice(successNotice, result));
+    },
   };
 }
 
@@ -440,7 +474,8 @@ export function registerAgentTools(
     executeTool("spawn_agent", provider, async (controller, params) => controller.spawnAgent(params), false, lookups),
     executeTool("send_message", provider, async (controller, params) => controller.sendMessage(params), false, lookups, undefined, SEND_MESSAGE_HANDOFF_NOTICE),
     executeTool("wait_agent", provider, async (controller, params, call): Promise<WaitAgentToolResult> =>
-      waitBatchCoordinator.wait(controller, call.toolCallId, params, call.signal, call.context), false, lookups, prepareWaitAgentArguments),
+      waitBatchCoordinator.wait(controller, call.toolCallId, params, call.signal, call.context), false, lookups, prepareWaitAgentArguments,
+    (data) => isWokenWaitData(data) ? WAIT_PARENT_INPUT_WOKEN_NOTICE : undefined),
     executeTool("interrupt_agent", provider, async (controller, params) => {
       const agentId = readAgentId(params);
       return controller.interruptAgent(agentId);

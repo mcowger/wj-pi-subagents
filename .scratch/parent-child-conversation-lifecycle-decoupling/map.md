@@ -30,6 +30,7 @@ Label: wayfinder:map
 - [持续会话中的消息顺序与并发操作](issues/07-conversation-ordering-concurrency.md) — 取消消息级 FIFO、业务队列、`reply_seq`、ACK、发送窗口、去重和跨方向排序；三类发送都是独立同步 Pi 接纳操作，成功即交给 Pi，失败不改生命周期、不自动重试；控制/压缩屏障只拒绝其后的新调用。
 - [旧内部协议与运行时迁移边界](issues/08-migration-compatibility-boundary.md) — 本次是 clean break：旧 wire、v5 信封、旧运行实例和旧 lease 不兼容；版本不匹配立即报告 `protocol_mismatch` 并清理，不迁移在途消息或上下文；只允许同一新规格内的 reload lease 交接，不支持滚动升级。
 - [重构规格的验收不变量与回归边界](issues/09-acceptance-invariants-and-regressions.md) — 四层验收、七状态不变量、事件独立投影和 P0 竞态矩阵确定；旧任务/自动 final 语义测试删除或改写，clean-break 实现以全量 P0 通过为完成判据。
+- [父代理入站消息对阻塞中 wait_agent 的唤醒](issues/10-wait-wake-on-parent-input.md) — 子代理扩展用纯同步 `pi.on("input")` 观察父代理 steering 入站并唤醒全部活跃 waiter，真实事件优先、无 waiter 时为纯 no-op；`woken`/`parent_input` 属等待层释放事实，不进入会话事件闭集、不携带 `state`/`revision`，唤醒后本次等待立即结束。
 
 ## Not yet specified
 

@@ -508,6 +508,16 @@ function renderWaitResult(
       color: "warning",
     }], theme, context);
   }
+  if (outcome === "woken") {
+    // 父输入唤醒与 timeout 同构：目标未完成，因此使用 warning 而非 success。
+    // wake_reason 是固定值（parent_input），不参与展示判定。
+    const agentIds = readStringArray(details, "agent_ids");
+    if (agentIds === undefined || agentIds.length === 0) return invalidResult(theme, context);
+    return createSafeTextComponent([{
+      text: `${agentIds.length} agents · woken · parent_input`,
+      color: "warning",
+    }], theme, context);
+  }
   if (outcome === "batch_released") {
     const agentIds = readStringArray(details, "agent_ids");
     const releasedByAgentId = readOptionalString(details, "released_by_agent_id");

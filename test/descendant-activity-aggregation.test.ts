@@ -396,3 +396,275 @@ test("子模式扩展跨实例 reload 后恢复 display source generation 并轮
     await listener.close().catch(() => {});
   }
 });
+
+test("子运行时 input handler 只在 rpc steer 上唤醒且绝不抛错", async () => {
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const listener = await transportAdapter.listen({
+    agentId: CHILD_ID,
+    credential: LOCAL_CREDENTIAL,
+  });
+  const api = new FakeExtensionApi();
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  const hostCapabilities = {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.85.1",
+    platform: process.platform,
+    processTreeAdapter: {} as never,
+  } as AvailableHostCapabilities;
+  let controller: AgentController | undefined;
+  let parentChannel: StreamSupervisorChannel | undefined;
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment: childEnvironment(listener.endpoint),
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+    onController: (value) => {
+      controller = value;
+    },
+  });
+  const parentReady = (async () => {
+    const transport = await listener.waitForConnection(AbortSignal.timeout(2_000));
+    const channel = new StreamSupervisorChannel({
+      role: "parent",
+      rootId: ROOT_ID,
+      localAgentId: null,
+      peerAgentId: CHILD_ID,
+      parentAgentId: null,
+      depth: 1,
+      credential: SUPERVISOR_CREDENTIAL,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+      transport,
+      onReply: () => true,
+    });
+    parentChannel = channel;
+    const signal = AbortSignal.timeout(2_000);
+    await channel.bind(signal);
+    await channel.waitForReady(signal);
+  })();
+
+  try {
+    await activator(api as unknown as ExtensionApiSurface, hostCapabilities);
+    // session_start 之前 controller 未就绪：input 必须静默 no-op。
+    await api.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer" }, context);
+    await Promise.all([
+      api.emit("session_start", { type: "session_start", reason: "startup" }, context),
+      parentReady,
+    ]);
+    assert.ok(controller);
+
+    let wakeCount = 0;
+    const live = controller;
+    live.wakeWaitersForParentInput = () => {
+      wakeCount += 1;
+    };
+
+    for (const event of [
+      { type: "input", source: "interactive", streamingBehavior: "steer" },
+      { type: "input", source: "rpc" },
+      { type: "input", source: "rpc", streamingBehavior: "follow_up" },
+      { type: "input", source: "extension", streamingBehavior: "steer" },
+    ]) {
+      await api.emit("input", event, context);
+    }
+    assert.equal(wakeCount, 0);
+
+    await api.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer" }, context);
+    assert.equal(wakeCount, 1);
+
+    // 唤醒异常必须被整体吞掉：handler 不冒泡，也不影响后续事件。
+    live.wakeWaitersForParentInput = () => {
+      throw new Error("wake failed");
+    };
+    await api.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer" }, context);
+    await api.emit("turn_start", { type: "turn_start" }, context);
+  } finally {
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+    await parentChannel?.release().catch(() => {});
+    await listener.close().catch(() => {});
+  }
+});
+
+test("根运行时 input handler 不因 rpc steer 唤醒父消息 waiter", async () => {
+  const api = new FakeExtensionApi();
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  const hostCapabilities = {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.85.1",
+    platform: process.platform,
+    processTreeAdapter: {} as never,
+  } as AvailableHostCapabilities;
+  let controller: AgentController | undefined;
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment: {},
+    rootIdFactory: () => "root-input-handler-scope",
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+    onController: (value) => {
+      controller = value;
+    },
+  });
+
+  try {
+    await activator(api as unknown as ExtensionApiSurface, hostCapabilities);
+    await api.emit("session_start", { type: "session_start", reason: "startup" }, context);
+    assert.ok(controller);
+
+    let wakeCount = 0;
+    const live = controller;
+    live.wakeWaitersForParentInput = () => {
+      wakeCount += 1;
+    };
+
+    // 根会话没有父代理：即使命中 rpc steer，也不得产生 parent_input 唤醒。
+    await api.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer" }, context);
+    assert.equal(wakeCount, 0);
+  } finally {
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+  }
+});
+
+test("handoff pending 期间 rpc steer 输入不唤醒 waiter", async () => {
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const listener = await transportAdapter.listen({
+    agentId: CHILD_ID,
+    credential: LOCAL_CREDENTIAL,
+  });
+  // reload 交接只在存在 EventBus 时建立；同一扩展实例随后可在 reload 后接管旧树。
+  const reloadEventBus = new FakeReloadEventBus();
+  const api = new FakeExtensionApi(reloadEventBus);
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  const hostCapabilities = {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.85.1",
+    platform: process.platform,
+    processTreeAdapter: {} as never,
+  } as AvailableHostCapabilities;
+  let controller: AgentController | undefined;
+  let parentChannel: StreamSupervisorChannel | undefined;
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment: childEnvironment(listener.endpoint),
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+    onController: (value) => {
+      controller = value;
+    },
+  });
+  const parentReady = (async () => {
+    const transport = await listener.waitForConnection(AbortSignal.timeout(2_000));
+    const channel = new StreamSupervisorChannel({
+      role: "parent",
+      rootId: ROOT_ID,
+      localAgentId: null,
+      peerAgentId: CHILD_ID,
+      parentAgentId: null,
+      depth: 1,
+      credential: SUPERVISOR_CREDENTIAL,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+      transport,
+      onReply: () => true,
+    });
+    parentChannel = channel;
+    const signal = AbortSignal.timeout(2_000);
+    await channel.bind(signal);
+    await channel.waitForReady(signal);
+  })();
+
+  try {
+    await activator(api as unknown as ExtensionApiSurface, hostCapabilities);
+    await Promise.all([
+      api.emit("session_start", { type: "session_start", reason: "startup" }, context),
+      parentReady,
+    ]);
+    assert.ok(controller);
+
+    let wakeCount = 0;
+    const live = controller;
+    live.wakeWaitersForParentInput = () => {
+      wakeCount += 1;
+    };
+
+    // 对照：正常状态下 rpc steer 会唤醒。
+    await api.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer" }, context);
+    assert.equal(wakeCount, 1);
+
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }, context);
+    // handoff 交接走工具隐藏而非正常清树；这个事实同时证明 handoffPending 已置位。
+    assert.equal(api.getActiveTools().includes("wait_agent"), false);
+
+    await api.emit("input", { type: "input", source: "rpc", streamingBehavior: "steer" }, context);
+    assert.equal(wakeCount, 1);
+  } finally {
+    // quit 会 cancelHandoff，避免 reload lease 泄漏。
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+    await parentChannel?.release().catch(() => {});
+    await listener.close().catch(() => {});
+  }
+});
+
+test("子运行时协议版本与代码常量不一致时 session_start 被拒", async () => {
+  const api = new FakeExtensionApi();
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  const hostCapabilities = {
+    ok: true,
+    nodeVersion: process.versions.node,
+    piVersion: "0.85.1",
+    platform: process.platform,
+    processTreeAdapter: {} as never,
+  } as AvailableHostCapabilities;
+  const environment = {
+    ...childEnvironment("unused-endpoint"),
+    [RUNTIME_INTERNAL_ENV_KEYS.protocolVersion]: "wj-pi-subagents/0",
+  };
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment,
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+  });
+
+  await activator(api as unknown as ExtensionApiSurface, hostCapabilities);
+  // 身份元数据不完整不能被静默降级成根会话：必须稳定拒绝启动。
+  await assert.rejects(
+    api.emit("session_start", { type: "session_start", reason: "startup" }, context),
+    { message: "子运行时身份元数据无效" },
+  );
+});
