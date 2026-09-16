@@ -225,12 +225,12 @@ test("打开即回放全部规范条目历史", () => {
   assert.equal(viewer.getPublicState().event_count, 3);
 });
 
-test("模型调用失败条目折叠为一行 × Error: 错误文本首行", () => {
+test("模型调用失败条目折叠为一行 ▸ × Error: 错误文本首行", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     modelFailureEntry("401 unauthorized\nx-request-id: abc"),
   ], { viewport_height: 20 });
   const lines = viewer.render(160).slice(1, -1);
-  assert.deepEqual(lines.filter((line) => line.length > 0), ["× Error: 401 unauthorized"]);
+  assert.deepEqual(lines.filter((line) => line.length > 0), ["▸ × Error: 401 unauthorized"]);
   // 折叠态不带动 provider/model 或错误正文其余行。
   assert.doesNotMatch(lines[0] ?? "", /x-request-id|anthropic|claude/u);
   assert.equal(viewer.getPublicState().event_count, 1);
@@ -244,11 +244,76 @@ test("错误文本以空行开头时折叠行取第一个非空行", () => {
   ], { viewport_height: 20 });
   assert.deepEqual(
     viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
-    ["× Error: 429 rate limited"],
+    ["▸ × Error: 429 rate limited"],
   );
 });
 
-test("模型调用失败条目使用错误色与 × 图标，且当前不提供展开入口", () => {
+test("模型调用失败条目折叠行带展开标记，默认选中并沿用既有展开按键", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry("401 unauthorized\nx-request-id: abc"),
+  ], { viewport_height: 20 });
+  const selected = viewer.getSelectedKey();
+  assert.match(selected ?? "", /^model-call-failure:/u);
+  assert.deepEqual(viewer.getExpandedKeys(), []);
+  // 折叠态仍只有一行标题：不出现行数提示或额外说明文案。
+  assert.deepEqual(
+    viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+    ["▸ × Error: 401 unauthorized"],
+  );
+
+  // 沿用既有交互：Enter 展开当前选中项，左方向键折叠。
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expandLines = viewer.render(160).slice(1, -1).filter((line) => line.length > 0);
+  assert.equal(expandLines[0], "▾ × Error: 401 unauthorized");
+  assert.deepEqual(viewer.getExpandedKeys(), [selected]);
+
+  assert.equal(viewer.handleInput("\x1b[D"), "changed");
+  assert.deepEqual(
+    viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+    ["▸ × Error: 401 unauthorized"],
+  );
+});
+
+test("展开模型调用失败条目：首行 provider · model，其后为逐字保留换行与前导空白的错误原文", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry("401 unauthorized\n  x-request-id: abc\n\nsecond *literal* line"),
+  ], { viewport_height: 20 });
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const lines = viewer.render(160).slice(1, -1).filter((line) => line.length > 0);
+  assert.equal(lines[0], "▾ × Error: 401 unauthorized");
+  // 展开体逐行带引导线；空白行仍占一行、前导空白不被压缩、Markdown 不被解析。
+  assert.deepEqual(lines.slice(1).map((line) => line.trimEnd()), [
+    "│ anthropic · claude-sonnet-4-20250514",
+    "│ 401 unauthorized",
+    "│   x-request-id: abc",
+    "│",
+    "│ second *literal* line",
+  ]);
+});
+
+test("展开的失败正文按面板宽度软折行，宽度变化后按新宽度重新折行", () => {
+  const message = "provider said: " + "x".repeat(40);
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry(message),
+  ], { viewport_height: 20 });
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const bodyOf = (width: number): readonly string[] => viewer
+    .render(width)
+    .slice(1, -1)
+    .filter((line) => line.startsWith("│"))
+    .map((line) => line.replace(/^│ /u, ""));
+
+  const narrow = bodyOf(40);
+  const wide = bodyOf(160);
+  assert.deepEqual(wide, ["anthropic · claude-sonnet-4-20250514", message]);
+  assert.ok(narrow.length > wide.length, narrow.join("\n"));
+  // 宽度变化只改变折行位置，不改变正文内容与顺序。
+  const compact = (lines: readonly string[]): string => lines.join("").replace(/\s+/gu, "");
+  assert.equal(compact(narrow), compact(wide));
+  for (const line of narrow) assert.ok(displayWidth(`│ ${line}`) <= 40, `│ ${line}`);
+});
+
+test("模型调用失败条目使用错误色与 × 图标，并提供既有展开入口", () => {
   const theme = {
     fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
     bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
@@ -260,9 +325,34 @@ test("模型调用失败条目使用错误色与 × 图标，且当前不提供�
   const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
   assert.match(surface, /<fg:error>×<\/fg:error>/u);
   assert.match(surface, /<fg:error><bold>Error: boom<\/bold><\/fg:error>/u);
-  // 工单 01 只交付折叠行；展开体与折叠标记 `▸` 由展开体工单落地，
-  // 因此这里断言当前不输出任何展开标记。
-  assert.doesNotMatch(surface, /▸|▾/u, surface);
+  // 展开标记沿用工具条目同一套呈现：折叠 `▸`、展开后 `▾`。
+  assert.match(surface, /▸/u);
+  assert.doesNotMatch(surface, /▾/u, surface);
+
+  // 展开体与工具失败展开体同款：错误色预格式化正文，逐行带引导线。
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const expandedSurface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
+  assert.match(expandedSurface, /▾/u);
+  assert.match(expandedSurface, /<fg:error>│ anthropic · claude-sonnet-4-20250514/u);
+  assert.match(expandedSurface, /<fg:error>│ boom/u);
+});
+
+test("展开的失败正文与工具失败展开体同款：同样的错误文本逐行一致", () => {
+  const errorText = "Error: EACCES: permission denied\n  at open('/etc/hosts')\n\nsecond *literal* line";
+  const toolViewer = new AgentActivityViewerModel(viewerAgent(), [
+    toolEnd("t1", "write", true, "pi_native", INCARNATION_ID, { tool: "write", path: "/etc/hosts" }, errorText),
+  ], { viewport_height: 20 });
+  assert.equal(toolViewer.handleInput("\r"), "changed");
+  const toolBody = toolViewer.render(120).slice(1, -1).filter((line) => line.startsWith("│"));
+  assert.ok(toolBody.length > 1, toolBody.join("\n"));
+
+  const failureViewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry(errorText),
+  ], { viewport_height: 20 });
+  assert.equal(failureViewer.handleInput("\r"), "changed");
+  const failureBody = failureViewer.render(120).slice(1, -1).filter((line) => line.startsWith("│"));
+  // 首行是 provider · model 事实；其余行与工具失败展开体逐行相同。
+  assert.deepEqual(failureBody.slice(1), toolBody);
 });
 
 test("模型调用失败条目与既有条目按到达序共存且不影响其渲染", () => {
@@ -276,9 +366,9 @@ test("模型调用失败条目与既有条目按到达序共存且不影响其�
   const lines = viewer.render(160).slice(1, -1).filter((line) => line.length > 0);
   assert.deepEqual(lines, [
     "第一段正文",
-    "× Error: 配额用尽",
+    "▸ × Error: 配额用尽",
     "✓ read_file",
-    "× Error: 重试仍失败",
+    "▸ × Error: 重试仍失败",
   ]);
   assert.equal(viewer.getPublicState().event_count, 5);
   assert.match(viewer.render(160)[0] ?? "", /worker · worker-a · working/u);

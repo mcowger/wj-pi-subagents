@@ -355,7 +355,18 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
     }, cache.replay(CHILD_ID), { viewport_height: 20 });
     assert.deepEqual(
       viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
-      ["× Error: 401 unauthorized"],
+      ["▸ × Error: 401 unauthorized"],
+    );
+    // 展开体：首行 provider · model，其后为逐字保留换行的错误原文。
+    assert.equal(viewer.handleInput("\r"), "changed");
+    assert.deepEqual(
+      viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+      [
+        "▾ × Error: 401 unauthorized",
+        "│ anthropic · claude-sonnet-4-20250514",
+        "│ 401 unauthorized",
+        "│ x-request-id: abc",
+      ],
     );
 
     // 版本一致时活动链路不被判为无效帧，也不触发生命周期转换。

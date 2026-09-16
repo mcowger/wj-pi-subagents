@@ -130,7 +130,21 @@ type CachedBodyKind =
   | "guided-markdown-body"
   | "guided-markdown-terminal"
   | "guided-tool-error"
+  | "guided-model-call-failure"
   | "guided-shell-command";
+
+/** 预格式化正文：不解析 Markdown、不做字符截断，只按宽度软折行。 */
+function isPreformattedBodyKind(kind: CachedBodyKind): boolean {
+  return kind === "guided-tool-error"
+    || kind === "guided-model-call-failure"
+    || kind === "guided-shell-command";
+}
+
+/** 正文块行样式：工具失败与模型调用失败共用面板既有的错误色。 */
+function cachedBodyStyle(kind: CachedBodyKind): UiPanelLineStyle {
+  if (kind === "guided-tool-error" || kind === "guided-model-call-failure") return "error";
+  return kind.includes("terminal") ? "terminal" : "body";
+}
 
 interface CachedBodySpec {
   readonly key: string;
@@ -339,13 +353,9 @@ class CachedViewerBodyBlock {
     const kind = this.kind!;
     const source = this.source!;
     const safe = this.getSafeSource();
-    const preformatted = kind === "guided-tool-error" || kind === "guided-shell-command";
+    const preformatted = isPreformattedBodyKind(kind);
     const guided = kind.startsWith("guided-");
-    const style: UiPanelLineStyle = kind === "guided-tool-error"
-      ? "error"
-      : kind.includes("terminal")
-        ? "terminal"
-        : "body";
+    const style = cachedBodyStyle(kind);
     let layout: CachedBodyWidthLayout;
     if (preformatted || isPlainMarkdownSource(safe)) {
       const plain = new PlainTextBodyLayout(
@@ -508,6 +518,11 @@ function toolCommandKey(entryId: string): string {
 
 function parentMessageKey(entryId: string): string {
   return `parent-message:${entryId}`;
+}
+
+/** 模型调用失败条目的展开身份：折叠行与展开体共用同一稳定键。 */
+function modelCallFailureKey(entryId: string): string {
+  return `model-call-failure:${entryId}`;
 }
 
 function liveThinkingKey(draftKey: string, contentIndex: number): string {
@@ -1054,7 +1069,8 @@ export class AgentActivityViewerModel {
       || key.startsWith("tool-error:")
       || key.startsWith("tool-message:")
       || key.startsWith("tool-command:")
-      || key.startsWith("parent-message:");
+      || key.startsWith("parent-message:")
+      || key.startsWith("model-call-failure:");
   }
 
   private replayPrefixMatches(replay: readonly CanonicalAgentActivityEntry[]): boolean {
@@ -1122,13 +1138,15 @@ export class AgentActivityViewerModel {
       }
 
       if (body.type === "model_call_failure") {
-        // 失败条目只服务活动显示：折叠态只需错误文本首行，provider 与 model
-        // 留在权威正文里，不参与本层投影。
+        // 失败条目只服务活动显示：折叠态用错误文本首行，展开体用 provider、
+        // model 与错误文本原文。
         entries.push({
           kind: "model_call_failure",
           entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
           message: body.message,
+          provider: body.provider,
+          model: body.model,
         });
         continue;
       }
@@ -1432,12 +1450,22 @@ export class AgentActivityViewerModel {
         }
 
         if (entry.kind === "model_call_failure") {
+          const key = modelCallFailureKey(entry.entryId);
+          const expanded = this.expandedKeys.has(key);
           const label = `${MODEL_CALL_FAILURE_TITLE_PREFIX} ${firstLine(entry.message)}`;
           addDynamicLine((width) => toolTitleLine({
             label,
             visual: MODEL_CALL_FAILURE_VISUAL,
             width,
-          }));
+            key,
+            expanded,
+          }), key);
+          addMaybeExpandedCached(
+            expanded,
+            `model-call-failure:${entry.incarnationId}:${entry.entryId}`,
+            "guided-model-call-failure",
+            modelCallFailureBodySource(entry.provider, entry.model, entry.message),
+          );
           continue;
         }
 
@@ -1618,6 +1646,8 @@ type DisplayEntry =
       readonly entryId: string;
       readonly incarnationId: string;
       readonly message: string;
+      readonly provider: string;
+      readonly model: string;
     }
   | {
       readonly kind: "live";
@@ -1872,7 +1902,8 @@ function renderCachedBodyBlock(
     case "guided-markdown-terminal":
       return renderGuidedBody(width, (bodyWidth) => renderMarkdownBlock(source, bodyWidth, "terminal"));
     case "guided-tool-error":
-      return renderGuidedBody(width, (bodyWidth) => renderToolErrorBody(source, bodyWidth));
+    case "guided-model-call-failure":
+      return renderGuidedBody(width, (bodyWidth) => renderPreformattedErrorBody(source, bodyWidth));
     case "guided-shell-command":
       return renderGuidedBody(width, (bodyWidth) => renderShellCommandBody(source, bodyWidth));
   }
@@ -1895,10 +1926,19 @@ function firstLine(value: string): string {
 }
 
 /**
+ * 模型调用失败展开体：首行为 `provider · model`，其后为错误文本原文。整段
+ * 作为一块预格式化正文渲染，因此换行、前导空白与软折行行为与工具失败一致。
+ */
+function modelCallFailureBodySource(provider: string, model: string, message: string): string {
+  return `${provider}${SUMMARY_SEPARATOR}${model}\n${message}`;
+}
+
+/**
  * 工具错误正文：红色预格式化纯文本。不解析 Markdown、不做语义摘要或字符
  * 截断，只按正文宽度软换行，保留换行与可读空白；调用方统一添加引导线。
+ * 模型调用失败展开体复用同一渲染。
  */
-function renderToolErrorBody(
+function renderPreformattedErrorBody(
   errorText: string,
   width: number,
 ): readonly ViewerSemanticLine[] {
