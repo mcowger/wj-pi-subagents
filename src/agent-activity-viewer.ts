@@ -50,6 +50,8 @@ const WAIT_AGENT_RUNNING_TEXT = "…";
 const FROZEN_DRAFT_ELLIPSIS = "…";
 const EMPTY_ACTIVITY_TEXT = "No cached activity yet";
 const OLDER_ACTIVITY_OMITTED_TEXT = "Older activity omitted";
+/** 模型调用失败条目的折叠前缀；错误与已中止两种收尾同形。 */
+const MODEL_CALL_FAILURE_TITLE_PREFIX = "Error:";
 const VIEWER_HEADER_TEXT = "AGENT ACTIVITY";
 const VIEWER_FOOTER_TEXT = "↑↓ scroll · Tab/Shift+Tab select · Enter expand · Home/End jump · Esc back";
 const RENDER_VIEWER_LINES = Symbol("renderViewerLines");
@@ -426,6 +428,12 @@ interface ToolDisplayEntry {
 }
 
 /**
+ * 失败事实的统一视觉：`×` 图标与错误色。工具失败与模型调用失败各自携带
+ * 不同语义，但折叠行呈现完全相同。
+ */
+const FAILURE_VISUAL = Object.freeze({ icon: "×", style: "error" as const });
+
+/**
  * 标题使用统一展开标记和强调样式，工具状态图标固定在标题前缀。状态视觉为：
  * 运行中 `↻` 强调色、成功 `✓` 弱化色、失败 `×` 错误色；收束警告与
  * terminated 继续保留各自语义。
@@ -437,7 +445,7 @@ const TOOL_STATE_VISUALS: Readonly<Record<ToolRunState["phase"], {
 }>> = Object.freeze({
   running: Object.freeze({ icon: "↻", style: "accent" as const }),
   success: Object.freeze({ icon: "✓", style: "terminal" as const }),
-  failure: Object.freeze({ icon: "×", style: "error" as const }),
+  failure: FAILURE_VISUAL,
   unavailable: Object.freeze({ icon: "⚠", style: "warning" as const, suffix: "result unavailable" }),
   terminated: Object.freeze({
     icon: "○",
@@ -448,6 +456,12 @@ const TOOL_STATE_VISUALS: Readonly<Record<ToolRunState["phase"], {
 
 /** terminate_agent 强制回收成功：警告而非失败，成功结果与风险事实同时保留。 */
 const TOOL_FORCED_VISUAL = Object.freeze({ icon: "⚠", style: "warning" as const });
+
+/**
+ * 模型调用失败条目与工具失败同形：同一 `×` 图标与错误色；它与工具失败
+ * 不共享错误码/正文语义，只是复用同一套呈现。
+ */
+const MODEL_CALL_FAILURE_VISUAL = FAILURE_VISUAL;
 
 /**
  * 工具条目的显示视觉。运行状态机语义不变；只有来源验证通过的专用摘要在
@@ -1107,6 +1121,18 @@ export class AgentActivityViewerModel {
         continue;
       }
 
+      if (body.type === "model_call_failure") {
+        // 失败条目只服务活动显示：折叠态只需错误文本首行，provider 与 model
+        // 留在权威正文里，不参与本层投影。
+        entries.push({
+          kind: "model_call_failure",
+          entryId: entry.entry_id,
+          incarnationId: entry.incarnation_id,
+          message: body.message,
+        });
+        continue;
+      }
+
       if (body.type === "tool_execution_start") {
         // 旧 replay 可包含 start/end 两个事实，按运行实例、toolCallId 与
         // executionGeneration 合并；缺省代次 1 保持旧条目兼容。
@@ -1405,6 +1431,16 @@ export class AgentActivityViewerModel {
           continue;
         }
 
+        if (entry.kind === "model_call_failure") {
+          const label = `${MODEL_CALL_FAILURE_TITLE_PREFIX} ${firstLine(entry.message)}`;
+          addDynamicLine((width) => toolTitleLine({
+            label,
+            visual: MODEL_CALL_FAILURE_VISUAL,
+            width,
+          }));
+          continue;
+        }
+
         const visual = toolDisplayVisual(entry);
         // 工具摘要统一作为标题：状态图标位于标题前缀；可展开项顺序为折叠符、
         // 状态图标、摘要，不可展开项由状态图标占据最左侧。
@@ -1575,6 +1611,13 @@ type DisplayEntry =
       readonly entryId: string;
       readonly incarnationId: string;
       readonly content: readonly SafeAgentActivityContentBlock[];
+    }
+  | {
+      /** 一次模型调用失败的活动事实；每次失败尝试各自成条。 */
+      readonly kind: "model_call_failure";
+      readonly entryId: string;
+      readonly incarnationId: string;
+      readonly message: string;
     }
   | {
       readonly kind: "live";
@@ -1839,6 +1882,16 @@ const PARENT_MESSAGE_TITLE = "Parent message";
 
 function wrapPlainText(value: string, width: number): readonly string[] {
   return Object.freeze(value.split("\n").flatMap((line) => wrapPlainLine(line, width)));
+}
+
+/**
+ * 错误文本首行：跳过开头的空行后取第一段，不裁剪其后的空白、不摘要、
+ * 不加省略号。
+ */
+function firstLine(value: string): string {
+  const fromFirstLine = value.replace(/^\n+/u, "");
+  const breakIndex = fromFirstLine.indexOf("\n");
+  return breakIndex < 0 ? fromFirstLine : fromFirstLine.slice(0, breakIndex);
 }
 
 /**

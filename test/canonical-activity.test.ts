@@ -46,7 +46,7 @@ function validEntry(overrides: Partial<CanonicalAgentActivityEntry> = {}): Canon
 }
 
 test("规范条目契约版本是固定字符串，解析器只接受当前版本", () => {
-  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/11");
+  assert.equal(CANONICAL_ACTIVITY_CONTRACT_VERSION, "wj-pi-subagents.activity/12");
   assert.equal(parseCanonicalAgentActivityEntry(validEntry()).kind, "entry");
 
   const legacy = Object.freeze({ ...validEntry(), contract_version: "wj-pi-subagents.activity/7" });
@@ -183,6 +183,75 @@ test("assistant 消息的 canonical 关联必须携带完整有序 displayStream
       }),
     }),
   })).kind, "invalid");
+});
+
+test("/12 canonical wire 接受模型调用失败条目并保留四个字段", () => {
+  const body = Object.freeze({
+    type: "model_call_failure" as const,
+    failure: "error" as const,
+    message: "401 unauthorized",
+    provider: "anthropic",
+    model: "claude-sonnet-4-20250514",
+  });
+  const parsed = parseCanonicalAgentActivityEntry(validEntry({ body }));
+  assert.equal(parsed.kind, "entry");
+  if (parsed.kind === "entry") {
+    assert.equal(parsed.entry.contract_version, CANONICAL_ACTIVITY_CONTRACT_VERSION);
+    assert.deepEqual(parsed.entry.body, {
+      type: "model_call_failure",
+      failure: "error",
+      message: "401 unauthorized",
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    });
+  }
+  // 已中止收尾在契约层同样合法（采集面由采集边界工单补齐）。
+  assert.equal(
+    parseCanonicalAgentActivityEntry(validEntry({ body: { ...body, failure: "aborted" } as never })).kind,
+    "entry",
+  );
+});
+
+test("/12 canonical wire 对模型调用失败条目执行固定字段闭集校验", () => {
+  const body = {
+    type: "model_call_failure",
+    failure: "error",
+    message: "boom",
+    provider: "anthropic",
+    model: "claude-sonnet-4-20250514",
+  };
+  assert.equal(parseCanonicalAgentActivityEvent(body).kind, "event");
+  assert.equal(parseAgentActivityEvent(body).kind, "event");
+  // 四字段一次定死：额外键、缺键、值域外收尾原因与空字符串都违约。
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, extra: true }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, displayStream: undefined }).kind, "invalid");
+  const { model: _model, ...missingModel } = body;
+  assert.equal(parseCanonicalAgentActivityEvent(missingModel).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, failure: "cancelled" }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, failure: undefined }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, message: "" }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, provider: "" }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, model: "" }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, provider: 42 }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, message: 42 }).kind, "invalid");
+});
+
+test("/12 长错误文本的失败条目仍按身份分块并可完整重组", () => {
+  const text = "provider payload\n".repeat(6_000);
+  const entry = validEntry({
+    body: Object.freeze({
+      type: "model_call_failure" as const,
+      failure: "error" as const,
+      message: text,
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    }),
+  });
+  const frames = chunkCanonicalAgentActivityEntry(entry, 32 * 1024) as CanonicalAgentActivityChunk[];
+  assert.ok(frames.length > 1, `期望多帧，实际 ${frames.length}`);
+  const reassembled = reassembleCanonicalAgentActivityChunks(frames);
+  assert.ok(reassembled);
+  assert.deepEqual(reassembled.body, entry.body);
 });
 
 test("规范条目校验代理身份、运行实例身份、条目身份与原子正文闭集", () => {

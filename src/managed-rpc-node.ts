@@ -7,6 +7,7 @@ import type { AgentSnapshot } from "./tree-controller.ts";
 import { SUPERVISOR_CHANNEL_LIMITS } from "./supervisor-channel.ts";
 import {
   ACTIVITY_MAX_TEXT_BYTES,
+  isSafeModelCallFailureReason,
   isSafeToolOrigin,
   isValidToolExecutionGeneration,
 } from "./rpc-bridge-event.ts";
@@ -1056,6 +1057,8 @@ function isSafeBridgeEvent(value: unknown): boolean {
         && Object.keys(value).every((key) => key === "type" || key === "pendingMessageCount");
     case "message":
       return isSafeActivityMessageEvent(value);
+    case "model_call_failure":
+      return isSafeModelCallFailureEvent(value);
     case "tool_execution_start":
     case "tool_execution_end":
       return isSafeActivityToolEvent(value);
@@ -1108,6 +1111,28 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
   ) return false;
   if (!isSafeToolOrigin(value.origin)) return false;
   return value.type === "tool_execution_start" || typeof value.isError === "boolean";
+}
+
+/**
+ * 模型调用失败事件按固定字段集合校验：桥接帧闭集与产生端归一化保持同一
+ * 形状，避免同一事件在发布侧合法、在接收侧变成通道故障。
+ */
+function isSafeModelCallFailureEvent(value: Record<string, unknown>): boolean {
+  if (!Object.keys(value).every((key) => [
+    "type",
+    "failure",
+    "message",
+    "provider",
+    "model",
+  ].includes(key))) return false;
+  if (!isSafeModelCallFailureReason(value.failure)) return false;
+  return isActivityTextShape(value.message) && value.message.length > 0
+    && isBoundedIdentityShape(value.provider) && isBoundedIdentityShape(value.model);
+}
+
+/** provider 与 model 身份是短引用：非空且不超过工具身份同款上限。 */
+function isBoundedIdentityShape(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256;
 }
 
 /**

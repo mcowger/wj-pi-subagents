@@ -79,6 +79,28 @@ function toolEntry(
   });
 }
 
+function modelCallFailureEntry(
+  agentId: string,
+  message: string,
+  entryId: string = randomUUID(),
+  incarnationId: string = randomUUID(),
+  failure: "error" | "aborted" = "error",
+): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: incarnationId,
+    entry_id: entryId,
+    body: Object.freeze({
+      type: "model_call_failure" as const,
+      failure,
+      message,
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    }),
+  });
+}
+
 test("活动缓存按 agent_id 追加规范条目，并按到达序全量回放", () => {
   const cache = new AgentActivityCache();
   const first = messageEntry(AGENT_A, "第一条");
@@ -101,6 +123,66 @@ test("活动缓存按 agent_id 追加规范条目，并按到达序全量回放"
   cache.append(AGENT_A, second);
 
   assert.deepEqual(cache.replay(AGENT_A), [first, toolEntry, second]);
+});
+
+test("模型调用失败条目作为独立原子按到达序回放，不合并也不去重", () => {
+  const cache = new AgentActivityCache();
+  const incarnationId = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+  const first = modelCallFailureEntry(AGENT_A, "配额用尽", "11111111-1111-4111-8111-111111111111", incarnationId);
+  const second = modelCallFailureEntry(AGENT_A, "配额用尽", "22222222-2222-4222-8222-222222222222", incarnationId);
+  const text = messageEntry(AGENT_A, "重试后的正文");
+
+  assert.equal(cache.record(AGENT_A, first).disposition, "appended");
+  assert.equal(cache.record(AGENT_A, text).disposition, "appended");
+  assert.equal(cache.record(AGENT_A, second).disposition, "appended");
+
+  // 两次失败尝试内容相同也各自成条，顺序即到达顺序。
+  assert.deepEqual(cache.replay(AGENT_A), [first, text, second]);
+  assert.equal(cache.snapshot(AGENT_A).entries.length, 3);
+
+  // 同一条目身份重复到达幂等；同身份不同正文是稳定身份冲突，不覆盖。
+  assert.equal(cache.record(AGENT_A, first).disposition, "duplicate");
+  const conflict = modelCallFailureEntry(
+    AGENT_A,
+    "不同的错误",
+    "11111111-1111-4111-8111-111111111111",
+    incarnationId,
+  );
+  assert.equal(cache.record(AGENT_A, conflict).accepted, false);
+  assert.deepEqual(cache.replay(AGENT_A), [first, text, second]);
+});
+
+test("模型调用失败条目在窗口裁剪与墓碑裁决上与既有条目同等待遇", () => {
+  const cache = new AgentActivityCache();
+  const incarnationId = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+  const entries: CanonicalAgentActivityEntry[] = [];
+  for (let index = 0; index < 101; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    const entry = modelCallFailureEntry(
+      AGENT_A,
+      `尝试失败 ${index}`,
+      `33333333-3333-4333-8333-${suffix}${suffix}${suffix}${suffix}`,
+      incarnationId,
+    );
+    entries.push(entry);
+    assert.equal(cache.record(AGENT_A, entry).accepted, true);
+  }
+  const snapshot = cache.snapshot(AGENT_A);
+  assert.equal(snapshot.entries.length, 100);
+  assert.equal(snapshot.olderActivityOmitted, true);
+  assert.deepEqual(snapshot.entries.at(-1), entries.at(-1));
+
+  // 被淘汰条目由墓碑吸收：重复事实不重新占用窗口，冲突事实被拒绝。
+  const beforeReplay = cache.replay(AGENT_A);
+  assert.equal(cache.record(AGENT_A, entries[0]!).disposition, "duplicate");
+  assert.deepEqual(cache.replay(AGENT_A), beforeReplay);
+  assert.equal(cache.record(AGENT_A, modelCallFailureEntry(
+    AGENT_A,
+    "不同的错误正文",
+    "33333333-3333-4333-8333-000000000000",
+    incarnationId,
+  )).accepted, false);
+  assert.deepEqual(cache.replay(AGENT_A), beforeReplay);
 });
 
 test("修订号随追加单调递增，未知代理回放为空且修订号为 0", () => {

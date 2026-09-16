@@ -44,7 +44,7 @@ export interface AgentActivityRecordResult {
 
 export type AgentActivityResult = AgentActivityRecordResult;
 
-type ActivityAtomKind = "message" | "parent_message" | "tool";
+type ActivityAtomKind = "message" | "parent_message" | "tool" | "model_call_failure";
 type ActivityAtomState = "running" | "settled" | "completed";
 
 interface ToolIdentity {

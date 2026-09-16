@@ -324,6 +324,49 @@ test("活动流上行不影响既有活动阶段与工具配对跟踪", async ()
   }
 });
 
+test("版本一致时监督通道在发布侧与接收侧都接受模型调用失败条目", async () => {
+  const { supervisor, channels, cleanup } = setup();
+  const events: RpcSupervisorEvent[] = [];
+  const faults: unknown[] = [];
+  const unsubscribe = supervisor.onEvent((event) => events.push(event));
+  const unsubscribeChildFault = channels.child.onFault((fault) => faults.push(fault));
+  const unsubscribeParentFault = channels.parent.onFault((fault) => faults.push(fault));
+  const signal = new AbortController().signal;
+  try {
+    const startup = supervisor.start();
+    await channels.child.bind(signal);
+    assert.equal((await startup).ok, true);
+
+    const entry: CanonicalAgentActivityEntry = Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: CHILD_ID,
+      incarnation_id: randomUUID(),
+      entry_id: randomUUID(),
+      body: Object.freeze({
+        type: "model_call_failure" as const,
+        failure: "error" as const,
+        message: "provider payload\n".repeat(4_000),
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      }),
+    });
+    await channels.child.publishActivity({ entry });
+
+    // 大错误正文按身份分块上行；接收侧重组出的条目与发布侧逐字一致。
+    const deliveries = events.filter((event): event is Extract<RpcSupervisorEvent, { kind: "activity_stream" }> =>
+      event.kind === "activity_stream");
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0]?.agent_id, CHILD_ID);
+    assert.deepEqual(deliveries[0]?.entry, entry);
+    assert.deepEqual(faults, []);
+  } finally {
+    unsubscribe();
+    unsubscribeChildFault();
+    unsubscribeParentFault();
+    await cleanup();
+  }
+});
+
 test("监督通道活动帧经 RpcSupervisor 分发为带 agent_id 的规范条目", async () => {
   const { supervisor, channels, cleanup } = setup();
   const events: RpcSupervisorEvent[] = [];

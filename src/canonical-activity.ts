@@ -9,7 +9,7 @@ import { isCanonicalUuid } from "./tree-controller.ts";
  * 规范活动条目契约版本。版本字符串随原子正文或身份语义的不兼容变化递增；
  * 旧版本条目不得与当前运行实例混用，接收端按协议故障处理。
  */
-export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/11";
+export const CANONICAL_ACTIVITY_CONTRACT_VERSION = "wj-pi-subagents.activity/12";
 
 /**
  * 工具活动条目身份的派生命名空间。工具开始与结束是同一条目的状态事实，
@@ -33,7 +33,7 @@ export function deriveNamespaceUuid(namespace: string, name: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
-/** 规范活动条目的原子正文闭集：assistant 消息与工具活动状态事实。 */
+/** 规范活动条目的原子正文闭集：assistant 消息、父消息、工具活动与模型调用失败事实。 */
 export type CanonicalActivityBody = SafeAgentActivityEvent;
 
 /**

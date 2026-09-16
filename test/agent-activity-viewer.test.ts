@@ -58,6 +58,26 @@ function textMessage(text: string): CanonicalAgentActivityEntry {
   return messageEntry([{ type: "text", text }]);
 }
 
+function modelFailureEntry(
+  message: string,
+  failure: "error" | "aborted" = "error",
+  entryId: string = randomUUID(),
+): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: INCARNATION_ID,
+    entry_id: entryId,
+    body: Object.freeze({
+      type: "model_call_failure" as const,
+      failure,
+      message,
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    }),
+  });
+}
+
 function toolStart(
   toolCallId: string,
   toolName: string,
@@ -203,6 +223,84 @@ test("打开即回放全部规范条目历史", () => {
   assert.ok(lines.some((line) => line.includes("line4")));
   assert.ok(lines.some((line) => line.includes("read_file")), lines.join("\n"));
   assert.equal(viewer.getPublicState().event_count, 3);
+});
+
+test("模型调用失败条目折叠为一行 × Error: 错误文本首行", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry("401 unauthorized\nx-request-id: abc"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1);
+  assert.deepEqual(lines.filter((line) => line.length > 0), ["× Error: 401 unauthorized"]);
+  // 折叠态不带动 provider/model 或错误正文其余行。
+  assert.doesNotMatch(lines[0] ?? "", /x-request-id|anthropic|claude/u);
+  assert.equal(viewer.getPublicState().event_count, 1);
+  // 失败条目只服务历史显示，不抢实时草稿的空白投影。
+  assert.deepEqual(viewer.getExpandedKeys(), []);
+});
+
+test("错误文本以空行开头时折叠行取第一个非空行", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry("\n\n429 rate limited\nretry-after: 5"),
+  ], { viewport_height: 20 });
+  assert.deepEqual(
+    viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+    ["× Error: 429 rate limited"],
+  );
+});
+
+test("模型调用失败条目使用错误色与 × 图标，且当前不提供展开入口", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [modelFailureEntry("boom")], {
+    viewport_height: 20,
+  });
+  const surface = renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
+  assert.match(surface, /<fg:error>×<\/fg:error>/u);
+  assert.match(surface, /<fg:error><bold>Error: boom<\/bold><\/fg:error>/u);
+  // 工单 01 只交付折叠行；展开体与折叠标记 `▸` 由展开体工单落地，
+  // 因此这里断言当前不输出任何展开标记。
+  assert.doesNotMatch(surface, /▸|▾/u, surface);
+});
+
+test("模型调用失败条目与既有条目按到达序共存且不影响其渲染", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    textMessage("第一段正文"),
+    modelFailureEntry("配额用尽"),
+    toolStart("t1", "read_file"),
+    toolEnd("t1", "read_file", false),
+    modelFailureEntry("重试仍失败"),
+  ], { viewport_height: 20 });
+  const lines = viewer.render(160).slice(1, -1).filter((line) => line.length > 0);
+  assert.deepEqual(lines, [
+    "第一段正文",
+    "× Error: 配额用尽",
+    "✓ read_file",
+    "× Error: 重试仍失败",
+  ]);
+  assert.equal(viewer.getPublicState().event_count, 5);
+  assert.match(viewer.render(160)[0] ?? "", /worker · worker-a · working/u);
+});
+
+test("超宽失败行按面板既有规则右侧省略", () => {
+  const width = 40;
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    modelFailureEntry("provider said: " + "x".repeat(200)),
+  ], { viewport_height: 20 });
+  const line = viewer.render(width).slice(1, -1)[0] ?? "";
+  assert.ok(displayWidth(line) <= width, line);
+  assert.match(line, /…$/u);
+});
+
+test("模型调用失败条目不进入实时显示草稿投影", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [modelFailureEntry("boom")], {
+    viewport_height: 20,
+  });
+  const body = viewer.render(160).slice(1, -1).join("\n");
+  assert.doesNotMatch(body, /Thinking|streaming/u);
+  assert.deepEqual(viewer.getPublicState().event_count, 1);
 });
 
 test("snapshot 同槽位把工具 start 原地更新为 end，并按 revision 幂等", () => {

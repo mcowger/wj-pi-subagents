@@ -1100,6 +1100,10 @@ export class RpcSupervisor {
         return;
       case "message":
         return;
+      case "model_call_failure":
+        // 模型调用失败条目只由 child 扩展沿监督通道上行；RPC 副本只服务
+        // 既有生命周期与阶段跟踪，不在父端缓存第二次。
+        return;
       case "message_end":
         // 回复只能由真正 child 扩展经监督通道上行；任务 RPC 事件不再发布回复。
         return;

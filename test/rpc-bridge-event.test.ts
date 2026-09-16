@@ -425,6 +425,85 @@ test("空正文块被跳过，全空消息按 ignored 处理而不中断桥接",
   }), { kind: "ignored" });
 });
 
+test("错误收尾且正文为空的收尾消息登记为模型调用失败事实", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [],
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      stopReason: "error",
+      errorMessage: "Invalid API key",
+    },
+  }), {
+    kind: "event",
+    event: {
+      type: "model_call_failure",
+      failure: "error",
+      message: "Invalid API key",
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    },
+  });
+  // 错误文本原样保留（只做终端安全净化），不翻译、不摘要、不加前缀。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [],
+      provider: "openai",
+      model: "gpt-5",
+      stopReason: "error",
+      errorMessage: "line1\r\nline2\tend\u001b[31m",
+    },
+  }), {
+    kind: "event",
+    event: {
+      type: "model_call_failure",
+      failure: "error",
+      message: "line1\nline2  end",
+      provider: "openai",
+      model: "gpt-5",
+    },
+  });
+});
+
+test("缺少失败事实的收尾消息仍按既有语义忽略或只产生正文条目", () => {
+  const message = (
+    overrides: Record<string, unknown>,
+  ): Record<string, unknown> => ({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [],
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      stopReason: "error",
+      errorMessage: "Invalid API key",
+      ...overrides,
+    },
+  });
+  // 本工单只交付「正文为空且以错误收尾」的采集面：正文为空的非错误收尾、
+  // 缺错误文本、缺 provider/model 都仍不登记条目。
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "stop" })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "aborted" })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ errorMessage: undefined })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ errorMessage: "" })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ provider: undefined })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ model: undefined })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ provider: 42 })), { kind: "ignored" });
+  // 正文非空的失败消息当前仍与既有完全一致（只产生消息条目）；失败与正文
+  // 并存、已中止收尾与错误文本缺失的兑底文案都是采集面工单（03）的范围，
+  // 其上线时本节断言随之改写。
+  assert.deepEqual(normalizeRpcBridgeEvent(message({
+    content: [{ type: "text", text: "半句输出" }],
+  })), {
+    kind: "event",
+    event: { type: "message", content: [{ type: "text", text: "半句输出" }] },
+  });
+});
+
 test("活动事件闭集校验器拒绝空正文，与桥接端‘空块跳过’不冲突", () => {
   assert.equal(parseAgentActivityEvent({ type: "message", content: [] }).kind, "invalid");
   assert.equal(parseAgentActivityEvent({

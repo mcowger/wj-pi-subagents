@@ -794,8 +794,8 @@ function readOwnActivityEvent(
   normalizeOwnActivity: (event: unknown) => AgentActivityEventNormalization,
 ): SafeAgentActivityEvent | undefined {
   // 工具事实走产生端专用规范化：来源身份、开始参数缓存与专用摘要提取都在
-  // 规范化器内完成，原始参数与结果在此处丢弃，永不跨进程；message 事实
-  // 仍复用桥接事件闭集。
+  // 规范化器内完成，原始参数与结果在此处丢弃，永不跨进程；message 与
+  // 模型调用失败事实仍复用桥接事件闭集。
   if (
     isRecord(event)
     && (event.type === "tool_execution_start" || event.type === "tool_execution_end")
@@ -805,7 +805,9 @@ function readOwnActivityEvent(
   }
   const normalized = normalizeRpcBridgeEvent(event);
   if (normalized.kind !== "event") return undefined;
-  return normalized.event.type === "message" ? normalized.event : undefined;
+  return normalized.event.type === "message" || normalized.event.type === "model_call_failure"
+    ? normalized.event
+    : undefined;
 }
 
 function observeOwnActivity(

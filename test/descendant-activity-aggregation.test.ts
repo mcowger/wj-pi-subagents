@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { AgentActivityCache } from "../src/agent-activity-cache.ts";
+import { AgentActivityViewerModel } from "../src/agent-activity-viewer.ts";
 import type { AgentController } from "../src/agent-controller.ts";
 import type {
   AvailableHostCapabilities,
@@ -242,6 +244,123 @@ test("子模式扩展把本进程完整活动规范化上行且不在本层缓�
     // 中间运行时不保存历史：本层回放为空。
     assert.deepEqual(controller?.getActivityReplay(CHILD_ID), []);
     assert.equal(controller?.getActivityRevision(CHILD_ID), 0);
+  } finally {
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+    await parentChannel?.release().catch(() => {});
+    await listener.close().catch(() => {});
+  }
+});
+
+test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通到面板折叠行", async () => {
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const listener = await transportAdapter.listen({
+    agentId: CHILD_ID,
+    credential: LOCAL_CREDENTIAL,
+  });
+  const api = new FakeExtensionApi();
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  let parentChannel: StreamSupervisorChannel | undefined;
+  const delivered: SupervisorActivityDelivery[] = [];
+  const lifecycleEvents: unknown[] = [];
+  const faults: unknown[] = [];
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment: childEnvironment(listener.endpoint),
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+  });
+
+  const parentReady = (async () => {
+    const transport = await listener.waitForConnection(AbortSignal.timeout(2_000));
+    const channel = new StreamSupervisorChannel({
+      role: "parent",
+      rootId: ROOT_ID,
+      localAgentId: null,
+      peerAgentId: CHILD_ID,
+      parentAgentId: null,
+      depth: 1,
+      credential: SUPERVISOR_CREDENTIAL,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+      transport,
+      onReply: () => true,
+    });
+    parentChannel = channel;
+    channel.onActivity((activity) => delivered.push(activity));
+    channel.onEvent((event) => lifecycleEvents.push(event));
+    channel.onFault((fault) => faults.push(fault));
+    const signal = AbortSignal.timeout(2_000);
+    await channel.bind(signal);
+    await channel.waitForReady(signal);
+  })();
+
+  try {
+    await activator(api as unknown as ExtensionApiSurface, {
+      ok: true,
+      nodeVersion: process.versions.node,
+      piVersion: "0.85.1",
+      platform: process.platform,
+      processTreeAdapter: {} as never,
+    } as AvailableHostCapabilities);
+    await Promise.all([
+      api.emit("session_start", { type: "session_start", reason: "startup" }, context),
+      parentReady,
+    ]);
+    const lifecycleBefore = lifecycleEvents.length;
+
+    // 正文为空且以错误收尾的收尾消息：失败事实在桥接层采集并上行。
+    await api.emit("message_end", {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        stopReason: "error",
+        errorMessage: "401 unauthorized\nx-request-id: abc",
+      },
+    }, context);
+    await waitForCount(delivered, 1);
+
+    assert.equal(delivered.length, 1);
+    const delivery = delivered[0]!;
+    assert.equal(delivery.agent_id, CHILD_ID);
+    assert.match(delivery.entry.incarnation_id, /^[0-9a-f-]{36}$/u);
+    // 条目一次定死四个字段：收尾原因、错误文本、provider 与 model。
+    assert.deepEqual(delivery.entry.body, {
+      type: "model_call_failure",
+      failure: "error",
+      message: "401 unauthorized\nx-request-id: abc",
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    });
+
+    // 顶层活动缓存 → 活动面板：折叠行显示错误文本首行。
+    const cache = new AgentActivityCache();
+    const recorded = cache.record(delivery.agent_id, delivery.entry);
+    assert.equal(recorded.accepted, true);
+    const viewer = new AgentActivityViewerModel({
+      agent_id: CHILD_ID,
+      template_id: "worker",
+      name: "worker-a",
+      state: "working",
+    }, cache.replay(CHILD_ID), { viewport_height: 20 });
+    assert.deepEqual(
+      viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+      ["× Error: 401 unauthorized"],
+    );
+
+    // 版本一致时活动链路不被判为无效帧，也不触发生命周期转换。
+    assert.deepEqual(faults, []);
+    assert.equal(lifecycleEvents.length, lifecycleBefore);
   } finally {
     await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
     await parentChannel?.release().catch(() => {});

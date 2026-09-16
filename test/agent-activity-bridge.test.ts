@@ -136,6 +136,73 @@ test("真实桥接进程把加宽的活动事件闭集传给父端，大正文�
   }
 });
 
+test("真实桥接进程把模型调用失败事件按固定字段集合传给父端且不使通道进故障", async () => {
+  const session = startBridge([
+    // 正文为空且以错误收尾的收尾消息：失败事实不再在桥接层被整条丢弃。
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        stopReason: "error",
+        errorMessage: "401 unauthorized\nx-request-id: abc",
+        usage: { input: 12, output: 0 },
+        diagnostics: [{ type: "provider" }],
+        rawStopReason: "invalid_request_error",
+      },
+    },
+    // 正文非空的失败消息仍只产生既有消息条目。
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "半句输出" }],
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        stopReason: "error",
+        errorMessage: "401 unauthorized",
+      },
+    },
+    // 无错误文本与已中止收尾不登记失败条目。
+    {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        stopReason: "aborted",
+      },
+    },
+  ]);
+  const faults: unknown[] = [];
+  const unsubscribeFault = session.client.onTransportFault((fault) => faults.push(fault));
+  try {
+    const received: unknown[] = [];
+    const unsubscribe = session.client.onEvent((event) => received.push(event));
+    await session.client.start(AbortSignal.timeout(2_000));
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    unsubscribe();
+
+    assert.deepEqual(received, [
+      {
+        type: "model_call_failure",
+        failure: "error",
+        message: "401 unauthorized\nx-request-id: abc",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      },
+      { type: "message", content: [{ type: "text", text: "半句输出" }] },
+    ]);
+    assert.deepEqual(faults, []);
+  } finally {
+    unsubscribeFault();
+    await session.close();
+  }
+});
+
 test("真实桥接进程不再观察流式增量：display 草稿由子代理运行时扩展沿监督通道上行", async () => {
   const session = startBridge([
     {

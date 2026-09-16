@@ -18,6 +18,8 @@ export const ACTIVITY_MAX_TEXT_BYTES = 16 * 1024;
 const MAX_ACTIVITY_CONTENT_BLOCKS = 64;
 const MAX_TOOL_ID_BYTES = 256;
 const MAX_ACTIVITY_STREAM_ID_BYTES = 128;
+/** provider 与 model 身份是短引用；它们不承载任意正文。 */
+const MAX_MODEL_IDENTITY_BYTES = 256;
 
 /** display epoch 是 canonical UUID；实时 wire 不接受任意 opaque token。 */
 export function isValidDisplayEpoch(value: unknown): value is string {
@@ -403,7 +405,24 @@ export type SafeAgentActivityEvent =
       readonly errorText?: string;
       /** 插件工具失败时的规范稳定错误码；不在成功事实出现。 */
       readonly errorCode?: string;
+    }
+  | {
+      /**
+       * 一次模型调用失败的运行事实：收尾原因与错误文本取自收尾 assistant
+       * 消息，provider 与 model 记录发起该次失败的模型。它是活动事实，
+       * 不携带用量、原生收尾原因与诊断等调试信息。
+       */
+      readonly type: "model_call_failure";
+      /** 收尾原因如实记录；当前两种取值呈现完全相同。 */
+      readonly failure: SafeModelCallFailureReason;
+      /** 错误文本原文；缺失时由采集层使用 Pi 的兜底文案。 */
+      readonly message: string;
+      readonly provider: string;
+      readonly model: string;
     };
+
+/** 模型调用失败的收尾原因闭集：错误与已中止。 */
+export type SafeModelCallFailureReason = "error" | "aborted";
 
 /**
  * 产生端（子代理运行时扩展）生成的短暂 assistant 增量：还不携带代理身份。
@@ -529,6 +548,7 @@ export type SafeRpcBridgeEvent =
       readonly type: "tool_execution_start" | "tool_execution_end";
     }>
   | Extract<SafeAgentActivityEvent, { readonly type: "message" }>
+  | Extract<SafeAgentActivityEvent, { readonly type: "model_call_failure" }>
   | { readonly type: "extension_error" };
 
 export interface SafeAssistantMessageEndEvent {
@@ -641,8 +661,12 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
       const activity = normalizeActivityMessageEnd(event.message);
       if (activity.kind === "invalid") return INVALID_EVENT;
       // 结构合法但无有效正文（空块或空 content）的消息无内容可显示，
-      // 忽略该事件而不是把它当成违约中断会话。
-      if (activity.event.content.length === 0) return IGNORED_EVENT;
+      // 忽略该事件而不是把它当成违约中断会话；只有携带失败事实的收尾
+      // 消息例外：模型调用失败条目不依赖正文，仍要登记。
+      if (activity.event.content.length === 0) {
+        const failure = normalizeActivityModelCallFailure(event.message);
+        return failure === undefined ? IGNORED_EVENT : safeEvent(failure);
+      }
       return safeEvent(activity.event);
     }
     case "extension_error":
@@ -823,9 +847,43 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
         }),
       });
     }
+    case "model_call_failure": {
+      if (!isSafeModelCallFailureReason(value.failure)) return INVALID_ACTIVITY_EVENT;
+      if (
+        !hasOnlyModelCallFailureKeys(value)
+        || !validBoundedText(value.provider, MAX_MODEL_IDENTITY_BYTES)
+        || !validBoundedText(value.model, MAX_MODEL_IDENTITY_BYTES)
+        || typeof value.message !== "string"
+        || value.message.length === 0
+      ) return INVALID_ACTIVITY_EVENT;
+      return Object.freeze({
+        kind: "event",
+        event: Object.freeze({
+          type: "model_call_failure" as const,
+          failure: value.failure,
+          message: value.message,
+          provider: value.provider,
+          model: value.model,
+        }),
+      });
+    }
     default:
       return INVALID_ACTIVITY_EVENT;
   }
+}
+
+/** 模型调用失败收尾原因闭集谓词；产生端与 wire 校验共用同一形状。 */
+export function isSafeModelCallFailureReason(
+  value: unknown,
+): value is SafeModelCallFailureReason {
+  return value === "error" || value === "aborted";
+}
+
+/** 失败条目固定字段集合；额外字段不被本地宽容路径静默吞掉。 */
+function hasOnlyModelCallFailureKeys(value: Record<string, unknown>): boolean {
+  return Object.keys(value).every((key) => (
+    key === "type" || key === "failure" || key === "message" || key === "provider" || key === "model"
+  ));
 }
 
 /**
@@ -876,6 +934,13 @@ export function parseCanonicalAgentActivityEvent(
         || !Object.prototype.hasOwnProperty.call(value, "executionGeneration")
         || !isValidToolExecutionGeneration(value.executionGeneration)
       ) return INVALID_ACTIVITY_EVENT;
+      return parseAgentActivityEvent(value);
+    case "model_call_failure":
+      // 失败条目一次定死四个字段：收尾原因、错误文本、provider 与 model。
+      if (!hasExactObjectKeys(
+        value,
+        ["type", "failure", "message", "provider", "model"],
+      )) return INVALID_ACTIVITY_EVENT;
       return parseAgentActivityEvent(value);
     default:
       return INVALID_ACTIVITY_EVENT;
@@ -2365,6 +2430,34 @@ function normalizeActivityMessageEnd(
     content,
   });
   return Object.freeze({ kind: "event", event });
+}
+
+/**
+ * 从收尾 assistant 消息读取模型调用失败事实：收尾原因与错误文本都只在这里
+ * 采集，不新增 Pi 事件订阅点。错误文本缺失、已中止收尾与无错误文本的静默
+ * 溢出在这里都不登记条目；provider/model 不是合法短引用时同样忽略，
+ * 不把宿主事实差异升级为会话违约。
+ */
+function normalizeActivityModelCallFailure(
+  message: Record<string, unknown>,
+): Extract<SafeAgentActivityEvent, { readonly type: "model_call_failure" }> | undefined {
+  if (message.stopReason !== "error") return undefined;
+  const errorText = message.errorMessage;
+  if (typeof errorText !== "string") return undefined;
+  // 错误文本原样保留（只做终端安全净化）：不翻译、不摘要、不加前缀。
+  const text = sanitizeSafeActivityText(errorText);
+  if (text.length === 0) return undefined;
+  const provider = message.provider;
+  const model = message.model;
+  if (!validBoundedText(provider, MAX_MODEL_IDENTITY_BYTES)) return undefined;
+  if (!validBoundedText(model, MAX_MODEL_IDENTITY_BYTES)) return undefined;
+  return Object.freeze({
+    type: "model_call_failure" as const,
+    failure: "error" as const,
+    message: text,
+    provider,
+    model,
+  });
 }
 
 function normalizeActivityContent(
