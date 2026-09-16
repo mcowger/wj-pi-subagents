@@ -3,6 +3,7 @@ import test from "node:test";
 import { randomUUID } from "node:crypto";
 import {
   AgentController,
+  type AgentControllerOptions,
   type AgentSupervisor,
 } from "../src/agent-controller.ts";
 import type {
@@ -212,6 +213,27 @@ function messageEntryWithStream(
   });
 }
 
+/** 模型调用失败条目：失败载荷四字段（收尾原因、错误文本、provider、model）一次定死。 */
+function modelCallFailureEntry(
+  agentId: string,
+  message: string,
+  failure: "error" | "aborted" = "error",
+): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "model_call_failure" as const,
+      failure,
+      message,
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    }),
+  });
+}
+
 function makeChildModeController(options: {
   readonly agentId: string;
   readonly parentAgentId: string | null;
@@ -256,7 +278,10 @@ function makeChildModeController(options: {
   });
 }
 
-function makeController(fake: FakeSupervisor): {
+function makeController(
+  fake: FakeSupervisor,
+  onReply?: AgentControllerOptions["onReply"],
+): {
   readonly controller: AgentController;
   readonly tree: TreeController;
   readonly upstream: SupervisorActivityDelivery[];
@@ -281,9 +306,28 @@ function makeController(fake: FakeSupervisor): {
       return fake;
     },
     replyNotificationsHandledByInbox: false,
+    ...(onReply === undefined ? {} : { onReply }),
     publishUpstreamActivity: (delivery) => upstream.push(delivery),
   });
   return { controller, tree, upstream };
+}
+
+/** 注入活动条目缓存、上行转发与实时草稿三个分支的转发故障。 */
+function breakActivityBranches(controller: AgentController): void {
+  const internal = controller as unknown as {
+    tree: { updateActivity: () => void };
+    recordActivity: () => void;
+    handleDisplayEvent: () => void;
+  };
+  internal.tree.updateActivity = () => {
+    throw new Error("注入缓存故障");
+  };
+  internal.recordActivity = () => {
+    throw new Error("注入转发故障");
+  };
+  internal.handleDisplayEvent = () => {
+    throw new Error("注入草稿故障");
+  };
 }
 
 test("顶层控制器把活动条目写入缓存，按到达序可回放且修订号递增", async () => {
@@ -958,20 +1002,7 @@ test("活动流转发异常被屏障吞掉：不沿 onEvent 传播，后续事�
   await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
 
   // 注入转发故障：三个活动分支的目标内部调用全部抛错。
-  const internal = controller as unknown as {
-    tree: { updateActivity: () => void };
-    recordActivity: () => void;
-    handleDisplayEvent: () => void;
-  };
-  internal.tree.updateActivity = () => {
-    throw new Error("注入缓存故障");
-  };
-  internal.recordActivity = () => {
-    throw new Error("注入转发故障");
-  };
-  internal.handleDisplayEvent = () => {
-    throw new Error("注入草稿故障");
-  };
+  breakActivityBranches(controller);
 
   // 三个活动分支的转发失败都被屏障吞掉：面板数据静默缺失，不炸事件回调。
   assert.doesNotThrow(() => {
@@ -993,4 +1024,161 @@ test("活动流转发异常被屏障吞掉：不沿 onEvent 传播，后续事�
     fake.emitLifecycle(AGENT_ID, { type: "agent_settled", expected_generation: 0 });
   });
   assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+});
+
+test("版本一致时活动链路转发异常只表现为面板数据缺失，不把子代理判为失败", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  // 让子代理进入工作态：活动链路故障不得把它改写为 failed。
+  const start = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(start.ok, true, JSON.stringify(start));
+  if (!start.ok) return;
+  assert.equal(tree.applyLifecycleEvent(AGENT_ID, {
+    type: "agent_start",
+    expected_generation: start.data,
+  }).ok, true);
+
+  // 注入活动条目、上行转发与实时草稿三个分支的内部故障。
+  breakActivityBranches(controller);
+
+  assert.doesNotThrow(() => {
+    fake.emitActivityDelivery({
+      agent_id: AGENT_ID,
+      entry: modelCallFailureEntry(AGENT_ID, "401 unauthorized"),
+    });
+    fake.emitActivityDisplay({
+      agent_id: AGENT_ID,
+      event: displayDelta("message-1", 1, 0, "text", "草稿"),
+    });
+  });
+
+  // 面板数据静默缺失：既无历史条目也无草稿。
+  assert.deepEqual(controller.getActivityReplay(AGENT_ID), []);
+  assert.deepEqual(controller.getDisplayDrafts(AGENT_ID), []);
+  // 但子代理仍在原来的工作态：链路故障不被升级为运行故障。
+  const status = tree.getStatus(AGENT_ID);
+  assert.equal(status.ok, true, JSON.stringify(status));
+  assert.equal(status.ok && status.data.state, "working");
+});
+
+test("模型调用失败条目不进入实时显示草稿投影", async () => {
+  const rootSupervisor = new FakeSupervisor(AGENT_ID);
+  const { controller: root } = makeController(rootSupervisor);
+  await root.spawnAgent({ template_id: "demo", name: "直接子代理" });
+
+  // 顶层：失败条目到达不得写入草稿，也不得清掉同代理已有草稿。
+  rootSupervisor.emitActivityDisplay({
+    agent_id: AGENT_ID,
+    event: displayDelta("message-1", 1, 0, "text", "半句输出"),
+  });
+  assert.deepEqual(
+    root.getDisplayDrafts(AGENT_ID)[0]?.blocks.map((block) => block.value),
+    ["半句输出"],
+  );
+  rootSupervisor.emitActivityDelivery({
+    agent_id: AGENT_ID,
+    entry: modelCallFailureEntry(AGENT_ID, "429 too many requests"),
+  });
+  assert.deepEqual(
+    root.getDisplayDrafts(AGENT_ID)[0]?.blocks.map((block) => block.value),
+    ["半句输出"],
+  );
+
+  // 产生端即使把当前实时流身份一并传入，失败事实仍只有活动条目、不产生显示帧。
+  const displayUpstream: SupervisorDisplayDelivery[] = [];
+  const child = makeChildModeController({
+    agentId: AGENT_ID,
+    parentAgentId: null,
+    depth: 1,
+    directChildId: GRANDCHILD_ID,
+    directChildSupervisor: new FakeSupervisor(GRANDCHILD_ID),
+    publishUpstreamActivity: (delivery) => rootSupervisor.emitActivityDelivery(delivery),
+    publishUpstreamDisplayActivity: (delivery) => displayUpstream.push(delivery),
+  });
+  const failureBody: SafeAgentActivityEvent = modelCallFailureEntry(
+    AGENT_ID,
+    "Unknown error",
+    "aborted",
+  ).body;
+  assert.equal(child.recordOwnActivity(failureBody, displayStream("message-2")), true);
+  assert.deepEqual(displayUpstream, []);
+  assert.deepEqual(
+    root.getDisplayDrafts(AGENT_ID)[0]?.blocks.map((block) => block.value),
+    ["半句输出"],
+  );
+});
+
+test("模型调用失败条目不产生任何发往父代理的消息、报告或回复事件", async () => {
+  const fake = new FakeSupervisor();
+  const replies: string[] = [];
+  const { controller } = makeController(fake, (_agentId, reply) => replies.push(reply.kind));
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  // 同一回合的多次失败：各自进入活动缓存，但不产生任何会话事件。
+  fake.emitActivityDelivery({
+    agent_id: AGENT_ID,
+    entry: modelCallFailureEntry(AGENT_ID, "401 unauthorized"),
+  });
+  fake.emitActivityDelivery({
+    agent_id: AGENT_ID,
+    entry: modelCallFailureEntry(AGENT_ID, "503 service unavailable"),
+  });
+  assert.equal(controller.getActivityReplay(AGENT_ID).length, 2);
+  assert.deepEqual(replies, []);
+
+  // 对照：真实回复事件仍会被登记，证明观察通道本身有效。
+  const replyEvent: RpcSupervisorEvent = Object.freeze({
+    kind: "reply",
+    reply: Object.freeze({
+      schema: "wj-pi-subagents/conversation" as const,
+      version: 1 as const,
+      kind: "message" as const,
+      agent_id: AGENT_ID,
+      text: "真实回复",
+    }),
+  });
+  fake.emitRaw(replyEvent);
+  assert.deepEqual(replies, ["message"]);
+});
+
+test("模型调用失败条目不触发生命周期状态转换，也不建立或升级控制屏障", async () => {
+  const fake = new FakeSupervisor();
+  const { controller, tree } = makeController(fake);
+  await controller.spawnAgent({ template_id: "demo", name: "活动子代理" });
+
+  const start = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(start.ok, true, JSON.stringify(start));
+  if (!start.ok) return;
+  assert.equal(tree.applyLifecycleEvent(AGENT_ID, {
+    type: "agent_start",
+    expected_generation: start.data,
+  }).ok, true);
+  const generationBefore = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(generationBefore.ok, true, JSON.stringify(generationBefore));
+
+  fake.emitActivityDelivery({
+    agent_id: AGENT_ID,
+    entry: modelCallFailureEntry(AGENT_ID, "401 unauthorized"),
+  });
+  fake.emitActivityDelivery({
+    agent_id: AGENT_ID,
+    entry: modelCallFailureEntry(AGENT_ID, "Unknown error", "aborted"),
+  });
+
+  // 活动事实不改变生命周期状态与代际，也不建立终止屏障。
+  const generation = tree.getLifecycleGeneration(AGENT_ID);
+  assert.equal(generation.ok, true, JSON.stringify(generation));
+  assert.equal(generation.ok && generationBefore.ok && generation.data === generationBefore.data, true);
+  const status = tree.getStatus(AGENT_ID);
+  assert.equal(status.ok && status.data.state, "working");
+  assert.equal(tree.getTerminationBarrier(AGENT_ID).ok, false);
+
+  // 控制手段不受影响：消息发送与中断仍按既有语义被接受。
+  const sent = await controller.sendMessage({ agent_id: AGENT_ID, message: "继续" });
+  assert.equal(sent.ok, true, JSON.stringify(sent));
+  const interrupted = await controller.interruptAgent(AGENT_ID);
+  assert.equal(interrupted.ok, true, JSON.stringify(interrupted));
+  assert.equal(interrupted.ok && interrupted.data.changed, true);
 });

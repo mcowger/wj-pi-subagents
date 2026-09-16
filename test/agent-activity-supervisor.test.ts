@@ -359,6 +359,9 @@ test("版本一致时监督通道在发布侧与接收侧都接受模型调用�
     assert.equal(deliveries[0]?.agent_id, CHILD_ID);
     assert.deepEqual(deliveries[0]?.entry, entry);
     assert.deepEqual(faults, []);
+    // 收发两侧都不因合法失败条目进入通道故障。
+    assert.equal(channels.parent.getPublicState().state, "ready");
+    assert.equal(channels.child.getPublicState().state, "ready");
   } finally {
     unsubscribe();
     unsubscribeChildFault();

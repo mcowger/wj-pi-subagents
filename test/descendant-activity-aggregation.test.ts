@@ -267,6 +267,7 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
   let parentChannel: StreamSupervisorChannel | undefined;
   const delivered: SupervisorActivityDelivery[] = [];
   const lifecycleEvents: unknown[] = [];
+  const replies: unknown[] = [];
   const faults: unknown[] = [];
   const activator = createWjPiSubagentsRuntimeActivator({
     environment: childEnvironment(listener.endpoint),
@@ -291,7 +292,10 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
       credential: SUPERVISOR_CREDENTIAL,
       requestIdRegistry: new SupervisorRequestIdRegistry(),
       transport,
-      onReply: () => true,
+      onReply: (reply) => {
+        replies.push(reply);
+        return true;
+      },
     });
     parentChannel = channel;
     channel.onActivity((activity) => delivered.push(activity));
@@ -468,6 +472,8 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
     // 版本一致时活动链路不被判为无效帧，也不触发生命周期转换。
     assert.deepEqual(faults, []);
     assert.equal(lifecycleEvents.length, lifecycleBefore);
+    // 失败条目只走活动流：不产生任何发往父代理的回复或报告事件。
+    assert.deepEqual(replies, []);
   } finally {
     await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
     await parentChannel?.release().catch(() => {});

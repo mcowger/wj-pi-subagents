@@ -185,6 +185,35 @@ test("模型调用失败条目在窗口裁剪与墓碑裁决上与既有条目�
   assert.deepEqual(cache.replay(AGENT_A), beforeReplay);
 });
 
+test("模型调用失败条目在修订号与回放序号分配上与既有条目同等待遇", () => {
+  const cache = new AgentActivityCache();
+  const incarnationId = "7f9c24e8-5b3d-4f6a-8c1e-9d2b7a4f6e81";
+  const text = identifiedMessageEntry(
+    AGENT_A,
+    incarnationId,
+    "55555555-5555-4555-8555-555555555555",
+    "重试后的正文",
+  );
+  const failure = modelCallFailureEntry(
+    AGENT_A,
+    "配额用尽",
+    "44444444-4444-4444-8444-444444444444",
+    incarnationId,
+  );
+
+  // 修订号按到达序逐条分配：失败条目与普通条目占用同一序列。
+  assert.equal(cache.revision(AGENT_A), 0);
+  assert.equal(cache.record(AGENT_A, text).changed, true);
+  assert.equal(cache.revision(AGENT_A), 1);
+  assert.equal(cache.record(AGENT_A, failure).changed, true);
+  assert.equal(cache.revision(AGENT_A), 2);
+
+  // 幂等重复不再占用序号，也不改变回放序列。
+  assert.equal(cache.record(AGENT_A, failure).changed, false);
+  assert.equal(cache.revision(AGENT_A), 2);
+  assert.deepEqual(cache.replay(AGENT_A), [text, failure]);
+});
+
 test("修订号随追加单调递增，未知代理回放为空且修订号为 0", () => {
   const cache = new AgentActivityCache();
   assert.equal(cache.revision(AGENT_A), 0);

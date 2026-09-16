@@ -68,6 +68,22 @@ function canonicalEntry(agentId: string, text = "回复正文"): CanonicalAgentA
   });
 }
 
+function modelCallFailureEntry(agentId: string, message: string): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: agentId,
+    incarnation_id: randomUUID(),
+    entry_id: randomUUID(),
+    body: Object.freeze({
+      type: "model_call_failure" as const,
+      failure: "error" as const,
+      message,
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    }),
+  });
+}
+
 function readyPair(): Pair {
   const childAgentId = randomUUID();
   const grandchildAgentId = randomUUID();
@@ -222,6 +238,34 @@ test("契约版本不符或身份不一致的条目在发布端被拒绝", () =>
     (error: unknown) => error instanceof SupervisorProtocolError,
   );
   assert.equal(child.getPublicState().state, "ready");
+});
+
+test("旧版本模型调用失败条目在发布侧被拒绝，在接收侧按不兼容处理", () => {
+  const { parent, child, childAgentId } = readyPair();
+  const failure = modelCallFailureEntry(childAgentId, "401 unauthorized");
+
+  // 发布侧：上一版契约的失败条目被拒绝，发布端自身不进入故障。
+  const staleContract = Object.freeze({
+    ...failure,
+    contract_version: "wj-pi-subagents.activity/11",
+  }) as unknown as CanonicalAgentActivityEntry;
+  assert.throws(
+    () => child.publishActivity({ entry: staleContract }),
+    (error: unknown) => error instanceof SupervisorProtocolError && error.code === "invalid_frame",
+  );
+  assert.equal(child.getPublicState().state, "ready");
+
+  // 接收侧：伪造的旧版本条目按活动契约不兼容处理为协议故障。
+  const frame = child.publishActivity({ entry: failure })[0];
+  assert.ok(frame);
+  const legacyFrame = Object.freeze({
+    ...frame,
+    payload: Object.freeze({ agent_id: childAgentId, entry: staleContract }),
+  });
+  const result = parent.receive(legacyFrame);
+  assert.equal(result.kind, "protocol_fault");
+  assert.equal(result.kind === "protocol_fault" && result.error, "invalid_frame");
+  assert.equal(parent.getPublicState().state, "faulted");
 });
 
 test("握手完成前发布活动流被拒绝，终止屏障后活动帧被丢弃", () => {
