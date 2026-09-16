@@ -469,7 +469,7 @@ test("错误收尾且正文为空的收尾消息登记为模型调用失败事�
   });
 });
 
-test("缺少失败事实的收尾消息仍按既有语义忽略或只产生正文条目", () => {
+test("已中止收尾与错误同形登记失败条目，正文为空的静默溢出不登记", () => {
   const message = (
     overrides: Record<string, unknown>,
   ): Record<string, unknown> => ({
@@ -484,24 +484,173 @@ test("缺少失败事实的收尾消息仍按既有语义忽略或只产生正�
       ...overrides,
     },
   });
-  // 本工单只交付「正文为空且以错误收尾」的采集面：正文为空的非错误收尾、
-  // 缺错误文本、缺 provider/model 都仍不登记条目。
+  // 已中止收尾与错误收尾同形登记，收尾原因如实记录。
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "aborted" })), {
+    kind: "event",
+    event: {
+      type: "model_call_failure",
+      failure: "aborted",
+      message: "Invalid API key",
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    },
+  });
+  // 正常收尾与无错误文本的静默溢出（长度收尾且零输出）都不登记。
   assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "stop" })), { kind: "ignored" });
-  assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "aborted" })), { kind: "ignored" });
-  assert.deepEqual(normalizeRpcBridgeEvent(message({ errorMessage: undefined })), { kind: "ignored" });
-  assert.deepEqual(normalizeRpcBridgeEvent(message({ errorMessage: "" })), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "length" })), { kind: "ignored" });
+  // provider/model 不是合法短引用时不登记，不把宿主事实差异升级为违约。
   assert.deepEqual(normalizeRpcBridgeEvent(message({ provider: undefined })), { kind: "ignored" });
   assert.deepEqual(normalizeRpcBridgeEvent(message({ model: undefined })), { kind: "ignored" });
   assert.deepEqual(normalizeRpcBridgeEvent(message({ provider: 42 })), { kind: "ignored" });
-  // 正文非空的失败消息当前仍与既有完全一致（只产生消息条目）；失败与正文
-  // 并存、已中止收尾与错误文本缺失的兑底文案都是采集面工单（03）的范围，
-  // 其上线时本节断言随之改写。
-  assert.deepEqual(normalizeRpcBridgeEvent(message({
-    content: [{ type: "text", text: "半句输出" }],
-  })), {
-    kind: "event",
-    event: { type: "message", content: [{ type: "text", text: "半句输出" }] },
+});
+
+test("错误文本缺失时用 Pi 兜底文案 Unknown error", () => {
+  const message = (
+    overrides: Record<string, unknown>,
+  ): Record<string, unknown> => ({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [],
+      provider: "openai",
+      model: "gpt-5",
+      stopReason: "error",
+      ...overrides,
+    },
   });
+  const expected = {
+    kind: "event",
+    event: {
+      type: "model_call_failure",
+      failure: "error",
+      message: "Unknown error",
+      provider: "openai",
+      model: "gpt-5",
+    },
+  };
+  assert.deepEqual(normalizeRpcBridgeEvent(message({})), expected);
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ errorMessage: "" })), expected);
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ errorMessage: undefined })), expected);
+  // 已中止且无错误文本同样落到兜底文案。
+  assert.deepEqual(normalizeRpcBridgeEvent(message({ stopReason: "aborted" })), {
+    kind: "event",
+    event: { ...expected.event, failure: "aborted" },
+  });
+});
+
+test("正文非空的失败消息产生正文与失败两条独立条目，顺序为到达顺序", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "半句输出" }],
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      stopReason: "error",
+      errorMessage: "401 unauthorized\nline2",
+    },
+  }), {
+    kind: "events",
+    events: [
+      { type: "message", content: [{ type: "text", text: "半句输出" }] },
+      {
+        type: "model_call_failure",
+        failure: "error",
+        message: "401 unauthorized\nline2",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      },
+    ],
+  });
+  // 已中止且带正文的收尾同样是两条独立条目。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "半句" }],
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      stopReason: "aborted",
+    },
+  }), {
+    kind: "events",
+    events: [
+      { type: "message", content: [{ type: "text", text: "半句" }] },
+      {
+        type: "model_call_failure",
+        failure: "aborted",
+        message: "Unknown error",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      },
+    ],
+  });
+  // 无失败事实的正文消息仍只是单条正文条目。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "完整回复" }],
+      stopReason: "stop",
+    },
+  }), {
+    kind: "event",
+    event: { type: "message", content: [{ type: "text", text: "完整回复" }] },
+  });
+});
+
+test("上下文超限失败随收尾消息登记，无错误文本的静默溢出不登记", () => {
+  // Pi 把上下文超限失败先持久化在收尾 assistant 消息上（随后才进入压缩
+  // 重试），因此带错误文本的溢出/压缩触发失败与普通错误收尾共享同一采集点，
+  // provider/model 也随该消息一并采集。
+  // 静默溢出（用量超窗口或长度收尾且零输出）没有错误文本，不登记也不自造文案。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [],
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      stopReason: "error",
+      errorMessage: "context_length_exceeded: prompt is too long for this model",
+      usage: { input: 200_000, output: 0 },
+    },
+  }), {
+    kind: "event",
+    event: {
+      type: "model_call_failure",
+      failure: "error",
+      message: "context_length_exceeded: prompt is too long for this model",
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    },
+  });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [],
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+      stopReason: "length",
+      usage: { input: 200_000, output: 0 },
+    },
+  }), { kind: "ignored" });
+});
+
+test("自动重试事件不在桥接闭集内，不产生任何条目", () => {
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "auto_retry_start",
+    attempt: 2,
+    maxAttempts: 3,
+    delayMs: 1_000,
+    errorMessage: "rate limited",
+  }), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "auto_retry_end",
+    success: true,
+    attempt: 2,
+  }), { kind: "ignored" });
 });
 
 test("活动事件闭集校验器拒绝空正文，与桥接端‘空块跳过’不冲突", () => {

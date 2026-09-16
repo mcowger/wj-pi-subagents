@@ -30,6 +30,7 @@ import {
   buildDisplayStreamComplete,
   createOwnToolActivityNormalizer,
   createOwnToolActivityNormalizerState,
+  isOwnActivityBody,
   normalizeAssistantMessageUpdate,
   normalizeRpcBridgeEvent,
   type AgentActivityEventNormalization,
@@ -789,10 +790,10 @@ function readDirectChildDisplayName(
   }
 }
 
-function readOwnActivityEvent(
+function readOwnActivityEvents(
   event: unknown,
   normalizeOwnActivity: (event: unknown) => AgentActivityEventNormalization,
-): SafeAgentActivityEvent | undefined {
+): readonly SafeAgentActivityEvent[] {
   // 工具事实走产生端专用规范化：来源身份、开始参数缓存与专用摘要提取都在
   // 规范化器内完成，原始参数与结果在此处丢弃，永不跨进程；message 与
   // 模型调用失败事实仍复用桥接事件闭集。
@@ -801,13 +802,15 @@ function readOwnActivityEvent(
     && (event.type === "tool_execution_start" || event.type === "tool_execution_end")
   ) {
     const normalized = normalizeOwnActivity(event);
-    return normalized.kind === "event" ? normalized.event : undefined;
+    return normalized.kind === "event" ? [normalized.event] : [];
   }
   const normalized = normalizeRpcBridgeEvent(event);
-  if (normalized.kind !== "event") return undefined;
-  return normalized.event.type === "message" || normalized.event.type === "model_call_failure"
-    ? normalized.event
-    : undefined;
+  if (normalized.kind === "event") {
+    return isOwnActivityBody(normalized.event) ? [normalized.event] : [];
+  }
+  // 单条收尾消息可同时携带正文与失败事实：两条独立条目都进入活动流。
+  if (normalized.kind === "events") return normalized.events.filter(isOwnActivityBody);
+  return [];
 }
 
 function observeOwnActivity(
@@ -817,8 +820,10 @@ function observeOwnActivity(
   displayStream?: DisplayStreamRef,
 ): void {
   if (current === undefined || !current.isChild || current.handoffPending === true) return;
-  const activity = readOwnActivityEvent(event, normalizeOwnActivity);
-  if (activity !== undefined) current.controller.recordOwnActivity(activity, displayStream);
+  for (const activity of readOwnActivityEvents(event, normalizeOwnActivity)) {
+    // 实时显示流只关联 assistant 正文；控制器对非 message 条目自行忽略该引用。
+    current.controller.recordOwnActivity(activity, displayStream);
+  }
 }
 
 /** 产生端显示事实逐层 fire-and-forget 转发；recordOwnDisplayEvent 自身吞掉转发失败。 */

@@ -355,6 +355,24 @@ test("展开的失败正文与工具失败展开体同款：同样的错误文�
   assert.deepEqual(failureBody.slice(1), toolBody);
 });
 
+test("已中止收尾与错误收尾条目完全同形：同图标、同文案前缀、同样式", () => {
+  const theme = {
+    fg: (color: string, text: string): string => `<fg:${color}>${text}</fg:${color}>`,
+    bg: (color: string, text: string): string => `<bg:${color}>${text}</bg:${color}>`,
+    bold: (text: string): string => `<bold>${text}</bold>`,
+  };
+  const renderWith = (failure: "error" | "aborted"): string => {
+    const viewer = new AgentActivityViewerModel(viewerAgent(), [
+      modelFailureEntry("Operation aborted", failure),
+    ], { viewport_height: 20 });
+    return renderAgentActivityViewerSurface(viewer, 120, theme).join("\n");
+  };
+  const errorSurface = renderWith("error");
+  // 收尾原因只作为事实保留，不参与任何呈现分支。
+  assert.equal(renderWith("aborted"), errorSurface);
+  assert.match(errorSurface, /<fg:error><bold>Error: Operation aborted<\/bold><\/fg:error>/u);
+});
+
 test("模型调用失败条目与既有条目按到达序共存且不影响其渲染", () => {
   const viewer = new AgentActivityViewerModel(viewerAgent(), [
     textMessage("第一段正文"),

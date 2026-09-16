@@ -590,6 +590,10 @@ async function createClient(): Promise<BridgeClient> {
       return;
     }
     if (normalized.kind === "event") emitEvent(normalized.event);
+    else if (normalized.kind === "events") {
+      // 同一收尾消息可同时携带正文与失败事实：两条独立事件各自成帧。
+      for (const activity of normalized.events) emitEvent(activity);
+    }
   });
   return client;
 }

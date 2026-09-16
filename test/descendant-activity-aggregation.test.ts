@@ -369,6 +369,102 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
       ],
     );
 
+    // 采集面边界：已中止与错误同形；错误文本缺失用兜底文案；正文非空的
+    // 失败消息产生正文与失败两条；同一回合多次失败各自成条；静默上下文
+    // 溢出（长度收尾且零输出）与自动重试事件不产生任何条目。
+    const assistantEnd = (
+      message: Record<string, unknown>,
+    ): Promise<void> => api.emit("message_end", { type: "message_end", message }, context);
+    const providerAndModel = {
+      provider: "anthropic",
+      model: "claude-sonnet-4-20250514",
+    };
+    // 已中止收尾且无错误文本：同样登记，文本落到 Pi 的兜底文案。
+    await assistantEnd({ role: "assistant", content: [], ...providerAndModel, stopReason: "aborted" });
+    // 正文非空的失败消息：正文条目在前、失败条目在后。
+    await assistantEnd({
+      role: "assistant",
+      content: [{ type: "text", text: "半句输出" }],
+      ...providerAndModel,
+      stopReason: "error",
+      errorMessage: "429 too many requests",
+    });
+    // 无错误文本的静默溢出与自动重试事件都不登记。
+    await assistantEnd({ role: "assistant", content: [], ...providerAndModel, stopReason: "length" });
+    await api.emit("auto_retry_start", {
+      type: "auto_retry_start",
+      attempt: 2,
+      maxAttempts: 3,
+      delayMs: 1_000,
+      errorMessage: "rate limited",
+    }, context);
+    // 同一回合的第二次失败：重试后被救回的失败尝试仍留在面板上。
+    await assistantEnd({
+      role: "assistant",
+      content: [],
+      ...providerAndModel,
+      stopReason: "error",
+      errorMessage: "503 service unavailable",
+    });
+    await assistantEnd({
+      role: "assistant",
+      content: [{ type: "text", text: "最终回复" }],
+      ...providerAndModel,
+      stopReason: "stop",
+    });
+    await waitForCount(delivered, 6);
+
+    assert.deepEqual(delivered.map((item) => item.entry.body), [
+      {
+        type: "model_call_failure",
+        failure: "error",
+        message: "401 unauthorized\nx-request-id: abc",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      },
+      {
+        type: "model_call_failure",
+        failure: "aborted",
+        message: "Unknown error",
+        ...providerAndModel,
+      },
+      { type: "message", content: [{ type: "text", text: "半句输出" }] },
+      {
+        type: "model_call_failure",
+        failure: "error",
+        message: "429 too many requests",
+        ...providerAndModel,
+      },
+      {
+        type: "model_call_failure",
+        failure: "error",
+        message: "503 service unavailable",
+        ...providerAndModel,
+      },
+      { type: "message", content: [{ type: "text", text: "最终回复" }] },
+    ]);
+    assert.equal(new Set(delivered.map((item) => item.entry.entry_id)).size, delivered.length);
+
+    // 全部条目按到达顺序进入同一面板：三次失败各自成条，兜底文案可见。
+    const allCache = new AgentActivityCache();
+    for (const item of delivered) allCache.record(item.agent_id, item.entry);
+    const allViewer = new AgentActivityViewerModel({
+      agent_id: CHILD_ID,
+      template_id: "worker",
+      name: "worker-a",
+      state: "working",
+    }, allCache.replay(CHILD_ID), { viewport_height: 20 });
+    const rendered = allViewer.render(160).slice(1, -1).filter((line) => line.length > 0);
+    assert.deepEqual(
+      rendered.filter((line) => line.includes("Error:")),
+      [
+        "▸ × Error: 401 unauthorized",
+        "▸ × Error: Unknown error",
+        "▸ × Error: 429 too many requests",
+        "▸ × Error: 503 service unavailable",
+      ],
+    );
+
     // 版本一致时活动链路不被判为无效帧，也不触发生命周期转换。
     assert.deepEqual(faults, []);
     assert.equal(lifecycleEvents.length, lifecycleBefore);

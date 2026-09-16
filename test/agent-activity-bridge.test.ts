@@ -136,7 +136,7 @@ test("真实桥接进程把加宽的活动事件闭集传给父端，大正文�
   }
 });
 
-test("真实桥接进程把模型调用失败事件按固定字段集合传给父端且不使通道进故障", async () => {
+test("真实桥接进程按到达顺序转发失败与半句输出条目且不使通道进故障", async () => {
   const session = startBridge([
     // 正文为空且以错误收尾的收尾消息：失败事实不再在桥接层被整条丢弃。
     {
@@ -153,7 +153,7 @@ test("真实桥接进程把模型调用失败事件按固定字段集合传给�
         rawStopReason: "invalid_request_error",
       },
     },
-    // 正文非空的失败消息仍只产生既有消息条目。
+    // 正文非空的失败消息：正文与失败两条独立条目，正文在前。
     {
       type: "message_end",
       message: {
@@ -165,7 +165,7 @@ test("真实桥接进程把模型调用失败事件按固定字段集合传给�
         errorMessage: "401 unauthorized",
       },
     },
-    // 无错误文本与已中止收尾不登记失败条目。
+    // 已中止且无错误文本：同样登记失败条目，文本落到兜底文案。
     {
       type: "message_end",
       message: {
@@ -195,6 +195,20 @@ test("真实桥接进程把模型调用失败事件按固定字段集合传给�
         model: "claude-sonnet-4-20250514",
       },
       { type: "message", content: [{ type: "text", text: "半句输出" }] },
+      {
+        type: "model_call_failure",
+        failure: "error",
+        message: "401 unauthorized",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      },
+      {
+        type: "model_call_failure",
+        failure: "aborted",
+        message: "Unknown error",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+      },
     ]);
     assert.deepEqual(faults, []);
   } finally {

@@ -20,6 +20,8 @@ const MAX_TOOL_ID_BYTES = 256;
 const MAX_ACTIVITY_STREAM_ID_BYTES = 128;
 /** provider 与 model 身份是短引用；它们不承载任意正文。 */
 const MAX_MODEL_IDENTITY_BYTES = 256;
+/** Pi 自身 UI 的兜底错误文案；采集层不新造文案。 */
+const UNKNOWN_ERROR_TEXT = "Unknown error";
 
 /** display epoch 是 canonical UUID；实时 wire 不接受任意 opaque token。 */
 export function isValidDisplayEpoch(value: unknown): value is string {
@@ -559,8 +561,20 @@ export interface SafeAssistantMessageEndEvent {
   };
 }
 
+/**
+ * 可由本运行实例产生并沿活动流上行的正文种类闭集；工具事实走产生端
+ * 专用规范化，不走该谓词。
+ */
+export function isOwnActivityBody(
+  event: SafeRpcBridgeEvent | SafeAssistantMessageEndEvent,
+): event is Extract<SafeAgentActivityEvent, { readonly type: "message" | "model_call_failure" }> {
+  return event.type === "message" || event.type === "model_call_failure";
+}
+
 export type RpcBridgeEventNormalization =
   | { readonly kind: "event"; readonly event: SafeRpcBridgeEvent | SafeAssistantMessageEndEvent }
+  /** 同一 Pi 事件产生多条独立活动条目（目前只有正文与失败事实并存）。 */
+  | { readonly kind: "events"; readonly events: readonly SafeRpcBridgeEvent[] }
   | { readonly kind: "ignored" }
   | { readonly kind: "invalid" }
   | { readonly kind: "rejected"; readonly reason: "reply_too_large" };
@@ -660,14 +674,18 @@ export function normalizeRpcBridgeEvent(event: unknown): RpcBridgeEventNormaliza
       if (event.message.role !== "assistant") return IGNORED_EVENT;
       const activity = normalizeActivityMessageEnd(event.message);
       if (activity.kind === "invalid") return INVALID_EVENT;
+      const failure = normalizeActivityModelCallFailure(event.message);
       // 结构合法但无有效正文（空块或空 content）的消息无内容可显示，
       // 忽略该事件而不是把它当成违约中断会话；只有携带失败事实的收尾
       // 消息例外：模型调用失败条目不依赖正文，仍要登记。
       if (activity.event.content.length === 0) {
-        const failure = normalizeActivityModelCallFailure(event.message);
         return failure === undefined ? IGNORED_EVENT : safeEvent(failure);
       }
-      return safeEvent(activity.event);
+      // 正文非空的失败消息同时产生两条独立条目：先正文、后失败，
+      // 两者身份独立，失败事实不挂在消息条目上。
+      return failure === undefined
+        ? safeEvent(activity.event)
+        : safeEvents(Object.freeze([activity.event, failure]));
     }
     case "extension_error":
       return safeEvent(Object.freeze({ type: "extension_error" }));
@@ -2434,27 +2452,28 @@ function normalizeActivityMessageEnd(
 
 /**
  * 从收尾 assistant 消息读取模型调用失败事实：收尾原因与错误文本都只在这里
- * 采集，不新增 Pi 事件订阅点。错误文本缺失、已中止收尾与无错误文本的静默
- * 溢出在这里都不登记条目；provider/model 不是合法短引用时同样忽略，
+ * 采集，不新增 Pi 事件订阅点。错误收尾与已中止收尾同形登记（收尾原因如实
+ * 记录，不参与呈现分支）；错误文本缺失（provider 只给状态不给正文）时使用
+ * Pi 自身的兜底文案，不自造新文案；无错误文本的静默溢出（长度收尾且零输出）
+ * 与正常收尾在这里不登记条目。provider/model 不是合法短引用时忽略，
  * 不把宿主事实差异升级为会话违约。
  */
 function normalizeActivityModelCallFailure(
   message: Record<string, unknown>,
 ): Extract<SafeAgentActivityEvent, { readonly type: "model_call_failure" }> | undefined {
-  if (message.stopReason !== "error") return undefined;
+  const stopReason = message.stopReason;
+  if (stopReason !== "error" && stopReason !== "aborted") return undefined;
   const errorText = message.errorMessage;
-  if (typeof errorText !== "string") return undefined;
   // 错误文本原样保留（只做终端安全净化）：不翻译、不摘要、不加前缀。
-  const text = sanitizeSafeActivityText(errorText);
-  if (text.length === 0) return undefined;
+  const text = typeof errorText === "string" ? sanitizeSafeActivityText(errorText) : "";
   const provider = message.provider;
   const model = message.model;
   if (!validBoundedText(provider, MAX_MODEL_IDENTITY_BYTES)) return undefined;
   if (!validBoundedText(model, MAX_MODEL_IDENTITY_BYTES)) return undefined;
   return Object.freeze({
     type: "model_call_failure" as const,
-    failure: "error" as const,
-    message: text,
+    failure: stopReason,
+    message: text.length === 0 ? UNKNOWN_ERROR_TEXT : text,
     provider,
     model,
   });
@@ -2509,6 +2528,12 @@ function safeEvent(
   event: SafeRpcBridgeEvent | SafeAssistantMessageEndEvent,
 ): RpcBridgeEventNormalization {
   return Object.freeze({ kind: "event", event });
+}
+
+function safeEvents(
+  events: readonly SafeRpcBridgeEvent[],
+): RpcBridgeEventNormalization {
+  return Object.freeze({ kind: "events", events });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
