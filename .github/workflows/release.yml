@@ -35,6 +35,20 @@ jobs:
       - name: 校验 tag 与包版本
         run: npm run release:validate -- "$GITHUB_REF_NAME"
 
+      - name: 校验发布说明文件
+        shell: bash
+        run: |
+          notes_path="release-notes/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$notes_path" ]]; then
+            echo "未找到发布说明文件：$notes_path"
+            exit 1
+          fi
+          if [[ ! -s "$notes_path" ]]; then
+            echo "发布说明文件为空：$notes_path"
+            exit 1
+          fi
+          echo "发布说明文件：$notes_path"
+
       - name: 安装依赖
         run: npm ci --ignore-scripts --legacy-peer-deps
 
@@ -63,12 +77,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 创建 Release 并生成发行说明
+      - name: 检出 tag 对应提交
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: 创建 Release 并写入发布说明
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --generate-notes \
+            --notes-file "release-notes/${GITHUB_REF_NAME}.md" \
             --title "$GITHUB_REF_NAME"

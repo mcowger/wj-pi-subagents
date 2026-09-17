@@ -73,23 +73,33 @@ test("release workflow 只监听版本形状 tag，npm 成功后才创建 GitHub
     .map((step) => step.run)
     .filter((run): run is string => typeof run === "string");
   const validateIndex = publishRuns.findIndex((run) => run.includes("release:validate"));
+  const notesIndex = publishRuns.findIndex((run) => run.includes("release-notes/"));
   const checkIndex = publishRuns.findIndex((run) => run.includes("npm run check"));
   const buildIndex = publishRuns.findIndex((run) => run.includes("npm run build:bridge"));
   const publishIndex = publishRuns.findIndex(
     (run) => run.includes("npm publish --ignore-scripts --access public --provenance"),
   );
   assert.ok(validateIndex >= 0);
-  assert.ok(checkIndex > validateIndex);
+  assert.ok(notesIndex > validateIndex, "发布说明文件应在 npm 发布前校验");
+  assert.ok(checkIndex > notesIndex);
   assert.ok(buildIndex > checkIndex);
   assert.ok(publishIndex > buildIndex);
 
   const release = asRecord(jobs.create_github_release);
   assert.equal(release.needs, "publish_npm");
   assert.equal(asRecord(release.permissions).contents, "write");
-  const releaseRuns = asArray(release.steps)
-    .map(asRecord)
+  const releaseSteps = asArray(release.steps).map(asRecord);
+  assert.ok(
+    releaseSteps.some((step) => step.uses === "actions/checkout@v6"),
+    "读取发布说明文件前必须检出 tag 对应提交",
+  );
+  const releaseRuns = releaseSteps
     .map((step) => step.run)
     .filter((run): run is string => typeof run === "string");
   assert.ok(releaseRuns.some((run) => run.includes("gh release create")));
-  assert.ok(releaseRuns.some((run) => run.includes("--verify-tag") && run.includes("--generate-notes")));
+  const createRun = releaseRuns.find((run) => run.includes("gh release create"));
+  assert.ok(createRun !== undefined);
+  assert.ok(createRun.includes("--verify-tag"));
+  assert.ok(createRun.includes("--notes-file \"release-notes/${GITHUB_REF_NAME}.md\""));
+  assert.equal(createRun.includes("--generate-notes"), false);
 });
