@@ -1115,7 +1115,9 @@ function isSafeActivityToolEvent(value: Record<string, unknown>): boolean {
 
 /**
  * 模型调用失败事件按固定字段集合校验：桥接帧闭集与产生端归一化保持同一
- * 形状，避免同一事件在发布侧合法、在接收侧变成通道故障。
+ * 形状，避免同一事件在发布侧合法、在接收侧变成通道故障。桥接 RPC 副本的
+ * 失败事实始终带 provider/model；无身份的压缩自身失败只走子代理产生端的
+ * 监督活动路径，不经过该闭集。
  */
 function isSafeModelCallFailureEvent(value: Record<string, unknown>): boolean {
   if (!Object.keys(value).every((key) => [

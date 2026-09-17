@@ -78,6 +78,25 @@ function modelFailureEntry(
   });
 }
 
+/** 压缩自身失败等拿不到发起模型身份的失败条目。 */
+function identitylessModelFailureEntry(
+  message: string,
+  failure: "error" | "aborted" = "error",
+  entryId: string = randomUUID(),
+): CanonicalAgentActivityEntry {
+  return Object.freeze({
+    contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+    agent_id: AGENT_ID,
+    incarnation_id: INCARNATION_ID,
+    entry_id: entryId,
+    body: Object.freeze({
+      type: "model_call_failure" as const,
+      failure,
+      message,
+    }),
+  });
+}
+
 function toolStart(
   toolCallId: string,
   toolName: string,
@@ -272,6 +291,25 @@ test("模型调用失败条目折叠行带展开标记，默认选中并沿用�
     viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
     ["▸ × Error: 401 unauthorized"],
   );
+});
+
+test("缺身份的失败条目折叠行不变，展开体直接以错误原文开头且不留空行", () => {
+  const viewer = new AgentActivityViewerModel(viewerAgent(), [
+    identitylessModelFailureEntry("compaction summarization failed\n  detail line"),
+  ], { viewport_height: 20 });
+  assert.deepEqual(
+    viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+    ["▸ × Error: compaction summarization failed"],
+  );
+  assert.equal(viewer.handleInput("\r"), "changed");
+  const lines = viewer.render(160).slice(1, -1).filter((line) => line.length > 0);
+  // 正文直接从错误原文开始：没有身份行、没有空行、没有占位文案。
+  assert.deepEqual(lines.map((line) => line.trimEnd()), [
+    "▾ × Error: compaction summarization failed",
+    "│ compaction summarization failed",
+    "│   detail line",
+  ]);
+  assert.doesNotMatch(lines.join("\n"), /anthropic|claude|·|n\/a|unknown identity/iu);
 });
 
 test("展开模型调用失败条目：首行 provider · model，其后为逐字保留换行与前导空白的错误原文", () => {

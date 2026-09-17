@@ -5,6 +5,7 @@ import {
   ACTIVITY_MAX_TEXT_BYTES,
   normalizeAssistantMessageEnd,
   normalizeAssistantMessageUpdate,
+  normalizeOwnCompactionFailure,
   normalizeRpcBridgeEvent,
   parseAgentActivityDisplayEvent,
   parseCanonicalAgentActivityDisplayEvent,
@@ -502,6 +503,70 @@ test("已中止收尾与错误同形登记失败条目，正文为空的静默�
   assert.deepEqual(normalizeRpcBridgeEvent(message({ provider: undefined })), { kind: "ignored" });
   assert.deepEqual(normalizeRpcBridgeEvent(message({ model: undefined })), { kind: "ignored" });
   assert.deepEqual(normalizeRpcBridgeEvent(message({ provider: 42 })), { kind: "ignored" });
+  // 两个都不可得同样不登记：收尾消息的失败事实仍以身份在场为采集前提，
+  // 无身份失败条目只来自压缩自身失败的产生端订阅。
+  assert.deepEqual(
+    normalizeRpcBridgeEvent(message({ provider: undefined, model: undefined })),
+    { kind: "ignored" },
+  );
+});
+
+test("压缩自身失败的产生端归一化：无身份登记、中止如实记录、文本缺失用兜底文案", () => {
+  // session_compact_failed 不携带 provider/model，条目以无身份形状成立。
+  assert.deepEqual(normalizeOwnCompactionFailure({
+    type: "session_compact_failed",
+    reason: "overflow",
+    errorMessage: "summarization request failed",
+    aborted: false,
+    willRetry: true,
+    fromExtension: false,
+  }), {
+    kind: "event",
+    event: {
+      type: "model_call_failure",
+      failure: "error",
+      message: "summarization request failed",
+    },
+  });
+  // aborted 为真记 aborted，与错误同形登记；无错误文本时用 Pi 兜底文案。
+  assert.deepEqual(normalizeOwnCompactionFailure({
+    type: "session_compact_failed",
+    reason: "threshold",
+    aborted: true,
+    willRetry: false,
+    fromExtension: false,
+  }), {
+    kind: "event",
+    event: { type: "model_call_failure", failure: "aborted", message: "Unknown error" },
+  });
+  // 错误文本原样保留（只做终端安全净化）。
+  assert.deepEqual(normalizeOwnCompactionFailure({
+    type: "session_compact_failed",
+    reason: "manual",
+    errorMessage: "line1\r\nline2\tend",
+    aborted: false,
+    willRetry: false,
+    fromExtension: true,
+  }), {
+    kind: "event",
+    event: { type: "model_call_failure", failure: "error", message: "line1\nline2  end" },
+  });
+  // 非压缩失败事件不登记条目；中止标志非真（含缺失）时按 error 记录。
+  assert.deepEqual(
+    normalizeOwnCompactionFailure({ type: "summarization_retry_finished", attempt: 2 }),
+    { kind: "invalid" },
+  );
+  assert.deepEqual(
+    normalizeOwnCompactionFailure({
+      type: "session_compact_failed",
+      reason: "manual",
+      errorMessage: "compaction failed",
+    }),
+    {
+      kind: "event",
+      event: { type: "model_call_failure", failure: "error", message: "compaction failed" },
+    },
+  );
 });
 
 test("错误文本缺失时用 Pi 兜底文案 Unknown error", () => {
@@ -638,7 +703,7 @@ test("上下文超限失败随收尾消息登记，无错误文本的静默溢�
   }), { kind: "ignored" });
 });
 
-test("自动重试事件不在桥接闭集内，不产生任何条目", () => {
+test("自动重试与压缩重试事件不在桥接闭集内，不产生任何条目", () => {
   assert.deepEqual(normalizeRpcBridgeEvent({
     type: "auto_retry_start",
     attempt: 2,
@@ -650,6 +715,22 @@ test("自动重试事件不在桥接闭集内，不产生任何条目", () => {
     type: "auto_retry_end",
     success: true,
     attempt: 2,
+  }), { kind: "ignored" });
+  // 压缩重试事件与自动重试同属重试类：桥接闭集不新增条目。
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "summarization_retry_scheduled",
+    attempt: 2,
+    maxAttempts: 3,
+    delayMs: 1_000,
+  }), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "summarization_retry_attempt_start",
+    attempt: 2,
+  }), { kind: "ignored" });
+  assert.deepEqual(normalizeRpcBridgeEvent({
+    type: "summarization_retry_finished",
+    attempt: 2,
+    success: false,
   }), { kind: "ignored" });
 });
 

@@ -1138,15 +1138,16 @@ export class AgentActivityViewerModel {
       }
 
       if (body.type === "model_call_failure") {
-        // 失败条目只服务活动显示：折叠态用错误文本首行，展开体用 provider、
-        // model 与错误文本原文。
+        // 失败条目只服务活动显示：折叠态用错误文本首行，展开体用身份行（可得时）
+        // 与错误文本原文；压缩自身失败不携带身份，展开体直接从原文开始。
         entries.push({
           kind: "model_call_failure",
           entryId: entry.entry_id,
           incarnationId: entry.incarnation_id,
           message: body.message,
-          provider: body.provider,
-          model: body.model,
+          ...(body.provider === undefined || body.model === undefined
+            ? {}
+            : { provider: body.provider, model: body.model }),
         });
         continue;
       }
@@ -1646,8 +1647,9 @@ type DisplayEntry =
       readonly entryId: string;
       readonly incarnationId: string;
       readonly message: string;
-      readonly provider: string;
-      readonly model: string;
+      /** 发起该次失败的模型；压缩自身失败等场景不可得时缺失。 */
+      readonly provider?: string;
+      readonly model?: string;
     }
   | {
       readonly kind: "live";
@@ -1926,11 +1928,19 @@ function firstLine(value: string): string {
 }
 
 /**
- * 模型调用失败展开体：首行为 `provider · model`，其后为错误文本原文。整段
- * 作为一块预格式化正文渲染，因此换行、前导空白与软折行行为与工具失败一致。
+ * 模型调用失败展开体：身份可得时首行为 `provider · model`，其后为错误文本
+ * 原文；身份缺失（压缩自身失败）时正文直接以错误原文开头，不写占位文案、
+ * 不留空行。整段作为一块预格式化正文渲染，因此换行、前导空白与软折行行为
+ * 与工具失败一致。
  */
-function modelCallFailureBodySource(provider: string, model: string, message: string): string {
-  return `${provider}${SUMMARY_SEPARATOR}${model}\n${message}`;
+function modelCallFailureBodySource(
+  provider: string | undefined,
+  model: string | undefined,
+  message: string,
+): string {
+  return provider === undefined || model === undefined
+    ? message
+    : `${provider}${SUMMARY_SEPARATOR}${model}\n${message}`;
 }
 
 /**

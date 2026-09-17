@@ -32,6 +32,7 @@ import {
   createOwnToolActivityNormalizerState,
   isOwnActivityBody,
   normalizeAssistantMessageUpdate,
+  normalizeOwnCompactionFailure,
   normalizeRpcBridgeEvent,
   type AgentActivityEventNormalization,
   type AgentDisplayStreamUpdate,
@@ -804,6 +805,13 @@ function readOwnActivityEvents(
     const normalized = normalizeOwnActivity(event);
     return normalized.kind === "event" ? [normalized.event] : [];
   }
+  // 压缩自身（summarization 调用）失败也是模型调用失败事实，但只在产生端
+  // `session_compact_failed` 上可见；桥接/RPC 事件闭集保持不变。压缩重试
+  // 事件与自动重试事件一样不订阅、不采集。
+  if (isRecord(event) && event.type === "session_compact_failed") {
+    const normalized = normalizeOwnCompactionFailure(event);
+    return normalized.kind === "event" ? [normalized.event] : [];
+  }
   const normalized = normalizeRpcBridgeEvent(event);
   if (normalized.kind === "event") {
     return isOwnActivityBody(normalized.event) ? [normalized.event] : [];
@@ -1238,6 +1246,11 @@ export function createWjPiSubagentsRuntimeActivator(
       observeOwnActivity(current, event, normalizeOwnActivity, ownDisplayTracker.latestDisplayStream);
       current.replyCoordinator?.observeAssistantMessageEnd(event);
       refreshContextUsage(current, rawContext);
+    });
+
+    // 压缩自身失败只发生在产生端：不新增桥接/RPC 事件闭集，也不订阅压缩重试事件。
+    api.on("session_compact_failed", (event) => {
+      observeOwnActivity(active, event, normalizeOwnActivity);
     });
 
     api.on("tool_execution_start", (event) => {

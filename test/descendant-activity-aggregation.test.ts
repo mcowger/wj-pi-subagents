@@ -481,6 +481,170 @@ test("模型调用失败沿桥接归一化、监督通道、活动缓存贯通�
   }
 });
 
+test("压缩自身失败沿产生端订阅登记为无身份失败条目，压缩重试事件不产生任何条目", async () => {
+  const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
+  const listener = await transportAdapter.listen({
+    agentId: CHILD_ID,
+    credential: LOCAL_CREDENTIAL,
+  });
+  const api = new FakeExtensionApi();
+  const context = {
+    cwd: process.cwd(),
+    mode: "print",
+    hasUI: false,
+    isProjectTrusted: () => true,
+  };
+  let parentChannel: StreamSupervisorChannel | undefined;
+  const delivered: SupervisorActivityDelivery[] = [];
+  const lifecycleEvents: unknown[] = [];
+  const replies: unknown[] = [];
+  const faults: unknown[] = [];
+  const activator = createWjPiSubagentsRuntimeActivator({
+    environment: childEnvironment(listener.endpoint),
+    localSupervisorTransportAdapter: transportAdapter,
+    templateFileSystem: {
+      readDirectory: () => [],
+      readFile: () => {
+        throw new Error("unexpected template read");
+      },
+    },
+  });
+
+  const parentReady = (async () => {
+    const transport = await listener.waitForConnection(AbortSignal.timeout(2_000));
+    const channel = new StreamSupervisorChannel({
+      role: "parent",
+      rootId: ROOT_ID,
+      localAgentId: null,
+      peerAgentId: CHILD_ID,
+      parentAgentId: null,
+      depth: 1,
+      credential: SUPERVISOR_CREDENTIAL,
+      requestIdRegistry: new SupervisorRequestIdRegistry(),
+      transport,
+      onReply: (reply) => {
+        replies.push(reply);
+        return true;
+      },
+    });
+    parentChannel = channel;
+    channel.onActivity((activity) => delivered.push(activity));
+    channel.onEvent((event) => lifecycleEvents.push(event));
+    channel.onFault((fault) => faults.push(fault));
+    const signal = AbortSignal.timeout(2_000);
+    await channel.bind(signal);
+    await channel.waitForReady(signal);
+  })();
+
+  try {
+    await activator(api as unknown as ExtensionApiSurface, {
+      ok: true,
+      nodeVersion: process.versions.node,
+      piVersion: "0.85.1",
+      platform: process.platform,
+      processTreeAdapter: {} as never,
+    } as AvailableHostCapabilities);
+    await Promise.all([
+      api.emit("session_start", { type: "session_start", reason: "startup" }, context),
+      parentReady,
+    ]);
+    const lifecycleBefore = lifecycleEvents.length;
+
+    // 压缩自身（summarization 调用）失败：事实只在产生端可见，不携带发起它的
+    // provider/model。压缩重试事件与自动重试事件一样不订阅也不采集。
+    await api.emit("session_compact_failed", {
+      type: "session_compact_failed",
+      reason: "overflow",
+      errorMessage: "summarization request failed\nline2",
+      aborted: false,
+      willRetry: true,
+      fromExtension: false,
+    }, context);
+    await api.emit("summarization_retry_scheduled", {
+      type: "summarization_retry_scheduled",
+      attempt: 2,
+      maxAttempts: 3,
+      delayMs: 1_000,
+    }, context);
+    await api.emit("summarization_retry_attempt_start", {
+      type: "summarization_retry_attempt_start",
+      attempt: 2,
+    }, context);
+    await api.emit("summarization_retry_finished", {
+      type: "summarization_retry_finished",
+      attempt: 2,
+      success: false,
+    }, context);
+    await api.emit("auto_retry_start", {
+      type: "auto_retry_start",
+      attempt: 1,
+      maxAttempts: 2,
+      delayMs: 100,
+      errorMessage: "rate limited",
+    }, context);
+    await waitForCount(delivered, 1);
+
+    assert.equal(delivered.length, 1);
+    const delivery = delivered[0]!;
+    assert.equal(delivery.agent_id, CHILD_ID);
+    // 条目仍完整成立：收尾原因与错误文本在场，身份整个缺失。
+    assert.deepEqual(delivery.entry.body, {
+      type: "model_call_failure",
+      failure: "error",
+      message: "summarization request failed\nline2",
+    });
+
+    // 顶层活动缓存 → 活动面板：折叠行不变，展开体直接以错误原文开头。
+    const cache = new AgentActivityCache();
+    const recorded = cache.record(delivery.agent_id, delivery.entry);
+    assert.equal(recorded.accepted, true);
+    const viewer = new AgentActivityViewerModel({
+      agent_id: CHILD_ID,
+      template_id: "worker",
+      name: "worker-a",
+      state: "working",
+    }, cache.replay(CHILD_ID), { viewport_height: 20 });
+    assert.deepEqual(
+      viewer.render(160).slice(1, -1).filter((line) => line.length > 0),
+      ["▸ × Error: summarization request failed"],
+    );
+    assert.equal(viewer.handleInput("\r"), "changed");
+    assert.deepEqual(
+      viewer.render(160).slice(1, -1).filter((line) => line.length > 0).map((line) => line.trimEnd()),
+      [
+        "▾ × Error: summarization request failed",
+        "│ summarization request failed",
+        "│ line2",
+      ],
+    );
+
+    // 被中止的压缩失败同形登记，只有收尾原因如实不同；文本缺失用兜底文案。
+    await api.emit("session_compact_failed", {
+      type: "session_compact_failed",
+      reason: "threshold",
+      aborted: true,
+      willRetry: false,
+      fromExtension: false,
+    }, context);
+    await waitForCount(delivered, 2);
+    assert.deepEqual(delivered[1]?.entry.body, {
+      type: "model_call_failure",
+      failure: "aborted",
+      message: "Unknown error",
+    });
+    assert.equal(new Set(delivered.map((item) => item.entry.entry_id)).size, delivered.length);
+
+    // 版本一致时活动链路不被判为无效帧，也不触发生命周期转换或父代理回复。
+    assert.deepEqual(faults, []);
+    assert.equal(lifecycleEvents.length, lifecycleBefore);
+    assert.deepEqual(replies, []);
+  } finally {
+    await api.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, context).catch(() => {});
+    await parentChannel?.release().catch(() => {});
+    await listener.close().catch(() => {});
+  }
+});
+
 test("子模式扩展跨实例 reload 后恢复 display source generation 并轮换活动身份", async () => {
   const transportAdapter = new InMemoryLocalSupervisorTransportAdapter();
   const listener = await transportAdapter.listen({

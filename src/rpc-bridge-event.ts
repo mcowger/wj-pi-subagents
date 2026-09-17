@@ -419,8 +419,12 @@ export type SafeAgentActivityEvent =
       readonly failure: SafeModelCallFailureReason;
       /** 错误文本原文；缺失时由采集层使用 Pi 的兜底文案。 */
       readonly message: string;
-      readonly provider: string;
-      readonly model: string;
+      /**
+       * 发起该次失败的模型；压缩自身失败等场景不可得时整个字段缺失。
+       * provider 与 model 同进同出，不允许只出现一个。
+       */
+      readonly provider?: string;
+      readonly model?: string;
     };
 
 /** 模型调用失败的收尾原因闭集：错误与已中止。 */
@@ -869,19 +873,18 @@ export function parseAgentActivityEvent(value: unknown): AgentActivityEventNorma
       if (!isSafeModelCallFailureReason(value.failure)) return INVALID_ACTIVITY_EVENT;
       if (
         !hasOnlyModelCallFailureKeys(value)
-        || !validBoundedText(value.provider, MAX_MODEL_IDENTITY_BYTES)
-        || !validBoundedText(value.model, MAX_MODEL_IDENTITY_BYTES)
         || typeof value.message !== "string"
         || value.message.length === 0
       ) return INVALID_ACTIVITY_EVENT;
+      const identity = parseModelCallFailureIdentity(value);
+      if (identity === undefined) return INVALID_ACTIVITY_EVENT;
       return Object.freeze({
         kind: "event",
         event: Object.freeze({
           type: "model_call_failure" as const,
           failure: value.failure,
           message: value.message,
-          provider: value.provider,
-          model: value.model,
+          ...identity,
         }),
       });
     }
@@ -902,6 +905,25 @@ function hasOnlyModelCallFailureKeys(value: Record<string, unknown>): boolean {
   return Object.keys(value).every((key) => (
     key === "type" || key === "failure" || key === "message" || key === "provider" || key === "model"
   ));
+}
+
+/**
+ * 失败条目的模型身份：provider 与 model 要么同时在场、要么同时缺失。
+ * 缺失身份是正当事实（压缩自身失败不携带发起它的模型），此时返回空对象；
+ * 单边缺失、空串、超长或非文本身份都是违约，返回 undefined。
+ */
+function parseModelCallFailureIdentity(
+  value: Record<string, unknown>,
+): { readonly provider?: string; readonly model?: string } | undefined {
+  const hasProvider = value.provider !== undefined;
+  const hasModel = value.model !== undefined;
+  if (!hasProvider && !hasModel) return {};
+  if (
+    !hasProvider || !hasModel
+    || !validBoundedText(value.provider, MAX_MODEL_IDENTITY_BYTES)
+    || !validBoundedText(value.model, MAX_MODEL_IDENTITY_BYTES)
+  ) return undefined;
+  return { provider: value.provider, model: value.model };
 }
 
 /**
@@ -954,10 +976,12 @@ export function parseCanonicalAgentActivityEvent(
       ) return INVALID_ACTIVITY_EVENT;
       return parseAgentActivityEvent(value);
     case "model_call_failure":
-      // 失败条目一次定死四个字段：收尾原因、错误文本、provider 与 model。
-      if (!hasExactObjectKeys(
+      // 收尾原因与错误文本必填；provider 与 model 同进同出（压缩自身失败无身份）。
+      // 单边身份由通用 parser 的同一不变量拒绝，不在这里重复判定。
+      if (!hasExactKeysWithOptional(
         value,
-        ["type", "failure", "message", "provider", "model"],
+        ["type", "failure", "message"],
+        ["provider", "model"],
       )) return INVALID_ACTIVITY_EVENT;
       return parseAgentActivityEvent(value);
     default:
@@ -2465,7 +2489,6 @@ function normalizeActivityModelCallFailure(
   if (stopReason !== "error" && stopReason !== "aborted") return undefined;
   const errorText = message.errorMessage;
   // 错误文本原样保留（只做终端安全净化）：不翻译、不摘要、不加前缀。
-  const text = typeof errorText === "string" ? sanitizeSafeActivityText(errorText) : "";
   const provider = message.provider;
   const model = message.model;
   if (!validBoundedText(provider, MAX_MODEL_IDENTITY_BYTES)) return undefined;
@@ -2473,10 +2496,43 @@ function normalizeActivityModelCallFailure(
   return Object.freeze({
     type: "model_call_failure" as const,
     failure: stopReason,
-    message: text.length === 0 ? UNKNOWN_ERROR_TEXT : text,
+    message: failureMessageText(errorText),
     provider,
     model,
   });
+}
+
+/**
+ * 压缩自身（summarization 调用）失败的产生端归一化：事实只在 `session_compact_failed`
+ * 上可见，且不携带发起它的 provider/model，因此条目以无身份形状登记。
+ * `aborted` 为真记 `aborted`，否则记 `error`；错误文本缺失时用 Pi 的兜底文案。
+ * 该订阅只发生在产生端扩展，不进入桥接/RPC 事件闭集；压缩重试事件既不
+ * 订阅也不采集。
+ */
+export function normalizeOwnCompactionFailure(
+  event: unknown,
+): AgentActivityEventNormalization {
+  if (!isRecord(event) || event.type !== "session_compact_failed") {
+    return INVALID_ACTIVITY_EVENT;
+  }
+  return Object.freeze({
+    kind: "event",
+    event: Object.freeze({
+      type: "model_call_failure" as const,
+      // 中止标志为真记 aborted，否则记 error；两种取值呈现完全相同。
+      failure: event.aborted === true ? "aborted" as const : "error" as const,
+      message: failureMessageText(event.errorMessage),
+    }),
+  });
+}
+
+/**
+ * 失败事实的文本原文：只做终端安全净化（不翻译、不摘要、不加前缀）；
+ * 缺失或为空时使用 Pi 自身的兜底文案，不自造新文案。
+ */
+function failureMessageText(value: unknown): string {
+  const text = typeof value === "string" ? sanitizeSafeActivityText(value) : "";
+  return text.length === 0 ? UNKNOWN_ERROR_TEXT : text;
 }
 
 function normalizeActivityContent(

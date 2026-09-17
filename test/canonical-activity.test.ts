@@ -236,6 +236,37 @@ test("/12 canonical wire 对模型调用失败条目执行固定字段闭集校�
   assert.equal(parseCanonicalAgentActivityEvent({ ...body, message: 42 }).kind, "invalid");
 });
 
+test("/12 canonical wire 接受缺身份的模型调用失败条目（压缩自身失败不带 provider/model）", () => {
+  const body = {
+    type: "model_call_failure" as const,
+    failure: "error" as const,
+    message: "compaction summarization failed",
+  };
+  const parsed = parseCanonicalAgentActivityEntry(validEntry({ body: body as never }));
+  assert.equal(parsed.kind, "entry");
+  if (parsed.kind === "entry") {
+    // 缺身份时条目仍完整成立：只有收尾原因与错误文本两个必填字段。
+    assert.deepEqual(parsed.entry.body, {
+      type: "model_call_failure",
+      failure: "error",
+      message: "compaction summarization failed",
+    });
+  }
+  assert.equal(parseCanonicalAgentActivityEvent(body).kind, "event");
+  assert.equal(parseAgentActivityEvent(body).kind, "event");
+  // provider 与 model 同进同出：单边身份、空串与超长仍然违约。
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, provider: "anthropic" }).kind, "invalid");
+  assert.equal(parseCanonicalAgentActivityEvent({ ...body, model: "gpt-5" }).kind, "invalid");
+  assert.equal(
+    parseCanonicalAgentActivityEvent({ ...body, provider: "anthropic", model: "" }).kind,
+    "invalid",
+  );
+  assert.equal(
+    parseCanonicalAgentActivityEvent({ ...body, provider: "anthropic", model: "gpt-5" }).kind,
+    "event",
+  );
+});
+
 test("/12 长错误文本的失败条目仍按身份分块并可完整重组", () => {
   const text = "provider payload\n".repeat(6_000);
   const entry = validEntry({

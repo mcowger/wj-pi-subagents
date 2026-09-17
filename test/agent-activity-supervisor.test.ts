@@ -352,12 +352,28 @@ test("版本一致时监督通道在发布侧与接收侧都接受模型调用�
     });
     await channels.child.publishActivity({ entry });
 
+    // 缺身份的压缩自身失败条目也同样在发布侧与接收侧被接受：身份整个缺失，
+    // 不产生无效帧，也不使通道进入故障。
+    const identitylessEntry: CanonicalAgentActivityEntry = Object.freeze({
+      contract_version: CANONICAL_ACTIVITY_CONTRACT_VERSION,
+      agent_id: CHILD_ID,
+      incarnation_id: randomUUID(),
+      entry_id: randomUUID(),
+      body: Object.freeze({
+        type: "model_call_failure" as const,
+        failure: "aborted" as const,
+        message: "Unknown error",
+      }),
+    });
+    await channels.child.publishActivity({ entry: identitylessEntry });
+
     // 大错误正文按身份分块上行；接收侧重组出的条目与发布侧逐字一致。
     const deliveries = events.filter((event): event is Extract<RpcSupervisorEvent, { kind: "activity_stream" }> =>
       event.kind === "activity_stream");
-    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries.length, 2);
     assert.equal(deliveries[0]?.agent_id, CHILD_ID);
     assert.deepEqual(deliveries[0]?.entry, entry);
+    assert.deepEqual(deliveries[1]?.entry, identitylessEntry);
     assert.deepEqual(faults, []);
     // 收发两侧都不因合法失败条目进入通道故障。
     assert.equal(channels.parent.getPublicState().state, "ready");
