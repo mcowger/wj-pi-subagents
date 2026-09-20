@@ -86,8 +86,10 @@ pi list
 User-level templates go in:
 
 ```text
-<USER_HOME>/.pi/agent/agents/*.md
+<PI_AGENT_DIR>/agents/*.md
 ```
+
+`<PI_AGENT_DIR>` is Pi's user-level agent directory: it follows the `PI_CODING_AGENT_DIR` environment variable and falls back to `<USER_HOME>/.pi/agent` when that variable is unset or empty.
 
 Project-level templates go in:
 
@@ -232,8 +234,10 @@ A few things worth knowing:
 
 | Scope | Path | Description |
 | --- | --- | --- |
-| User-level | `<USER_HOME>/.pi/agent/agents/*.md` | Available to all projects |
+| User-level | `<PI_AGENT_DIR>/agents/*.md` | Available to all projects |
 | Project-level | `<PROJECT_DIR>/.pi/agents/*.md` | Available only after the project is authorized by Pi |
+
+`<PI_AGENT_DIR>` is Pi's user-level agent directory: it follows the `PI_CODING_AGENT_DIR` environment variable and falls back to `<USER_HOME>/.pi/agent` when that variable is unset or empty.
 
 The template directory only reads direct, lowercase `.md` files and does not scan subdirectories recursively. When a project template shares a name with a user template, the project template wins. Template IDs are case-sensitive.
 
@@ -286,9 +290,11 @@ Confirm the existing implementation and constraints first, then make the changes
 Runtime configuration can be placed at:
 
 ```text
-<USER_HOME>/.pi/agent/wj-pi-subagents.json
+<PI_AGENT_DIR>/wj-pi-subagents.json
 <PROJECT_DIR>/.pi/wj-pi-subagents.json
 ```
+
+`<PI_AGENT_DIR>` is Pi's user-level agent directory: it follows the `PI_CODING_AGENT_DIR` environment variable and falls back to `<USER_HOME>/.pi/agent` when that variable is unset or empty.
 
 An authorized project configuration takes precedence over user configuration. When no configuration is provided, these defaults apply:
 

@@ -1,8 +1,8 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMap, isScalar, isSeq, LineCounter, parseDocument } from "yaml";
-import type { RuntimeUiContext } from "./root-runtime-context.ts";
+import { resolvePiAgentDir } from "./pi-agent-dir.ts";
+import type { RootRuntimeContext, RuntimeUiContext } from "./root-runtime-context.ts";
 
 export type TemplateSource = "user" | "project";
 
@@ -120,11 +120,16 @@ export interface TemplateDiscoveryOptions {
   readonly root: {
     readonly cwd: string;
     readonly projectTrust: boolean;
+    /** 用户级 Pi agent 目录；由调用方解析后注入，本模块不自行读取环境。 */
+    readonly userAgentDirectory: string;
   };
   readonly fileSystem?: TemplateDiscoveryFileSystem;
 }
 
-export type TemplateSnapshotControllerOptions = TemplateDiscoveryOptions;
+/** 根控制器持有含环境快照的根上下文，用户级目录在构造时固定一次。 */
+export type TemplateSnapshotControllerOptions = Omit<TemplateDiscoveryOptions, "root"> & {
+  readonly root: Pick<RootRuntimeContext, "cwd" | "projectTrust" | "environment">;
+};
 
 interface FrontmatterLocation {
   readonly line?: number;
@@ -675,7 +680,7 @@ function scanSource(
 
 function sourceDirectory(source: TemplateSource, root: TemplateDiscoveryOptions["root"]): string {
   return source === "user"
-    ? join(homedir(), ".pi", "agent", "agents")
+    ? join(root.userAgentDirectory, "agents")
     : join(root.cwd, ".pi", "agents");
 }
 
@@ -847,6 +852,7 @@ export class TemplateSnapshotController {
     const root = freezeRecord({
       cwd: options.root.cwd,
       projectTrust: options.root.projectTrust,
+      userAgentDirectory: resolvePiAgentDir(options.root.environment),
     });
     this.options = freezeRecord({
       root,

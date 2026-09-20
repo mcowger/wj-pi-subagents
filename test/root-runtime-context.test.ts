@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import test from "node:test";
+import { PI_AGENT_DIR_ENV_KEY, resolvePiAgentDir } from "../src/pi-agent-dir.ts";
 import {
   captureRootRuntimeContext,
   createChildRuntimeContext,
@@ -24,10 +25,17 @@ function missingConfigFile(): Error {
   return error;
 }
 
+/** 显式注入的用户级 Pi agent 目录；用例不依赖宿主环境或真实 home。 */
+const USER_AGENT_DIR = resolve("runtime-context-fixtures", "user-agent");
+
+function userEnvironment(extra: Readonly<Record<string, string>> = {}): Record<string, string> {
+  return { [PI_AGENT_DIR_ENV_KEY]: USER_AGENT_DIR, ...extra };
+}
+
 function configFilePaths(cwd: string): { project: string; user: string } {
   return {
     project: join(resolve(cwd), ".pi", "wj-pi-subagents.json"),
-    user: join(homedir(), ".pi", "agent", "wj-pi-subagents.json"),
+    user: join(USER_AGENT_DIR, "wj-pi-subagents.json"),
   };
 }
 
@@ -66,10 +74,10 @@ test("根上下文只捕获一次 cwd、信任和环境，并让子代理沿用�
   const root = captureRootRuntimeContext({
     cwd: rootCwd,
     projectTrust: true,
-    environment: {
+    environment: userEnvironment({
       PI_SECRET_CANARY: "top-secret",
       STABLE_VALUE: "root",
-    },
+    }),
   });
 
   const requestedChildIdentity = {
@@ -190,6 +198,7 @@ test("根参数、可信项目、用户配置按字段优先级解析并冻结�
     cwd,
     rootArguments: { maxDepth: 3 },
     projectTrust: true,
+    environment: userEnvironment(),
   }, configReader(new Map([
     [paths.project, JSON.stringify({ maxDepth: 5, maxChildrenPerAgent: 7 })],
     [paths.user, JSON.stringify({
@@ -244,6 +253,7 @@ test("未信任项目不读取项目配置，并使用用户层", () => {
   const result = resolveRuntimeConfig({
     cwd,
     projectTrust: false,
+    environment: userEnvironment(),
   }, {
     readFile: (path) => {
       if (path === paths.project) projectReads += 1;
@@ -263,6 +273,7 @@ test("项目层字段非法时直接采用默认值，不回退用户层", () =>
   const result = resolveRuntimeConfig({
     cwd,
     projectTrust: true,
+    environment: userEnvironment(),
   }, configReader(new Map([
     [paths.project, JSON.stringify({ maxDepth: 99, maxChildrenPerAgent: 6 })],
     [paths.user, JSON.stringify({ maxDepth: 5, maxChildrenPerAgent: 8, maxAgentsPerTree: 24 })],
@@ -281,6 +292,7 @@ test("配置文件不可读时受影响字段采用默认值且不暴露底层�
   const result = resolveRuntimeConfig({
     cwd,
     projectTrust: true,
+    environment: userEnvironment(),
   }, {
     readFile: (path) => {
       if (path === paths.project) {
@@ -306,6 +318,7 @@ test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () =>
   const result = resolveRuntimeConfig({
     cwd,
     projectTrust: true,
+    environment: userEnvironment(),
   }, {
     readFile: (path) => {
       paths.push(path);
@@ -331,6 +344,7 @@ test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () =>
   const unknown = resolveRuntimeConfig({
     cwd: unknownCwd,
     projectTrust: true,
+    environment: userEnvironment(),
   }, configReader(new Map([
     [unknownPaths.project, JSON.stringify({ maxDepth: 3, ignored: "SECRET-123" })],
     [unknownPaths.user, JSON.stringify({})],
@@ -347,6 +361,7 @@ test("坏 JSON、不可读文件和未知字段只产生脱敏 UI 诊断", () =>
   const invalidShape = resolveRuntimeConfig({
     cwd: invalidShapeCwd,
     projectTrust: true,
+    environment: userEnvironment(),
   }, configReader(new Map([
     [invalidShapePaths.project, JSON.stringify([])],
     [invalidShapePaths.user, JSON.stringify({ maxDepth: 8 })],
@@ -420,6 +435,7 @@ test("配置文件只从固定项目和用户位置读取 UTF-8 JSON", () => {
   const options = {
     cwd,
     projectTrust: true,
+    environment: userEnvironment(),
     projectConfigPath: fixtureCwd("attempted-override", "project.json"),
     userConfigPath: fixtureCwd("attempted-override", "user.json"),
     homeDir: fixtureCwd("attempted-override"),
@@ -438,10 +454,76 @@ test("配置文件只从固定项目和用户位置读取 UTF-8 JSON", () => {
   assert.deepEqual(observedPaths, [paths.project, paths.user]);
 });
 
+test("用户级 agent 目录跟随 PI_CODING_AGENT_DIR，未设置或空串时回退默认位置", () => {
+  const customAgentDir = fixtureCwd("custom-agent");
+  assert.equal(PI_AGENT_DIR_ENV_KEY, "PI_CODING_AGENT_DIR");
+  assert.equal(resolvePiAgentDir({ [PI_AGENT_DIR_ENV_KEY]: customAgentDir }), customAgentDir);
+  assert.equal(resolvePiAgentDir({ [PI_AGENT_DIR_ENV_KEY]: "~" }), homedir());
+  assert.equal(
+    resolvePiAgentDir({ [PI_AGENT_DIR_ENV_KEY]: "~/custom-agent" }),
+    join(homedir(), "custom-agent"),
+  );
+  assert.equal(resolvePiAgentDir({}), join(homedir(), ".pi", "agent"));
+  assert.equal(resolvePiAgentDir({ [PI_AGENT_DIR_ENV_KEY]: "" }), join(homedir(), ".pi", "agent"));
+  const relative = resolvePiAgentDir({ [PI_AGENT_DIR_ENV_KEY]: "relative-agent-dir" });
+  assert.equal(relative, resolve("relative-agent-dir"));
+  assert.equal(isAbsolute(relative), true);
+
+  if (process.platform === "win32") {
+    assert.equal(
+      resolvePiAgentDir({ [PI_AGENT_DIR_ENV_KEY]: "~\\custom-agent" }),
+      join(homedir(), "custom-agent"),
+    );
+  }
+});
+
+test("用户级配置从 PI_CODING_AGENT_DIR 读取，~ 展开为 home 且空串回退默认位置", () => {
+  const cwd = fixtureCwd("workspace", "user-agent-dir");
+  const customAgentDir = fixtureCwd("custom-agent-dir");
+  const customPath = join(customAgentDir, "wj-pi-subagents.json");
+  const decoyPath = join(homedir(), ".pi", "agent", "wj-pi-subagents.json");
+  const observedPaths: string[] = [];
+  const result = resolveRuntimeConfig({
+    cwd,
+    projectTrust: false,
+    environment: { [PI_AGENT_DIR_ENV_KEY]: customAgentDir },
+  }, configReader(new Map([
+    [customPath, JSON.stringify({ maxDepth: 6, waitTimeoutMs: 30_000 })],
+    [decoyPath, JSON.stringify({ maxDepth: 3 })],
+  ]), observedPaths));
+
+  assert.equal(result.config.maxDepth, 6);
+  assert.equal(result.config.waitTimeoutMs, 30_000);
+  assert.equal(result.sources.maxDepth, "user");
+  assert.deepEqual(observedPaths, [customPath]);
+
+  const tildePath = join(homedir(), "custom-pi-agent", "wj-pi-subagents.json");
+  const tildeObserved: string[] = [];
+  const tildeResult = resolveRuntimeConfig({
+    cwd,
+    projectTrust: false,
+    environment: { [PI_AGENT_DIR_ENV_KEY]: "~/custom-pi-agent" },
+  }, configReader(new Map([[tildePath, JSON.stringify({ maxDepth: 7 })]]), tildeObserved));
+  assert.equal(tildeResult.config.maxDepth, 7);
+  assert.deepEqual(tildeObserved, [tildePath]);
+
+  const emptyObserved: string[] = [];
+  resolveRuntimeConfig({
+    cwd,
+    projectTrust: false,
+    environment: { [PI_AGENT_DIR_ENV_KEY]: "" },
+  }, configReader(new Map(), emptyObserved));
+  assert.deepEqual(emptyObserved, [decoyPath]);
+});
+
 test("无效 UTF-8 配置不会被替换字符悄悄接受", () => {
   const cwd = fixtureCwd("workspace", "invalid-utf8");
   const paths = configFilePaths(cwd);
-  const result = resolveRuntimeConfig({ cwd, projectTrust: true }, configReader(new Map<string, ConfigFileContent>([
+  const result = resolveRuntimeConfig({
+    cwd,
+    projectTrust: true,
+    environment: userEnvironment(),
+  }, configReader(new Map<string, ConfigFileContent>([
     [paths.project, Buffer.from([0x7b, 0xff, 0x7d])],
     [paths.user, JSON.stringify({ maxDepth: 8 })],
   ])));
@@ -455,11 +537,11 @@ test("根上下文存储只捕获一次，配置诊断在根 UI 最多通知一�
   const paths = configFilePaths(".");
   const first = store.capture({
     cwd: ".",
-    environment: { STABLE: "first" },
+    environment: userEnvironment({ STABLE: "first" }),
   }, configReader(new Map([[paths.user, JSON.stringify({ maxDepth: 0 })]])));
   const second = store.capture({
     cwd: "..",
-    environment: { STABLE: "second" },
+    environment: userEnvironment({ STABLE: "second" }),
   });
   const notifications: string[] = [];
   const ui = {
@@ -513,6 +595,7 @@ test("根捕获可选地发送一次 UI-only 配置诊断，不触碰消息接�
   const paths = configFilePaths(cwd);
   const root = captureRootRuntimeContext({
     cwd,
+    environment: userEnvironment(),
     uiContext,
   }, configReader(new Map([[paths.user, JSON.stringify({ unknownSecretField: "do-not-show" })]])));
 
@@ -535,6 +618,7 @@ test("UI 通知抛错时也不重复尝试或泄露配置异常", () => {
   const paths = configFilePaths(cwd);
   const root = captureRootRuntimeContext({
     cwd,
+    environment: userEnvironment(),
   }, configReader(new Map([[paths.user, JSON.stringify({ maxDepth: 0 })]])));
   const first = root.notifyDiagnostics({
     hasUI: true,

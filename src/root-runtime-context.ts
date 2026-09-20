@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { resolvePiAgentDir } from "./pi-agent-dir.ts";
 
 /** 根会话启动时固定的数量配置字段。 */
 export const RUNTIME_CONFIG_FIELDS = [
@@ -428,6 +428,8 @@ interface CapturedRuntimeConfigInputs {
   readonly cwd: string;
   readonly projectTrust: boolean;
   readonly explicit: Readonly<Record<string, unknown>> | undefined;
+  /** 用户级固定位置；与根环境快照同源捕获一次，之后不再读取环境。 */
+  readonly userAgentDirectory: string;
 }
 
 function captureRuntimeConfigInputs(options: RootRuntimeContextOptions): CapturedRuntimeConfigInputs {
@@ -436,6 +438,7 @@ function captureRuntimeConfigInputs(options: RootRuntimeContextOptions): Capture
     cwd: resolve(options.cwd ?? process.cwd()),
     projectTrust: options.projectTrust === true,
     explicit,
+    userAgentDirectory: resolvePiAgentDir(options.environment),
   });
 }
 
@@ -447,9 +450,9 @@ function resolveRuntimeConfigInternal(
   inputs: CapturedRuntimeConfigInputs,
   fileReader: RuntimeConfigFileReader | undefined,
 ): RuntimeConfigResolution {
-  const { cwd, explicit, projectTrust } = inputs;
+  const { cwd, explicit, projectTrust, userAgentDirectory } = inputs;
   const projectPath = join(cwd, ".pi", "wj-pi-subagents.json");
-  const userPath = join(homedir(), ".pi", "agent", "wj-pi-subagents.json");
+  const userPath = join(userAgentDirectory, "wj-pi-subagents.json");
   const needsFileConfig = RUNTIME_CONFIG_FIELDS.some(
     (field) => explicit === undefined || !own(explicit, field),
   );

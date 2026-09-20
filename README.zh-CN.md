@@ -86,8 +86,10 @@ pi list
 用户级模板存放于：
 
 ```text
-<USER_HOME>/.pi/agent/agents/*.md
+<PI_AGENT_DIR>/agents/*.md
 ```
+
+`<PI_AGENT_DIR>` 是 Pi 的用户级代理目录：跟随 `PI_CODING_AGENT_DIR` 环境变量；该变量未设置或为空串时回退 `<USER_HOME>/.pi/agent`。
 
 项目级模板存放于：
 
@@ -232,8 +234,10 @@ pi
 
 | 范围 | 路径 | 说明 |
 | --- | --- | --- |
-| 用户级 | `<USER_HOME>/.pi/agent/agents/*.md` | 对所有项目可用 |
+| 用户级 | `<PI_AGENT_DIR>/agents/*.md` | 对所有项目可用 |
 | 项目级 | `<PROJECT_DIR>/.pi/agents/*.md` | 仅在项目获得 Pi 授权后可用 |
+
+`<PI_AGENT_DIR>` 是 Pi 的用户级代理目录：跟随 `PI_CODING_AGENT_DIR` 环境变量；该变量未设置或为空串时回退 `<USER_HOME>/.pi/agent`。
 
 模板目录只读取直接的、小写的 `.md` 文件，不会递归扫描子目录。当项目模板与用户模板同名时，项目模板优先。模板 ID 区分大小写。
 
@@ -286,9 +290,11 @@ Confirm the existing implementation and constraints first, then make the changes
 运行时配置可放置于：
 
 ```text
-<USER_HOME>/.pi/agent/wj-pi-subagents.json
+<PI_AGENT_DIR>/wj-pi-subagents.json
 <PROJECT_DIR>/.pi/wj-pi-subagents.json
 ```
+
+`<PI_AGENT_DIR>` 是 Pi 的用户级代理目录：跟随 `PI_CODING_AGENT_DIR` 环境变量；该变量未设置或为空串时回退 `<USER_HOME>/.pi/agent`。
 
 已授权的项目配置优先于用户配置。未提供配置时，采用以下默认值：
 

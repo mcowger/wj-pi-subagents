@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
+import { PI_AGENT_DIR_ENV_KEY } from "../src/pi-agent-dir.ts";
 import {
   discoverTemplateSnapshot,
   listAgentTemplates,
@@ -51,14 +52,21 @@ function errorWithCode(code: string, message: string): Error {
   return error;
 }
 
+/** 显式注入的用户级 Pi agent 目录；用例不依赖宿主环境或真实 home。 */
+const USER_AGENT_DIRECTORY = resolve("template-discovery-fixtures", "user-agent");
+
 function userDirectory(): string {
-  return join(homedir(), ".pi", "agent", "agents");
+  return join(USER_AGENT_DIRECTORY, "agents");
 }
 
 function discoverUserTemplates(files: ReadonlyMap<string, MemoryFileContent>) {
   const directory = userDirectory();
   return discoverTemplateSnapshot({
-    root: { cwd: "C:\\workspace\\project", projectTrust: false },
+    root: {
+      cwd: "C:\\workspace\\project",
+      projectTrust: false,
+      userAgentDirectory: USER_AGENT_DIRECTORY,
+    },
     fileSystem: new MemoryTemplateFileSystem(
       new Map([[
         directory,
@@ -400,7 +408,7 @@ test("项目候选在有效性判断前遮蔽同名用户模板，并保持标�
   );
 
   const snapshot = discoverTemplateSnapshot({
-    root: { cwd, projectTrust: true },
+    root: { cwd, projectTrust: true, userAgentDirectory: USER_AGENT_DIRECTORY },
     fileSystem,
   });
 
@@ -456,7 +464,7 @@ test("来源扫描只接受直属 Markdown 文件，并隔离读取、编码与 
   );
 
   const snapshot = discoverTemplateSnapshot({
-    root: { cwd, projectTrust: true },
+    root: { cwd, projectTrust: true, userAgentDirectory: USER_AGENT_DIRECTORY },
     fileSystem,
   });
 
@@ -490,7 +498,7 @@ test("未获信任的项目目录不参与发现，缺失目录是正常空来�
   };
 
   const untrustedSnapshot = discoverTemplateSnapshot({
-    root: { cwd, projectTrust: false },
+    root: { cwd, projectTrust: false, userAgentDirectory: USER_AGENT_DIRECTORY },
     fileSystem,
   });
   assert.deepEqual(untrustedSnapshot.templates.map((template) => template.templateId), ["user"]);
@@ -498,7 +506,7 @@ test("未获信任的项目目录不参与发现，缺失目录是正常空来�
   assert.deepEqual(untrustedSnapshot.sourceDiagnostics, []);
 
   const missingSnapshot = discoverTemplateSnapshot({
-    root: { cwd, projectTrust: true },
+    root: { cwd, projectTrust: true, userAgentDirectory: USER_AGENT_DIRECTORY },
     fileSystem: {
       readDirectory: () => {
         throw errorWithCode("ENOENT", "目录不存在");
@@ -550,7 +558,11 @@ test("根控制器首次发现和 reload 原子替换快照，并只通过 UI �
     sendUserMessage: () => sideEffects.push("user-message"),
   };
   const controller = new TemplateSnapshotController({
-    root: { cwd, projectTrust: false },
+    root: {
+      cwd,
+      projectTrust: false,
+      environment: { [PI_AGENT_DIR_ENV_KEY]: USER_AGENT_DIRECTORY },
+    },
     fileSystem,
   });
 
@@ -581,7 +593,11 @@ test("根控制器首次发现和 reload 原子替换快照，并只通过 UI �
 
   round = 0;
   const silentController = new TemplateSnapshotController({
-    root: { cwd, projectTrust: false },
+    root: {
+      cwd,
+      projectTrust: false,
+      environment: { [PI_AGENT_DIR_ENV_KEY]: USER_AGENT_DIRECTORY },
+    },
     fileSystem,
   });
   silentController.initialize({
@@ -589,4 +605,81 @@ test("根控制器首次发现和 reload 原子替换快照，并只通过 UI �
     ui: { notify: () => sideEffects.push("notify") },
   });
   assert.equal(sideEffects.length, 0);
+});
+
+test("用户级模板目录跟随 PI_CODING_AGENT_DIR，默认位置不参与发现", () => {
+  const cwd = "C:\\workspace\\project";
+  const customAgentDirectory = resolve("template-discovery-fixtures", "custom-agent");
+  const customTemplates = join(customAgentDirectory, "agents");
+  const decoyTemplates = userDirectory();
+  const observedDirectories: string[] = [];
+  const controller = new TemplateSnapshotController({
+    root: {
+      cwd,
+      projectTrust: false,
+      environment: { [PI_AGENT_DIR_ENV_KEY]: customAgentDirectory },
+    },
+    fileSystem: {
+      readDirectory(path) {
+        observedDirectories.push(path);
+        if (path === customTemplates) return [{ name: "custom.md", kind: "file" }];
+        if (path === decoyTemplates) return [{ name: "decoy.md", kind: "file" }];
+        throw errorWithCode("ENOENT", "目录不存在");
+      },
+      readFile(path) {
+        if (path === join(customTemplates, "custom.md")) {
+          return Buffer.from("---\ndescription: 自定义用户模板\n---\n", "utf8");
+        }
+        throw errorWithCode("ENOENT", "缺少模板");
+      },
+    },
+  });
+
+  const snapshot = controller.initialize();
+  assert.deepEqual(snapshot.templates.map((template) => template.templateId), ["custom"]);
+  assert.deepEqual(snapshot.invalidCandidates, []);
+  assert.deepEqual(observedDirectories, [customTemplates]);
+});
+
+test("PI_CODING_AGENT_DIR 展开 ~，并在空串时回退默认用户模板目录", () => {
+  const cwd = "C:\\workspace\\project";
+  const observedTilde: string[] = [];
+  const tildeController = new TemplateSnapshotController({
+    root: {
+      cwd,
+      projectTrust: false,
+      environment: { [PI_AGENT_DIR_ENV_KEY]: "~/custom-pi-agent" },
+    },
+    fileSystem: {
+      readDirectory(path) {
+        observedTilde.push(path);
+        return [];
+      },
+      readFile() {
+        throw errorWithCode("ENOENT", "缺少模板");
+      },
+    },
+  });
+  tildeController.initialize();
+  assert.deepEqual(observedTilde, [join(homedir(), "custom-pi-agent", "agents")]);
+
+  const observedEmpty: string[] = [];
+  const emptyController = new TemplateSnapshotController({
+    root: {
+      cwd,
+      projectTrust: false,
+      environment: { [PI_AGENT_DIR_ENV_KEY]: "" },
+    },
+    fileSystem: {
+      readDirectory(path) {
+        observedEmpty.push(path);
+        return [];
+      },
+      readFile() {
+        throw errorWithCode("ENOENT", "缺少模板");
+      },
+    },
+  });
+  emptyController.initialize();
+  assert.deepEqual(observedEmpty, [join(homedir(), ".pi", "agent", "agents")]);
 });
