@@ -228,6 +228,44 @@ A few things worth knowing:
 - Terminated agents can still be replayed within the current session, so you can review what they did after they are gone.
 - The viewer is available in TUI mode only.
 
+## 📡 RPC Activity Stream
+
+Headless and `pi --mode rpc` clients get the same settled activity as push messages, without polling.
+Each `onActivityChange` fires one message with the agent's latest entry:
+
+```text
+customType: wj-pi-subagents-activity
+flags: display=false, triggerTurn=false (never wakes the model, never enters parent context)
+```
+
+`details` (lightweight, always present):
+
+```json
+{ "agent_id": "<uuid>", "kind": "activity", "revision": 9, "olderActivityOmitted": false }
+```
+
+`content[0].text` (JSON body):
+
+```json
+{
+  "schema": "wj-pi-subagents.activity/1",
+  "version": 1,
+  "kind": "activity",
+  "agent_id": "<uuid>",
+  "revision": 9,
+  "olderActivityOmitted": false,
+  "entry": { "contract_version": "wj-pi-subagents.activity/12", "agent_id": "<uuid>", "entry_id": "<uuid>", "body": { "type": "tool_execution_end", "...": "..." } }
+}
+```
+
+Notes:
+
+- Summary-only: raw tool args/results are discarded at the producer; entries stay under the 16 KiB text cap.
+- Latest entry per event; `revision` is included for future batching/backfill but no cursor tracking is required.
+- Per-delta display drafts (live streaming text) are excluded; they remain TUI-viewer only.
+- Scope matches `get_agent_tree` visibility: the root sees all descendants, a subagent sees its own subtree.
+- Filter the RPC message stream on `customType == "wj-pi-subagents-activity"`.
+
 ## 🧩 Agent Templates
 
 ### Template locations

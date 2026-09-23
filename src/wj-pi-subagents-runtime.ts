@@ -21,6 +21,11 @@ import {
   type AgentToolRegistrationApi,
 } from "./agent-tools.ts";
 import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
+import {
+  bindAgentActivityRpc,
+  registerAgentActivityMessageRenderer,
+  type AgentActivityRpcBinding,
+} from "./agent-activity-rpc.ts";
 import { ParentWaitBatchCoordinator } from "./parent-wait-batch-coordinator.ts";
 import type {
   AvailableHostCapabilities,
@@ -1042,6 +1047,18 @@ export function createWjPiSubagentsRuntimeActivator(
     let active: ActiveRuntime | undefined;
     let lifecycle: Promise<void> = Promise.resolve();
     let runtimeUi: { readonly runtime: ActiveRuntime; readonly binding: AgentTreeUiBinding } | undefined;
+    let runtimeActivityRpc: { readonly runtime: ActiveRuntime; readonly binding: AgentActivityRpcBinding } | undefined;
+
+    const disposeRuntimeActivityRpc = (current?: ActiveRuntime): void => {
+      const registered = runtimeActivityRpc;
+      if (registered === undefined || (current !== undefined && registered.runtime !== current)) return;
+      runtimeActivityRpc = undefined;
+      try {
+        registered.binding.dispose();
+      } catch {
+        // Activity fan-out teardown must never break session shutdown.
+      }
+    };
 
     const rotateOwnDisplayEpoch = (current?: ActiveRuntime): void => {
       if (ownDisplaySourceGeneration >= Number.MAX_SAFE_INTEGER) {
@@ -1059,6 +1076,7 @@ export function createWjPiSubagentsRuntimeActivator(
     const bootstrapAtActivation = readChildRuntimeBootstrap(options.environment);
 
     const disposeRuntimeUi = (current?: ActiveRuntime): void => {
+      disposeRuntimeActivityRpc(current);
       const registered = runtimeUi;
       if (registered === undefined || (current !== undefined && registered.runtime !== current)) return;
       runtimeUi = undefined;
@@ -1067,6 +1085,10 @@ export function createWjPiSubagentsRuntimeActivator(
 
     const bindRuntimeUi = (current: ActiveRuntime, context: RuntimeContextView): void => {
       disposeRuntimeUi();
+      runtimeActivityRpc = Object.freeze({
+        runtime: current,
+        binding: bindAgentActivityRpc(current.controller, api),
+      });
       runtimeUi = Object.freeze({
         runtime: current,
         binding: bindAgentTreeUi({
@@ -1112,6 +1134,7 @@ export function createWjPiSubagentsRuntimeActivator(
     registerParentReplyMessageRenderers(api, {
       resolveSenderName: (agentId) => readDirectChildDisplayName(active, agentId, false),
     });
+    registerAgentActivityMessageRenderer(api);
     const waitBatchCoordinator = new ParentWaitBatchCoordinator();
     registerAgentTools(api, async (toolContext) => {
       if (active !== undefined) active.bindings.context = readContext(toolContext);
