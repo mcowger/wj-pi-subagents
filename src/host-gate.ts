@@ -41,11 +41,13 @@ export interface ExtensionApiSurface {
   on?: unknown;
   registerTool?: unknown;
   registerMessageRenderer?: unknown;
+  registerEntryRenderer?: unknown;
   registerCommand?: unknown;
   getActiveTools?: unknown;
   getAllTools?: unknown;
   setActiveTools?: unknown;
   sendMessage?: unknown;
+  appendEntry?: unknown;
   exec?: unknown;
   events?: unknown;
 }
@@ -166,11 +168,13 @@ const REQUIRED_EXTENSION_API_METHODS = [
   "on",
   "registerTool",
   "registerMessageRenderer",
+  "registerEntryRenderer",
   "registerCommand",
   "getActiveTools",
   "getAllTools",
   "setActiveTools",
   "sendMessage",
+  "appendEntry",
   "exec",
 ] as const;
 

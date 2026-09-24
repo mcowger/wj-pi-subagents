@@ -230,21 +230,21 @@ A few things worth knowing:
 
 ## 📡 RPC Activity Stream
 
-Headless and `pi --mode rpc` clients get the same settled activity as push messages, without polling.
-Each `onActivityChange` fires one message with the agent's latest entry:
+Headless and `pi --mode rpc` clients get the same settled activity as session entries, without polling.
+Each `onActivityChange` appends one custom entry with the agent's latest activity:
 
 ```text
-customType: wj-pi-subagents-activity
-flags: display=false, triggerTurn=false (never wakes the model, never enters parent context)
+RPC event: entry_appended
+entry.type: custom
+entry.customType: wj-pi-subagents-activity
 ```
 
-`details` (lightweight, always present):
+Custom entries never enter LLM context, never wake the model, and never render
+as completion text — generic RPC clients stay quiet unless they explicitly opt
+into this `customType`. They are also hidden in the TUI and excluded from
+`get_messages`; use `get_entries` / the `entry_appended` stream to read them.
 
-```json
-{ "agent_id": "<uuid>", "kind": "activity", "revision": 9, "olderActivityOmitted": false }
-```
-
-`content[0].text` (JSON body):
+`entry.data` (JSON body):
 
 ```json
 {
@@ -264,7 +264,7 @@ Notes:
 - Latest entry per event; `revision` is included for future batching/backfill but no cursor tracking is required.
 - Per-delta display drafts (live streaming text) are excluded; they remain TUI-viewer only.
 - Scope matches `get_agent_tree` visibility: the root sees all descendants, a subagent sees its own subtree.
-- Filter the RPC message stream on `customType == "wj-pi-subagents-activity"`.
+- Filter the RPC event stream on `type == "entry_appended" && entry.customType == "wj-pi-subagents-activity"`.
 
 ## 🧩 Agent Templates
 

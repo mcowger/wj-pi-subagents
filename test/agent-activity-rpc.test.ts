@@ -4,7 +4,7 @@ import {
   WJ_PI_SUBAGENTS_ACTIVITY_TYPE,
   bindAgentActivityRpc,
   publishAgentActivity,
-  registerAgentActivityMessageRenderer,
+  registerAgentActivityEntryRenderer,
 } from "../src/agent-activity-rpc.ts";
 import type { CanonicalAgentActivityEntry } from "../src/canonical-activity.ts";
 
@@ -42,15 +42,15 @@ function makeController(entries: readonly CanonicalAgentActivityEntry[], revisio
 }
 
 function makeApi() {
-  const sent: Array<{ message: unknown; options: unknown }> = [];
+  const appended: Array<{ customType: string; data: unknown }> = [];
   const renderers = new Map<string, unknown>();
   return {
-    sent,
+    appended,
     renderers,
-    sendMessage: (message: unknown, options?: unknown) => {
-      sent.push({ message, options });
+    appendEntry: (customType: string, data?: unknown) => {
+      appended.push({ customType, data });
     },
-    registerMessageRenderer: (customType: string, renderer: unknown) => {
+    registerEntryRenderer: (customType: string, renderer: unknown) => {
       renderers.set(customType, renderer);
     },
   };
@@ -59,24 +59,20 @@ function makeApi() {
 const AGENT_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("agent activity rpc fan-out", () => {
-  it("publishes latest entry only with non-waking delivery", () => {
+  it("publishes latest entry only as a custom entry outside LLM context", () => {
     const controller = makeController([makeEntry("a"), makeEntry("b")], 9);
     const api = makeApi();
     const ok = publishAgentActivity(api, controller, AGENT_ID);
     assert.equal(ok, true);
-    assert.equal(api.sent.length, 1);
-    const first = api.sent[0]!;
-    const { message, options } = first;
-    assert.equal((message as Record<string, unknown>).customType, WJ_PI_SUBAGENTS_ACTIVITY_TYPE);
-    assert.equal((message as Record<string, unknown>).display, false);
-    assert.equal((options as Record<string, unknown>).triggerTurn, false);
-    const details = (message as Record<string, { agent_id: string; kind: string; revision: number }>).details!;
-    assert.equal(details.agent_id, AGENT_ID);
-    assert.equal(details.kind, "activity");
-    assert.equal(details.revision, 9);
-    const content = (message as Record<string, Array<{ text: string }>>).content!;
-    const payload = JSON.parse(content[0]!.text) as Record<string, unknown>;
+    assert.equal(api.appended.length, 1);
+    const first = api.appended[0]!;
+    assert.equal(first.customType, WJ_PI_SUBAGENTS_ACTIVITY_TYPE);
+    const payload = first.data as Record<string, unknown>;
+    assert.equal(payload.schema, "wj-pi-subagents.activity/1");
+    assert.equal(payload.kind, "activity");
+    assert.equal(payload.agent_id, AGENT_ID);
     assert.equal(payload.revision, 9);
+    assert.equal(payload.olderActivityOmitted, false);
     assert.equal((payload.entry as Record<string, unknown>).entry_id, "b");
   });
 
@@ -84,7 +80,7 @@ describe("agent activity rpc fan-out", () => {
     const controller = makeController([]);
     const api = makeApi();
     assert.equal(publishAgentActivity(api, controller, AGENT_ID), false);
-    assert.equal(api.sent.length, 0);
+    assert.equal(api.appended.length, 0);
     const throwing = {
       getActivitySnapshot: () => {
         throw new Error("gone");
@@ -92,7 +88,7 @@ describe("agent activity rpc fan-out", () => {
       onActivityChange: () => () => {},
     };
     assert.equal(publishAgentActivity(api, throwing, AGENT_ID), false);
-    const failingApi = { sendMessage: () => {
+    const failingApi = { appendEntry: () => {
       throw new Error("host down");
     } };
     const full = makeController([makeEntry("a")]);
@@ -105,29 +101,22 @@ describe("agent activity rpc fan-out", () => {
     const binding = bindAgentActivityRpc(controller, api);
     assert.equal(controller.isSubscribed(), true);
     controller.emit(AGENT_ID);
-    assert.equal(api.sent.length, 1);
+    assert.equal(api.appended.length, 1);
     binding.dispose();
     assert.equal(controller.isSubscribed(), false);
     controller.emit(AGENT_ID);
-    assert.equal(api.sent.length, 1);
+    assert.equal(api.appended.length, 1);
   });
 
-  it("registers a non-throwing renderer", () => {
+  it("registers a hidden entry renderer that renders nothing", () => {
     const api = makeApi();
-    registerAgentActivityMessageRenderer(api);
+    registerAgentActivityEntryRenderer(api);
     assert.equal(api.renderers.has(WJ_PI_SUBAGENTS_ACTIVITY_TYPE), true);
-    const renderer = api.renderers.get(WJ_PI_SUBAGENTS_ACTIVITY_TYPE) as (
-      message: unknown,
-      options: unknown,
-      theme: never,
-    ) => { render(width: number): string[] };
-    const stubTheme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
-    const lines = renderer(
-      { details: { agent_id: AGENT_ID, revision: 3 } },
-      {},
-      stubTheme,
-    ).render(80);
-    assert.ok(lines.length >= 1);
-    assert.throws(() => registerAgentActivityMessageRenderer({}), TypeError);
+    const renderer = api.renderers.get(WJ_PI_SUBAGENTS_ACTIVITY_TYPE) as (...args: unknown[]) => unknown;
+    assert.equal(
+      renderer({ customType: WJ_PI_SUBAGENTS_ACTIVITY_TYPE, data: { agent_id: AGENT_ID, revision: 3 } }, {}, {}),
+      undefined,
+    );
+    assert.throws(() => registerAgentActivityEntryRenderer({}), TypeError);
   });
 });

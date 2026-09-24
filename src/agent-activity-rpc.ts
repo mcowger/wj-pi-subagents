@@ -1,12 +1,17 @@
-import { SafeTextComponent } from "./agent-tool-rendering.ts";
 import type { AgentActivitySnapshot } from "./agent-activity-cache.ts";
 
-/** RPC-visible activity fan-out: summary-only, never wakes the parent model. */
+/**
+ * Activity fan-out over Pi custom session entries (`appendEntry`).
+ *
+ * Custom entries never enter LLM context and surface on the RPC wire as
+ * `entry_appended` events — never as `message_end` completion text — so
+ * generic RPC clients stay quiet. Summary-only, never wakes the parent model.
+ */
 export const WJ_PI_SUBAGENTS_ACTIVITY_TYPE = "wj-pi-subagents-activity" as const;
 
 export interface AgentActivityRpcApi {
-  readonly sendMessage?: unknown;
-  readonly registerMessageRenderer?: unknown;
+  readonly appendEntry?: unknown;
+  readonly registerEntryRenderer?: unknown;
 }
 
 export interface AgentActivityRpcController {
@@ -26,12 +31,10 @@ export interface AgentActivityPayload {
   readonly entry: unknown;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
- * Publish the latest activity entry for one agent as a non-waking RPC message.
+ * Publish the latest activity entry for one agent as a custom session entry.
+ * Custom entries do not participate in LLM context and never trigger a turn;
+ * on the RPC wire they arrive as `entry_appended`, not completion text.
  * Returns true only when the host synchronously accepted the submission.
  * Empty snapshots send nothing and return false.
  */
@@ -62,27 +65,19 @@ export function publishAgentActivity(
   });
   let text: string;
   try {
+    // Session entries persist as JSONL; reject unserializable snapshots here
+    // so publish stays total and never throws into supervision handling.
     text = JSON.stringify(payload);
   } catch {
     return false;
   }
-  if (typeof (api as { sendMessage?: unknown }).sendMessage !== "function") return false;
+  if (text.length === 0) return false;
+  const appendEntry = (api as { appendEntry?: unknown }).appendEntry;
+  if (typeof appendEntry !== "function") return false;
   try {
-    (api as { sendMessage: (message: unknown, options?: unknown) => void }).sendMessage(
-      {
-        customType: WJ_PI_SUBAGENTS_ACTIVITY_TYPE,
-        content: [{ type: "text", text }],
-        display: false,
-        details: {
-          agent_id: agentId,
-          kind: "activity",
-          revision,
-          olderActivityOmitted,
-        },
-      },
-      {
-        triggerTurn: false,
-      },
+    (appendEntry as (customType: string, data?: unknown) => void)(
+      WJ_PI_SUBAGENTS_ACTIVITY_TYPE,
+      payload,
     );
   } catch {
     return false;
@@ -90,25 +85,16 @@ export function publishAgentActivity(
   return true;
 }
 
-/** TUI stays quiet (display:false); renderer is a collapsed one-liner fallback. */
-export function registerAgentActivityMessageRenderer(api: AgentActivityRpcApi): void {
-  const register = (api as { registerMessageRenderer?: unknown }).registerMessageRenderer;
-  if (typeof register !== "function") throw new TypeError("host missing registerMessageRenderer");
-  (register as (customType: string, renderer: (message: unknown, options: unknown, theme: never) => unknown) => void)(
+/**
+ * TUI and completion stream stay quiet: the entry renderer returns undefined,
+ * which Pi treats as "no content" and skips rendering entirely.
+ */
+export function registerAgentActivityEntryRenderer(api: AgentActivityRpcApi): void {
+  const register = (api as { registerEntryRenderer?: unknown }).registerEntryRenderer;
+  if (typeof register !== "function") throw new TypeError("host missing registerEntryRenderer");
+  (register as (customType: string, renderer: () => undefined) => void)(
     WJ_PI_SUBAGENTS_ACTIVITY_TYPE,
-    (message, _options, theme) => {
-      let label = "agent activity";
-      try {
-        const record = isRecord(message) ? message : undefined;
-        const details = record !== undefined && isRecord(record.details) ? record.details : undefined;
-        const agentId = typeof details?.agent_id === "string" ? details.agent_id : "unknown";
-        const revision = typeof details?.revision === "number" ? ` · rev ${String(details.revision)}` : "";
-        label = `agent activity · ${agentId}${revision}`;
-      } catch {
-        // Fall back to the default label; rendering must never throw.
-      }
-      return new SafeTextComponent([{ text: label, color: "muted" }], theme, {});
-    },
+    () => undefined,
   );
 }
 
@@ -118,9 +104,9 @@ export interface AgentActivityRpcBinding {
 
 /**
  * Fan out settled activity entries (tool start/end, messages, model-call
- * failures) to the host message stream. Display drafts (per-delta streaming)
- * are intentionally excluded: they are high-frequency and TUI-only.
- * Failures never propagate; worst case is a missing RPC line.
+ * failures) to the host session as custom entries. Display drafts (per-delta
+ * streaming) are intentionally excluded: they are high-frequency and TUI-only.
+ * Failures never propagate; worst case is a missing entry.
  */
 export function bindAgentActivityRpc(
   controller: AgentActivityRpcController,

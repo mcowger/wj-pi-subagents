@@ -23,7 +23,7 @@ import {
 import { ChildReplyCoordinator } from "./child-reply-coordinator.ts";
 import {
   bindAgentActivityRpc,
-  registerAgentActivityMessageRenderer,
+  registerAgentActivityEntryRenderer,
   type AgentActivityRpcBinding,
 } from "./agent-activity-rpc.ts";
 import { ParentWaitBatchCoordinator } from "./parent-wait-batch-coordinator.ts";
@@ -120,6 +120,8 @@ interface RuntimeExtensionApi extends AgentToolRegistrationApi {
     readonly handler: (args: string, context: unknown) => unknown;
   }): void;
   registerMessageRenderer(customType: string, renderer: ParentReplyMessageRenderer): void;
+  appendEntry(customType: string, data?: unknown): void;
+  registerEntryRenderer(customType: string, renderer: (entry: unknown, options: unknown, theme: never) => unknown): void;
   getActiveTools(): string[];
   getAllTools(): unknown[];
   setActiveTools?(tools: readonly string[]): void;
@@ -1134,7 +1136,7 @@ export function createWjPiSubagentsRuntimeActivator(
     registerParentReplyMessageRenderers(api, {
       resolveSenderName: (agentId) => readDirectChildDisplayName(active, agentId, false),
     });
-    registerAgentActivityMessageRenderer(api);
+    registerAgentActivityEntryRenderer(api);
     const waitBatchCoordinator = new ParentWaitBatchCoordinator();
     registerAgentTools(api, async (toolContext) => {
       if (active !== undefined) active.bindings.context = readContext(toolContext);

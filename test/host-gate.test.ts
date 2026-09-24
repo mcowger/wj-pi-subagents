@@ -22,11 +22,13 @@ const readyApi = (): ExtensionApiSurface => ({
   on: () => {},
   registerTool: () => {},
   registerMessageRenderer: () => {},
+  registerEntryRenderer: () => {},
   registerCommand: () => {},
   getActiveTools: () => [],
   getAllTools: () => [],
   setActiveTools: () => {},
   sendMessage: () => {},
+  appendEntry: () => {},
   exec: async () => ({ code: 0, stdout: "", stderr: "" }),
   events: { emit: () => {}, on: () => () => {} },
 });

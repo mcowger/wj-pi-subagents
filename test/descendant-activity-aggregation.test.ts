@@ -68,6 +68,8 @@ class FakeExtensionApi {
 
   registerMessageRenderer(_customType: string, _renderer: unknown): void {}
 
+  registerEntryRenderer(_customType: string, _renderer: unknown): void {}
+
   getActiveTools(): string[] {
     return [...this.activeTools];
   }
@@ -81,6 +83,8 @@ class FakeExtensionApi {
   }
 
   sendMessage(_message: unknown, _options?: unknown): void {}
+
+  appendEntry(_customType: string, _data?: unknown): void {}
 
   async emit(event: string, value: unknown, context: unknown): Promise<void> {
     for (const handler of this.handlers.get(event) ?? []) {
